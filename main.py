@@ -1,9 +1,11 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 
-from paddleocr import PaddleOCR
+import os
 import tempfile
-import shutil
+import pytesseract
+import cv2
+
 
 app = FastAPI()
 app.add_middleware(
@@ -15,15 +17,6 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-)
-
-ocr = PaddleOCR(
-    use_angle_cls=False,
-    lang="th",
-    use_gpu=False,
-    enable_mkldnn=False,
-    show_log=False
-)
 )
 
 app.add_middleware(
@@ -49,21 +42,24 @@ def health():
     }
 
 @app.post("/ocr")
-async def upload_ocr(file: UploadFile = File(...)):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
-        shutil.copyfileobj(file.file, temp_file)
-        temp_path = temp_file.name
+async def do_ocr(file: UploadFile = File(...)):
+    contents = await file.read()
 
-    result = ocr.ocr(temp_path)
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp.write(contents)
+        tmp_path = tmp.name
 
-    extracted_text = []
+    image = cv2.imread(tmp_path)
 
-    for line in result[0]:
-        text = line[1][0]
-        extracted_text.append(text)
+    text = pytesseract.image_to_string(
+        image,
+        lang="tha+eng"
+    )
+
+    os.unlink(tmp_path)
 
     return {
         "success": True,
-        "filename": file.filename,
-        "texts": extracted_text
+        "text": text,
+        "filename": file.filename
     }
