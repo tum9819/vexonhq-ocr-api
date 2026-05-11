@@ -6,6 +6,16 @@ import tempfile
 import shutil
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "https://vexonhq-ocr.vercel.app",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 ocr = PaddleOCR(use_angle_cls=False, lang="en")
 
