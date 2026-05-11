@@ -22,7 +22,6 @@ ocr = PaddleOCR(
     lang="th",
     show_log=False
 )
-)
 
 app.add_middleware(
     CORSMiddleware,
