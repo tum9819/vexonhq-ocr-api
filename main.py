@@ -18,9 +18,12 @@ app.add_middleware(
 )
 
 ocr = PaddleOCR(
-    use_angle_cls=True,
-    lang="ch",
+    use_angle_cls=False,
+    lang="th",
+    use_gpu=False,
+    enable_mkldnn=False,
     show_log=False
+)
 )
 
 app.add_middleware(

@@ -2,6 +2,8 @@ FROM python:3.11-slim
 
 ENV FLAGS_use_mkldnn=false
 ENV CPU_NUM=1
+ENV FLAGS_use_mkldnn=false
+ENV GLOG_minloglevel=3
 
 WORKDIR /app
 
