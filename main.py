@@ -7,7 +7,7 @@ import shutil
 
 app = FastAPI()
 
-ocr = PaddleOCR(use_angle_cls=True, lang="en")
+ocr = PaddleOCR(use_angle_cls=False, lang="en")
 
 app.add_middleware(
     CORSMiddleware,
