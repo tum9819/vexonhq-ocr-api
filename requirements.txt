@@ -1,7 +1,6 @@
 fastapi
 uvicorn
 python-multipart
-paddleocr
-paddlepaddle
+paddlepaddle==2.6.1
+paddleocr==2.7.3
 opencv-python-headless
-numpy
