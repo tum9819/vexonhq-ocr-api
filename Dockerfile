@@ -12,6 +12,9 @@ RUN apt-get update && apt-get install -y \
     libglib2.0-0 \
     gcc \
     g++ \
+    tesseract-ocr \
+    tesseract-ocr-tha \
+    tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
