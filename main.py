@@ -41,12 +41,32 @@ async def do_ocr(file: UploadFile = File(...)):
         tmp.write(contents)
         tmp_path = tmp.name
 
-    image = cv2.imread(tmp_path)
+image = cv2.imread(tmp_path)
 
-    text = pytesseract.image_to_string(
-        image,
-        lang="tha+eng"
-    )
+# grayscale
+gray = cv2.cvtColor(
+    image,
+    cv2.COLOR_BGR2GRAY
+)
+
+# denoise
+denoised = cv2.fastNlMeansDenoising(
+    gray
+)
+
+# threshold
+processed = cv2.threshold(
+    denoised,
+    150,
+    255,
+    cv2.THRESH_BINARY
+)[1]
+
+text = pytesseract.image_to_string(
+    processed,
+    lang="tha+eng",
+    config="--psm 6"
+)
 
     os.unlink(tmp_path)
 
