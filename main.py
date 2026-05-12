@@ -1,5 +1,5 @@
 """
-VEXONHQ OCR API — v3.0 (Phase 1: Invoice Review Pipeline)
+VEXONHQ OCR API — v3.1 (Phase 1: Invoice Review Pipeline + PDF support)
 
 Endpoints:
   GET  /                              Service info
@@ -21,6 +21,7 @@ Required env vars (set in Coolify):
 """
 
 import base64
+import io
 import json
 import logging
 import os
@@ -30,10 +31,12 @@ from datetime import date, datetime
 from typing import Any, Optional
 
 import cv2
+import pypdfium2 as pdfium
 import pytesseract
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
+from PIL import Image
 from pydantic import BaseModel
 from supabase import Client, create_client
 
@@ -79,7 +82,7 @@ def get_openai() -> OpenAI:
 # ============================================================
 # FastAPI app
 # ============================================================
-app = FastAPI(title="VEXONHQ OCR API", version="3.0.0")
+app = FastAPI(title="VEXONHQ OCR API", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -101,7 +104,7 @@ def root():
     return {
         "success": True,
         "service": "VEXONHQ OCR API",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "status": "running",
     }
 
@@ -161,12 +164,18 @@ async def invoice_upload(file: UploadFile = File(...)):
     """
     Main flow: upload invoice → Tesseract + GPT Vision → save to Supabase.
 
+    File types supported:
+      - Images: JPG, PNG, WEBP — processed directly
+      - PDF: each page rendered to PNG, processed individually
+             multi-page merge happens automatically when invoice_no matches
+
     Multi-page merge: if same (vendor_name, invoice_no) exists with
     review_status in ('pending','needs_attention'), this upload is treated
     as page N+1 of that bill (appends items, attaches as new page).
 
     Returns:
-      success, invoice_id, batch_id, page_no, merged, parsed, warnings, preview_url
+      success, invoice_id, batch_id, page_no, merged, parsed, warnings,
+      preview_url, total_pages_processed
     """
     if not file.filename:
         raise HTTPException(400, "filename required")
@@ -175,16 +184,63 @@ async def invoice_upload(file: UploadFile = File(...)):
     if not contents:
         raise HTTPException(400, "empty file")
 
+    is_pdf = (file.content_type == "application/pdf") or file.filename.lower().endswith(".pdf")
+
+    if is_pdf:
+        # Convert PDF → list of PNG images (1 per page)
+        try:
+            page_images = _pdf_to_images(contents)
+        except Exception as e:
+            log.exception("pdf conversion failed")
+            raise HTTPException(400, f"pdf conversion failed: {e}")
+
+        if not page_images:
+            raise HTTPException(400, "pdf has no readable pages")
+
+        log.info("processing PDF '%s' with %d page(s)", file.filename, len(page_images))
+
+        # Process each page through full pipeline.
+        # multi-page merge in _save_invoice() handles merging same-invoice pages.
+        page_filename_base = os.path.splitext(file.filename)[0]
+        last_result = None
+        all_warnings: list[dict[str, str]] = []
+
+        for idx, img_bytes in enumerate(page_images, start=1):
+            page_name = f"{page_filename_base}-p{idx}.png"
+            result = _process_single_image(img_bytes, page_name, "image/png")
+            last_result = result
+            all_warnings.extend(result["warnings"])
+
+        # Return the LAST page's result (which has the final merged state),
+        # but combined warnings from all pages
+        assert last_result is not None
+        last_result["warnings"] = all_warnings
+        last_result["total_pages_processed"] = len(page_images)
+        return last_result
+
+    # Single image path
+    result = _process_single_image(contents, file.filename, file.content_type or "image/jpeg")
+    result["total_pages_processed"] = 1
+    return result
+
+
+def _process_single_image(
+    image_bytes: bytes,
+    file_name: str,
+    mime_type: str,
+) -> dict[str, Any]:
+    """Full pipeline for ONE image: Tesseract → Vision → validate → store → DB save."""
+
     # 1) Tesseract OCR (as hint for Vision)
     try:
-        ocr_text = _run_tesseract(contents)
+        ocr_text = _run_tesseract(image_bytes)
     except Exception as e:
         log.warning("tesseract failed (continuing): %s", e)
         ocr_text = ""
 
     # 2) GPT-4 Vision structured extraction
     try:
-        parsed = _run_gpt_vision(contents, file.content_type or "image/jpeg", ocr_text)
+        parsed = _run_gpt_vision(image_bytes, mime_type, ocr_text)
     except Exception as e:
         log.exception("vision failed")
         raise HTTPException(500, f"vision extraction failed: {e}")
@@ -193,10 +249,10 @@ async def invoice_upload(file: UploadFile = File(...)):
     warnings = _validate_invoice(parsed)
 
     # 4) Upload to Supabase Storage
-    file_url, storage_path = None, None
+    file_url = None
     try:
-        file_url, storage_path = _upload_to_storage(contents, file.filename, file.content_type)
-    except Exception as e:
+        file_url, _ = _upload_to_storage(image_bytes, file_name, mime_type)
+    except Exception:
         log.exception("storage upload failed (continuing without file_url)")
 
     # 5) Save to DB (multi-page merge)
@@ -205,8 +261,8 @@ async def invoice_upload(file: UploadFile = File(...)):
             parsed=parsed,
             ocr_text=ocr_text,
             file_url=file_url,
-            file_name=file.filename,
-            mime_type=file.content_type,
+            file_name=file_name,
+            mime_type=mime_type,
         )
         if warnings:
             _save_warnings(invoice_id, warnings)
@@ -333,6 +389,33 @@ def invoice_reject(invoice_id: str, body: RejectRequest):
     if not resp.data:
         raise HTTPException(404, "invoice not found")
     return {"success": True, "invoice": resp.data[0]}
+
+
+# ============================================================
+# Helpers — PDF handling
+# ============================================================
+def _pdf_to_images(pdf_bytes: bytes, scale: float = 2.0) -> list[bytes]:
+    """
+    Render each page of a PDF to PNG bytes.
+
+    scale=2.0 gives ~144 DPI which is good for OCR + Vision without huge file size.
+    Increase to 3.0 if Vision struggles with small text.
+    """
+    images: list[bytes] = []
+    pdf = pdfium.PdfDocument(pdf_bytes)
+    try:
+        for page in pdf:
+            bitmap = page.render(scale=scale)
+            pil_image = bitmap.to_pil()
+            # Ensure RGB (not RGBA) for smaller PNG + OpenAI compat
+            if pil_image.mode != "RGB":
+                pil_image = pil_image.convert("RGB")
+            buf = io.BytesIO()
+            pil_image.save(buf, format="PNG", optimize=True)
+            images.append(buf.getvalue())
+    finally:
+        pdf.close()
+    return images
 
 
 # ============================================================
