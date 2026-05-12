@@ -68,6 +68,32 @@ text = pytesseract.image_to_string(
     config="--psm 6"
 )
 
+@app.post("/ocr")
+async def do_ocr(file: UploadFile = File(...)):
+    contents = await file.read()
+
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp.write(contents)
+        tmp_path = tmp.name
+
+    image = cv2.imread(tmp_path)
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    thresh = cv2.threshold(
+        gray,
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )[1]
+
+    denoise = cv2.fastNlMeansDenoising(thresh)
+
+    text = pytesseract.image_to_string(
+        denoise,
+        lang="tha+eng"
+    )
+
     os.unlink(tmp_path)
 
     return {
