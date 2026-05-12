@@ -5,3 +5,6 @@ pytesseract
 opencv-python-headless
 numpy
 Pillow
+openai>=1.40.0
+supabase>=2.7.0
+pydantic>=2.0.0
