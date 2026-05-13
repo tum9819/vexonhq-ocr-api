@@ -187,6 +187,69 @@ def is_total_row(row: pd.Series) -> bool:
     return first == "total"
 
 
+# Canonical short names sorted by length DESC so longer names match first
+# (e.g. "ส่วนลดสินค้า %" matches before "ส่วนลดสินค้า")
+_CANONICAL_COLS = sorted([
+    "วันที่ชำระเงิน", "เวลาที่ชำระเงิน", "หมายเลขใบเสร็จ / ID",
+    "INV. No", "รหัสถาดเก็บเงิน", "รหัสเมนู", "ชื่อเมนู",
+    "ประเภทการสั่ง", "จำนวน", "ราคาต่อหน่วย",
+    "ส่วนลดสินค้า %",         # MUST come before "ส่วนลดสินค้า"
+    "ส่วนลดสินค้า", "ส่วนลดบิล",
+    "ราคาสุทธิ", "ประเภทภาษีของรายการ", "ช่องทาง", "โต๊ะ",
+    "ชื่อลูกค้า", "เบอร์โทรศัพท์",
+    "ประเภทการชำระเงิน", "วิธีบันทึกรายการชำระ",
+    "รหัสชำระเงินแบบกำหนดเอง", "หมายเหตุ",
+    "ประเภทโปรโมชั่น", "กลุ่ม", "หมวดสินค้า",
+    "เปิดบิลโดย", "ปิดบิลโดย", "สาขา",
+    "วันที่", "เดือน",
+    "รหัสสินค้า", "ชื่อสินค้า",
+    "ต้นทุนเฉลี่ย", "ราคาขายเฉลี่ย", "จำนวนการขาย",
+    "ยอดก่อนลด", "ยอดรวม",
+    "ค่าบริการ", "ยอดขายสินค้าไม่มีภาษี",
+    "ยอดก่อนภาษี", "ภาษี",
+    "มูลค่า Voucher", "ส่วนลด Voucher",
+    "ยอดปัดเศษ", "ค่าจัดส่ง",
+    "รวมสุทธิ", "ทิป", "คืนเงิน",
+    "ส่วนลด",                       # generic fallback (payment_type report uses bare "ส่วนลด")
+    "ต้นทุน", "กำไรเฉลี่ย", "กำไร",
+    "จำนวนบิล",
+    "LINE MAN ยอดปรับยอด",
+    "ชื่อ", "รหัสวัตถุดิบ", "ป้ายกำกับ",
+    "จำนวนของในสต็อก", "จำนวนสูงสุดของสต็อก",
+    "ส่วนต่าง", "หน่วย",
+    "ราคาต่อหน่วย",
+    "มูลค่าสินค้าในสต๊อก",
+], key=len, reverse=True)
+
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename FoodStory's verbose column names to their short canonical form.
+
+    FoodStory exports headers like:
+        'ยอดรวม ยอดก่อนลด - ส่วนลดสินค้า'
+        'รวมสุทธิ (ยอดก่อนภาษี + ภาษี + ยอดปัดเศษ) -  ยอดขายสินค้าไม่มีภาษี'
+
+    We rewrite these to the short head ('ยอดรวม', 'รวมสุทธิ', ...) so the
+    parsers can use r.get('ยอดรวม') uniformly across all 7 report types.
+    """
+    rename: dict = {}
+    seen: set = set()
+    for raw in df.columns:
+        if raw is None:
+            continue
+        s = str(raw).strip()
+        for canon in _CANONICAL_COLS:
+            if s == canon or s.startswith(canon + " ") or s.startswith(canon + "(") \
+                    or s.startswith(canon + " ("):
+                if canon not in seen:
+                    rename[raw] = canon
+                    seen.add(canon)
+                break
+    if rename:
+        df = df.rename(columns=rename)
+    return df
+
+
 def map_branch(name: Any) -> str:
     """Map Thai branch name → branch_code. Auto-falls back to single default."""
     if not name or (isinstance(name, float) and pd.isna(name)):
@@ -619,6 +682,7 @@ async def import_pos_excel(
     try:
         import io
         df = pd.read_excel(io.BytesIO(content), header=1)
+        df = normalize_columns(df)        # rename verbose headers → short forms
     except Exception as e:
         raise HTTPException(400, f"Cannot read Excel: {e}")
 
@@ -702,7 +766,7 @@ async def import_pos_excel(
                 cfg = WRITER_CONFIG.get(table)
                 # add source_import_id to every row that has the column
                 for r in rows:
-                    if "source_import_id" in (cfg["update_cols"] if cfg else []):
+                    if cfg and "source_import_id" in cfg["update_cols"]:
                         r["source_import_id"] = import_id
                 if cfg:
                     _upsert(cur, table, rows, cfg["conflict_cols"],
@@ -764,7 +828,12 @@ def list_imports(limit: int = 50):
                 LIMIT %s
             """, (limit,))
             cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, row)) for row in cur.fetchall()]
+            return [
+                {k: (str(v) if hasattr(v, 'hex') else
+                     v.isoformat() if hasattr(v, 'isoformat') else v)
+                 for k, v in zip(cols, row)}
+                for row in cur.fetchall()
+            ]
     finally:
         conn.close()
 
@@ -779,7 +848,11 @@ def get_import(import_id: str):
             if not row:
                 raise HTTPException(404, "Import not found")
             cols = [d[0] for d in cur.description]
-            return dict(zip(cols, row))
+            return {
+                k: (str(v) if hasattr(v, 'hex') else
+                    v.isoformat() if hasattr(v, 'isoformat') else v)
+                for k, v in zip(cols, row)
+            }
     finally:
         conn.close()
 
@@ -791,6 +864,7 @@ async def detect_only(file: UploadFile = File(...)):
     import io
     try:
         df = pd.read_excel(io.BytesIO(content), header=1)
+        df = normalize_columns(df)
     except Exception as e:
         raise HTTPException(400, f"Cannot read Excel: {e}")
     rtype = detect_report_type(list(df.columns))
@@ -800,4 +874,3 @@ async def detect_only(file: UploadFile = File(...)):
         "row_count": len(df),
         "first_row": df.iloc[0].to_dict() if len(df) else None,
     }
-
