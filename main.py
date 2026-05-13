@@ -1,5 +1,5 @@
 """
-VEXONHQ OCR API — v3.1 (Phase 1: Invoice Review Pipeline + PDF support)
+VEXONHQ OCR API — v3.2 (Phase 1.5: tuned Vision prompt + smart merge)
 
 Endpoints:
   GET  /                              Service info
@@ -82,7 +82,7 @@ def get_openai() -> OpenAI:
 # ============================================================
 # FastAPI app
 # ============================================================
-app = FastAPI(title="VEXONHQ OCR API", version="3.1.0")
+app = FastAPI(title="VEXONHQ OCR API", version="3.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -104,7 +104,7 @@ def root():
     return {
         "success": True,
         "service": "VEXONHQ OCR API",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "status": "running",
     }
 
@@ -264,11 +264,20 @@ def _process_single_image(
             file_name=file_name,
             mime_type=mime_type,
         )
-        if warnings:
-            _save_warnings(invoice_id, warnings)
     except Exception as e:
         log.exception("db save failed")
         raise HTTPException(500, f"db save failed: {e}")
+
+    # 6) Revalidate against the merged state so warnings stay accurate
+    #    after multi-page backfill (e.g. Makro page 3 fills in the total
+    #    that page 1 was missing — MISSING_TOTAL warning should disappear)
+    try:
+        final_warnings = _revalidate_bill(invoice_id)
+    except Exception as e:
+        log.warning("revalidate failed (using page warnings instead): %s", e)
+        final_warnings = warnings
+        if warnings:
+            _save_warnings(invoice_id, warnings)
 
     return {
         "success": True,
@@ -277,7 +286,7 @@ def _process_single_image(
         "page_no": page_no,
         "merged": merged,
         "parsed": parsed,
-        "warnings": warnings,
+        "warnings": final_warnings,
         "preview_url": file_url,
     }
 
@@ -449,7 +458,7 @@ VISION_PROMPT = """You are an expert Thai/English accounting OCR system speciali
 
 Analyze the provided invoice IMAGE and extract structured data.
 
-The Tesseract OCR text below may contain errors. Use it as a hint, but trust the IMAGE as the source of truth:
+The Tesseract OCR text below may contain errors. Use it as a hint, but TRUST THE IMAGE as the source of truth:
 
 --- OCR HINT ---
 {ocr_hint}
@@ -466,30 +475,111 @@ Return ONLY valid JSON matching this exact schema (no markdown, no commentary):
   "subtotal": number_or_null,
   "vat": number_or_null,
   "amount": number_or_null,
-  "payment_type": "credit_card|transfer|cash|cheque|other|null (เครดิตการ์ด/บัตรเครดิต=credit_card, โอน=transfer, เงินสด=cash, เช็ค=cheque)",
+  "payment_type": "credit_card|transfer|cash|cheque|other|null",
   "currency": "THB",
   "items": [
     {{
       "line_no": 1,
       "sku": "string or null",
-      "product_name": "string (required if item present)",
+      "product_name": "string (real product name only — see CRITICAL RULE 5)",
       "quantity": number_or_null,
       "unit": "string or null",
       "unit_price": number_or_null,
       "amount": number_or_null
     }}
   ],
-  "notes": "string or null (any important note like discount, remark, etc.)"
+  "notes": "string or null"
 }}
 
-CRITICAL RULES:
-1. Use null (not empty string, not 0) when uncertain. NEVER make up data.
-2. Numbers MUST be numeric, never strings.
-3. Date format MUST be YYYY-MM-DD. Convert Thai Buddhist year (พ.ศ.) to Gregorian (พ.ศ. - 543 = ค.ศ.). Example: "12/05/2569" → "2026-05-12".
-4. 'amount' at top level = grand total (after VAT). 'subtotal' = before VAT.
-5. If you can't see an items table, return "items": [].
-6. Thai/English mixed text is normal — preserve original language in product_name.
-7. Output JSON only. NO markdown fences, NO explanation, NO preamble.
+═══════════════════════════════════════════════════════════════
+CRITICAL RULES — read carefully, these errors are common:
+═══════════════════════════════════════════════════════════════
+
+1. NULL OVER GUESSING
+   Use null (not 0, not empty string) when uncertain. NEVER make up data.
+   Especially: NEVER fabricate 13-digit tax IDs. If you can't read clearly → null.
+
+2. THAI BUDDHIST YEAR CONVERSION
+   Thai invoices use BE year (พ.ศ.). Convert to Gregorian: BE − 543 = CE.
+   Most invoices in 2026 will show year 2569 BE.
+   ⚠️ Digit 6 and 9 in Thai fonts look similar — examine the shape carefully.
+   Examples:
+     "30/04/2569" → "2026-04-30"
+     "08/04/2569" → "2026-04-08"
+     "12/05/2566" → "2023-05-12" (different year, double-check)
+
+3. MULTI-PAGE INVOICES — TOTALS ONLY ON LAST PAGE
+   Multi-page invoices (เช่น Makro 3-4 หน้า) show totals (subtotal/vat/amount)
+   ONLY on the last page. Earlier pages show item lines but NO total summary.
+
+   When processing an intermediate page (e.g. you see "1/3" or "2/3" indicator,
+   or you see only item rows without "รวมเงิน"/"AMOUNT" summary box):
+     → Return subtotal, vat, amount as **null**
+     → Still extract all items from that page
+     → DO NOT invent totals based on items shown
+
+   When you see the last page (totals are visible):
+     → Extract subtotal, vat, amount from the summary box at bottom
+
+4. ❌ NEVER CAPTURE COLUMN HEADERS AS ITEMS
+   Item tables have a header row at the TOP. These are LABELS, not products.
+   The following text strings are ALWAYS column headers — SKIP them:
+
+   Thai column headers to IGNORE:
+     "ลำดับ", "ITEM", "#"
+     "รหัส", "รหัสสินค้า", "SKU", "PRODUCT CODE", "ARTICLE NO"
+     "รายการ", "รายละเอียด", "DESCRIPTION"
+     "จำนวน", "QUANTITY", "QTY"
+     "หน่วย", "UNIT"
+     "ราคา", "ราคาต่อหน่วย", "UNIT PRICE"
+     "ลด", "ส่วนลด %", "DISCOUNT %"
+     "รหัส ภ.พ.", "ภ.พ.", "VAT CODE", "TAX CODE"
+     "ยอดรวม", "จำนวนเงิน", "AMOUNT", "TOTAL"
+
+   ⚠️ Common mistake: "รหัส ภ.พ." (= VAT code column header in Makro receipts)
+      is NOT a product. Same with "DESCRIPTION", "QUANTITY", etc.
+
+5. ❌ NEVER CAPTURE SUMMARY ROWS AS ITEMS
+   The bottom of an invoice has total/summary rows. These are NOT items:
+
+   Summary row labels to IGNORE (these appear BELOW items, with totals):
+     "รวมเงิน", "รวมราคาสินค้า/GOODS VALUE", "SUBTOTAL"
+     "ภาษีมูลค่าเพิ่ม", "VAT"
+     "จำนวนเงิน/AMOUNT", "NET AMOUNT", "TOTAL"
+     "ส่วนลด", "DISCOUNT"
+     "ค่ามัดจำ", "DEPOSIT"
+     "หัก ณ ที่จ่าย"
+     ตัวอักษรไทยบอกจำนวนเงิน (เช่น "สองหมื่นแปดพัน...บาท")
+
+6. PRODUCT NAMES — READ THE EXACT TEXT
+   Read each product name CHARACTER-BY-CHARACTER from the image.
+   ❌ DO NOT substitute or guess based on vendor context.
+   Example: If you see a Singha Beer invoice and the line text says
+   "โซดาสิงห์เปลี่ยนขวด" — write exactly that, NOT "เบียร์ลีโอ"
+   even though the vendor is a beer company.
+
+7. ITEM EXTRACTION CRITERIA
+   Only extract a row as an item if it has:
+     ✓ A specific product/service name (not a header/summary)
+     ✓ Usually has quantity, unit, or price
+     ✓ Appears in the body of the items table (between header row and summary)
+   Skip rows that are blank, dividers, or sub-headers.
+
+8. PAYMENT TYPE DETECTION
+   Look for hints in the invoice:
+     "บัตรเครดิต" / "Credit Card" / "VISA" / "Master Card"  → credit_card
+     "โอน" / "Transfer" / "PromptPay" / "พร้อมเพย์"          → transfer
+     "เงินสด" / "Cash"                                       → cash
+     "เช็ค" / "Cheque"                                       → cheque
+     "Payment On Delivery" / "POD" / "เก็บเงินปลายทาง"        → other
+     ไม่ชัดเจน                                                → null
+
+9. NUMBERS ARE NUMERIC
+   Numbers in JSON must be JSON numbers, not strings.
+   1,234.56 → 1234.56 (no comma, no quotes)
+
+10. OUTPUT
+    Pure JSON only. NO markdown fences. NO explanation. NO preamble.
 """
 
 
@@ -623,7 +713,7 @@ def _save_invoice(
         try:
             res = (
                 sb.table("vendor_bills")
-                .select("id, batch_id")
+                .select("*")  # fetch full row so we can backfill nulls
                 .ilike("vendor_name", vendor_name)
                 .eq("invoice_no", invoice_no)
                 .in_("review_status", ["pending", "needs_attention"])
@@ -636,11 +726,24 @@ def _save_invoice(
             log.warning("dedup lookup failed: %s", e)
 
     if existing:
-        # ---- MERGE PATH: append to existing bill ----
+        # ---- MERGE PATH: append items + backfill any null header fields ----
         invoice_id = existing["id"]
         batch_id = existing.get("batch_id") or str(uuid.uuid4())
+
+        # Backfill: if existing has null for a header field but this page provides one,
+        # populate it. This handles multi-page invoices where totals appear only on
+        # the last page (e.g. Makro 3-page invoices).
+        backfill: dict[str, Any] = {}
         if not existing.get("batch_id"):
-            sb.table("vendor_bills").update({"batch_id": batch_id}).eq("id", invoice_id).execute()
+            backfill["batch_id"] = batch_id
+
+        for field in ("merchant_tax_id", "bill_date", "due_date",
+                      "subtotal", "vat", "amount", "payment_type", "notes"):
+            if existing.get(field) in (None, "") and parsed.get(field) not in (None, ""):
+                backfill[field] = parsed.get(field)
+
+        if backfill:
+            sb.table("vendor_bills").update(backfill).eq("id", invoice_id).execute()
 
         page_count_resp = (
             sb.table("attachments")
@@ -735,3 +838,43 @@ def _save_warnings(invoice_id: str, warnings: list[dict[str, str]]):
             "field": w.get("field"),
         })
     sb.table("invoice_validation_warnings").insert(rows).execute()
+
+
+def _revalidate_bill(invoice_id: str) -> list[dict[str, str]]:
+    """
+    Re-run validation against the CURRENT merged state of the vendor_bill.
+    Replaces any existing UNRESOLVED warnings with fresh ones.
+    Resolved warnings (user marked done) are preserved.
+
+    This keeps warnings accurate across multi-page merges — e.g. if page 1
+    of Makro had no total (MISSING_TOTAL fired), then page 3 backfills the
+    total, the MISSING_TOTAL warning should disappear automatically.
+    """
+    sb = get_supabase()
+    res = sb.table("vendor_bills").select("*").eq("id", invoice_id).execute()
+    if not res.data:
+        return []
+    bill = res.data[0]
+
+    # Build a "parsed-like" dict from the bill row
+    parsed_like = {
+        "vendor_name": bill.get("vendor_name"),
+        "merchant_tax_id": bill.get("merchant_tax_id"),
+        "invoice_no": bill.get("invoice_no"),
+        "bill_date": bill.get("bill_date"),
+        "due_date": bill.get("due_date"),
+        "subtotal": bill.get("subtotal"),
+        "vat": bill.get("vat"),
+        "amount": bill.get("amount"),
+    }
+    fresh_warnings = _validate_invoice(parsed_like)
+
+    # Replace only UNRESOLVED warnings (preserve resolved ones for audit trail)
+    sb.table("invoice_validation_warnings").delete().eq(
+        "vendor_bill_id", invoice_id
+    ).eq("resolved", False).execute()
+
+    if fresh_warnings:
+        _save_warnings(invoice_id, fresh_warnings)
+
+    return fresh_warnings
