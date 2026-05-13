@@ -1,5 +1,5 @@
 """
-VEXONHQ OCR API — v3.3 (Phase 1.5: robust dedup + Makro tax-summary fix)
+VEXONHQ OCR API — v3.4 (Phase 1.6: item recall tuning + higher PDF scale)
 
 Endpoints:
   GET  /                              Service info
@@ -82,7 +82,7 @@ def get_openai() -> OpenAI:
 # ============================================================
 # FastAPI app
 # ============================================================
-app = FastAPI(title="VEXONHQ OCR API", version="3.3.0")
+app = FastAPI(title="VEXONHQ OCR API", version="3.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -104,7 +104,7 @@ def root():
     return {
         "success": True,
         "service": "VEXONHQ OCR API",
-        "version": "3.3.0",
+        "version": "3.4.0",
         "status": "running",
     }
 
@@ -403,12 +403,14 @@ def invoice_reject(invoice_id: str, body: RejectRequest):
 # ============================================================
 # Helpers — PDF handling
 # ============================================================
-def _pdf_to_images(pdf_bytes: bytes, scale: float = 2.0) -> list[bytes]:
+def _pdf_to_images(pdf_bytes: bytes, scale: float = 3.0) -> list[bytes]:
     """
     Render each page of a PDF to PNG bytes.
 
-    scale=2.0 gives ~144 DPI which is good for OCR + Vision without huge file size.
-    Increase to 3.0 if Vision struggles with small text.
+    scale=3.0 gives ~216 DPI — sharper text for both Tesseract and GPT Vision.
+    This is especially important for invoices with many small items (e.g. Makro
+    where each page has 20+ rows). Trade-off: slightly larger PNG files sent
+    to OpenAI (still well under their 20MB image limit per page).
     """
     images: list[bytes] = []
     pdf = pdfium.PdfDocument(pdf_bytes)
@@ -495,6 +497,30 @@ Return ONLY valid JSON matching this exact schema (no markdown, no commentary):
 CRITICAL RULES — read carefully, these errors are common:
 ═══════════════════════════════════════════════════════════════
 
+0. ⭐ ITEM COMPLETENESS — EXTRACT EVERY ITEM ROW
+   This is the MOST important rule. Real-world Thai wholesale invoices
+   (Makro, Siam Makro, Big C, Lotus, supplier orders) typically have
+   15 to 35 item rows PER PAGE. If you return only 5-6 items from a
+   page that visibly has many more rows, you are FAILING.
+
+   Strategy:
+   - Look at the items table region (usually the middle/bottom of the page)
+   - Count the rows yourself before extracting
+   - Extract EVERY row that has a product name and a price
+   - Do NOT sample, do NOT skip "similar-looking" rows
+   - If a row's text is partially unclear, still extract what you can read
+   - When in doubt, INCLUDE the row (recall > precision)
+
+   You can identify a real item row by:
+   - It has a product name (Thai or English) that describes a thing
+     (food, beverage, tool, supply, etc.)
+   - It has at least one of: quantity, unit, unit_price, amount
+   - It is in the body of the items table (between the header row
+     and the totals/summary at the bottom)
+
+   ❌ Wrong: Extracting only 6 rows from a 20-row items table
+   ✅ Right: Extracting all 20 rows with product names
+
 1. NULL OVER GUESSING
    Use null (not 0, not empty string) when uncertain. NEVER make up data.
    Especially: NEVER fabricate 13-digit tax IDs. If you can't read clearly → null.
@@ -577,12 +603,22 @@ CRITICAL RULES — read carefully, these errors are common:
    "โซดาสิงห์เปลี่ยนขวด" — write exactly that, NOT "เบียร์ลีโอ"
    even though the vendor is a beer company.
 
-7. ITEM EXTRACTION CRITERIA
-   Only extract a row as an item if it has:
-     ✓ A specific product/service name (not a header/summary)
-     ✓ Usually has quantity, unit, or price
-     ✓ Appears in the body of the items table (between header row and summary)
-   Skip rows that are blank, dividers, or sub-headers.
+7. ITEM EXTRACTION CRITERIA — DEFAULT IS "INCLUDE"
+   For each row in the items table area, ask yourself:
+     - Does it have a product name describing a real thing? → EXTRACT
+     - Is it ONLY a column header label ("รายการ", "DESCRIPTION", "QTY")? → SKIP
+     - Is it ONLY a summary total row ("รวมเงิน", "TOTAL", "VAT")? → SKIP
+     - Is product_name field EMPTY and SKU is just "1" or "2"? → SKIP (tax category)
+     - Anything else? → INCLUDE
+
+   When in doubt: INCLUDE. It's better to include a borderline row
+   than to miss real items. The human will review.
+
+   Watch out for:
+     - Items in second column (some receipts use 2-column item layouts)
+     - Items with very short names (e.g., "เอ.พี. 1 กก.")
+     - Items split across 2 lines (the product name wraps)
+     - Sub-items / variants (extract each)
 
 8. PAYMENT TYPE DETECTION
    Look for hints in the invoice:
@@ -622,7 +658,7 @@ def _run_gpt_vision(image_bytes: bytes, mime_type: str, ocr_hint: str) -> dict[s
         ],
         response_format={"type": "json_object"},
         temperature=0.1,
-        max_tokens=2000,
+        max_tokens=4000,  # increased for high-item-count invoices (Makro 20-30 items/page)
     )
 
     raw = (resp.choices[0].message.content or "{}").strip()
