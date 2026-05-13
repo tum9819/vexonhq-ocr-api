@@ -1,5 +1,5 @@
 """
-VEXONHQ OCR API — v3.5 (Phase 1.7: filter "ไม่ระบุ" placeholder items)
+VEXONHQ OCR API — v3.6 (Phase 1.8: whitespace normalization + invoice_no fallback dedup)
 
 Endpoints:
   GET  /                              Service info
@@ -82,7 +82,7 @@ def get_openai() -> OpenAI:
 # ============================================================
 # FastAPI app
 # ============================================================
-app = FastAPI(title="VEXONHQ OCR API", version="3.5.0")
+app = FastAPI(title="VEXONHQ OCR API", version="3.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -104,7 +104,7 @@ def root():
     return {
         "success": True,
         "service": "VEXONHQ OCR API",
-        "version": "3.5.0",
+        "version": "3.6.0",
         "status": "running",
     }
 
@@ -770,23 +770,26 @@ def _save_invoice(
     Returns (invoice_id, batch_id, page_no, merged).
     """
     sb = get_supabase()
-    vendor_name = (parsed.get("vendor_name") or "").strip() or None
-    invoice_no = (parsed.get("invoice_no") or "").strip() or None
+    # Aggressive whitespace normalization: collapse ALL whitespace (including
+    # internal double-spaces, tabs, zero-width chars) before storage.
+    # Bug v3.5 had: GPT extracted "บริษัท ซีพี" on page 1 and
+    # "บริษัท  ซีพี" (double space) on page 2 → dedup_key differed → 2 bills.
+    vendor_name = _norm_text(parsed.get("vendor_name"))
+    invoice_no = _norm_text(parsed.get("invoice_no"))
 
-    # Compute dedup_key the SAME way the DB does (lower of vendor|invoice).
-    # We use this as the merge lookup key instead of ILIKE on vendor_name —
-    # it matches the unique index exactly, avoids PostgREST URL-encoding
-    # weirdness with Thai text + parentheses, and is O(log n) via index.
+    # Compute dedup_key the SAME way the DB does (lower of vendor|invoice)
     dedup_key = None
     if vendor_name and invoice_no:
         dedup_key = f"{vendor_name.lower()}|{invoice_no.lower()}"
 
     existing = None
+
+    # Primary lookup: exact dedup_key match (most precise)
     if dedup_key:
         try:
             res = (
                 sb.table("vendor_bills")
-                .select("*")  # fetch full row so we can backfill nulls
+                .select("*")
                 .eq("dedup_key", dedup_key)
                 .in_("review_status", ["pending", "needs_attention"])
                 .limit(1)
@@ -795,7 +798,26 @@ def _save_invoice(
             if res.data:
                 existing = res.data[0]
         except Exception as e:
-            log.warning("dedup lookup failed: %s", e)
+            log.warning("dedup lookup (dedup_key) failed: %s", e)
+
+    # Fallback lookup: by invoice_no only (catches case where GPT extracts
+    # vendor_name slightly differently between pages — invoice_no is the
+    # most reliable across pages because it's a unique number on every page).
+    if not existing and invoice_no:
+        try:
+            res = (
+                sb.table("vendor_bills")
+                .select("*")
+                .eq("invoice_no", invoice_no)
+                .in_("review_status", ["pending", "needs_attention"])
+                .limit(1)
+                .execute()
+            )
+            if res.data:
+                existing = res.data[0]
+                log.info("dedup matched by invoice_no fallback (vendor_name differed)")
+        except Exception as e:
+            log.warning("dedup lookup (invoice_no fallback) failed: %s", e)
 
     if existing:
         # ---- MERGE PATH: append items + backfill any null header fields ----
@@ -918,6 +940,24 @@ _PLACEHOLDER_NAMES = {
     "รหัส ภ.พ.", "ภ.พ.", "vat code", "tax code", "vat", "tax",
     "-", "—", "_",
 }
+
+
+def _norm_text(s: Optional[str]) -> Optional[str]:
+    """
+    Aggressively normalize a text value before dedup/storage.
+    - Strips leading/trailing whitespace
+    - Collapses internal whitespace runs (multiple spaces, tabs, newlines)
+      into a single space
+    - Returns None for empty/whitespace-only input
+
+    Prevents dedup_key drift across pages where GPT extracts the same vendor
+    name but with subtly different internal spacing (Bug fixed in v3.6).
+    """
+    if not s:
+        return None
+    # str.split() with no args splits on any whitespace run AND drops empties
+    normalized = " ".join(s.split())
+    return normalized or None
 
 
 def _is_real_item(it: dict[str, Any]) -> bool:
