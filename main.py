@@ -1,5 +1,5 @@
 """
-VEXONHQ OCR API — v3.2 (Phase 1.5: tuned Vision prompt + smart merge)
+VEXONHQ OCR API — v3.3 (Phase 1.5: robust dedup + Makro tax-summary fix)
 
 Endpoints:
   GET  /                              Service info
@@ -82,7 +82,7 @@ def get_openai() -> OpenAI:
 # ============================================================
 # FastAPI app
 # ============================================================
-app = FastAPI(title="VEXONHQ OCR API", version="3.2.0")
+app = FastAPI(title="VEXONHQ OCR API", version="3.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -104,7 +104,7 @@ def root():
     return {
         "success": True,
         "service": "VEXONHQ OCR API",
-        "version": "3.2.0",
+        "version": "3.3.0",
         "status": "running",
     }
 
@@ -551,6 +551,25 @@ CRITICAL RULES — read carefully, these errors are common:
      "หัก ณ ที่จ่าย"
      ตัวอักษรไทยบอกจำนวนเงิน (เช่น "สองหมื่นแปดพัน...บาท")
 
+5.1 ❌ NEVER capture VAT CATEGORY SUMMARY rows as items (Makro pattern)
+    Thai wholesale invoices (esp. Makro) show a VAT category breakdown
+    at the bottom of the items area, like:
+
+      ลำดับ   รหัส ภ.พ.   จำนวน        ราคาสินค้า
+        1                  36.932        3,824.75
+        2                  16            2,067.00
+        รวม                              5,756.53
+
+    The number "1" or "2" alone in the "รหัส" column is a TAX CODE,
+    NOT a product code. The product_name column is EMPTY for these rows.
+    The quantity is the SUM of all items with that VAT rate.
+
+    Rule: if "product_name" / "DESCRIPTION" column is EMPTY OR contains
+    only a digit ("1", "2") → SKIP this row, it's a tax category summary.
+
+    Real items always have a descriptive product name (e.g. "เห็ดนางรมหลวง",
+    "เบียร์ SINGHA RESERVE").
+
 6. PRODUCT NAMES — READ THE EXACT TEXT
    Read each product name CHARACTER-BY-CHARACTER from the image.
    ❌ DO NOT substitute or guess based on vendor context.
@@ -708,14 +727,21 @@ def _save_invoice(
     vendor_name = (parsed.get("vendor_name") or "").strip() or None
     invoice_no = (parsed.get("invoice_no") or "").strip() or None
 
-    existing = None
+    # Compute dedup_key the SAME way the DB does (lower of vendor|invoice).
+    # We use this as the merge lookup key instead of ILIKE on vendor_name —
+    # it matches the unique index exactly, avoids PostgREST URL-encoding
+    # weirdness with Thai text + parentheses, and is O(log n) via index.
+    dedup_key = None
     if vendor_name and invoice_no:
+        dedup_key = f"{vendor_name.lower()}|{invoice_no.lower()}"
+
+    existing = None
+    if dedup_key:
         try:
             res = (
                 sb.table("vendor_bills")
                 .select("*")  # fetch full row so we can backfill nulls
-                .ilike("vendor_name", vendor_name)
-                .eq("invoice_no", invoice_no)
+                .eq("dedup_key", dedup_key)
                 .in_("review_status", ["pending", "needs_attention"])
                 .limit(1)
                 .execute()
@@ -758,31 +784,67 @@ def _save_invoice(
 
     else:
         # ---- CREATE PATH: new bill ----
+        # Retry-on-conflict: if our SELECT missed an existing row (e.g. race
+        # condition, stale read, PostgREST URL-encoding mismatch), the unique
+        # index on dedup_key will reject the INSERT. We catch that, re-fetch
+        # the existing bill, and merge instead of failing.
         invoice_id = str(uuid.uuid4())
         batch_id = str(uuid.uuid4())
         page_no = 1
         merged = False
 
-        sb.table("vendor_bills").insert({
-            "id": invoice_id,
-            "vendor_name": vendor_name,
-            "merchant_tax_id": parsed.get("merchant_tax_id"),
-            "invoice_no": invoice_no,
-            "bill_date": parsed.get("bill_date"),
-            "due_date": parsed.get("due_date"),
-            "subtotal": parsed.get("subtotal"),
-            "vat": parsed.get("vat"),
-            "amount": parsed.get("amount"),
-            "currency": parsed.get("currency") or "THB",
-            "payment_type": parsed.get("payment_type"),
-            "status": "unpaid",
-            "review_status": "pending",
-            "attachment_url": file_url,
-            "ocr_json": parsed,
-            "notes": parsed.get("notes"),
-            "batch_id": batch_id,
-        }).execute()
-        _insert_items(invoice_id, parsed.get("items") or [], page_no)
+        try:
+            sb.table("vendor_bills").insert({
+                "id": invoice_id,
+                "vendor_name": vendor_name,
+                "merchant_tax_id": parsed.get("merchant_tax_id"),
+                "invoice_no": invoice_no,
+                "bill_date": parsed.get("bill_date"),
+                "due_date": parsed.get("due_date"),
+                "subtotal": parsed.get("subtotal"),
+                "vat": parsed.get("vat"),
+                "amount": parsed.get("amount"),
+                "currency": parsed.get("currency") or "THB",
+                "payment_type": parsed.get("payment_type"),
+                "status": "unpaid",
+                "review_status": "pending",
+                "attachment_url": file_url,
+                "ocr_json": parsed,
+                "notes": parsed.get("notes"),
+                "batch_id": batch_id,
+            }).execute()
+            _insert_items(invoice_id, parsed.get("items") or [], page_no)
+        except Exception as e:
+            err = str(e).lower()
+            if dedup_key and ("uq_vendor_bills_dedup" in err or "duplicate key" in err or "23505" in err):
+                log.warning("create-conflict on dedup_key=%s → falling back to merge", dedup_key)
+                # Re-fetch the existing bill (this time exact dedup_key lookup)
+                res = (
+                    sb.table("vendor_bills")
+                    .select("*")
+                    .eq("dedup_key", dedup_key)
+                    .limit(1)
+                    .execute()
+                )
+                if not res.data:
+                    raise RuntimeError(f"unique conflict but no existing row for {dedup_key}")
+                existing = res.data[0]
+                invoice_id = existing["id"]
+                batch_id = existing.get("batch_id") or str(uuid.uuid4())
+                if not existing.get("batch_id"):
+                    sb.table("vendor_bills").update({"batch_id": batch_id}).eq("id", invoice_id).execute()
+                page_count_resp = (
+                    sb.table("attachments")
+                    .select("id", count="exact")
+                    .eq("parent_type", "vendor_bill")
+                    .eq("parent_id", invoice_id)
+                    .execute()
+                )
+                page_no = (page_count_resp.count or 0) + 1
+                merged = True
+                _insert_items(invoice_id, parsed.get("items") or [], page_no)
+            else:
+                raise
 
     # Save attachment row for this page
     if file_url:
