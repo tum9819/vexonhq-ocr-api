@@ -39,10 +39,13 @@ from pydantic import BaseModel
 try:
     from main import get_db_conn  # type: ignore
 except ImportError:
-    # Fallback for standalone testing
-    import psycopg
+    # Fallback when imported before main.get_db_conn is defined
+    # (happens during circular import — main.py imports pos_import before
+    # the function is defined at the line below). psycopg2 is installed
+    # in production via requirements.txt.
+    import psycopg2
     def get_db_conn():
-        return psycopg.connect(os.environ["DATABASE_URL"])
+        return psycopg2.connect(os.environ["DATABASE_URL"])
 
 
 logger = logging.getLogger("pos_import")
