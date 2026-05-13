@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-python-multipart
+-python-multipart
 pytesseract
 opencv-python-headless
 numpy
@@ -9,3 +9,7 @@ pypdfium2>=4.30.0
 openai>=1.40.0
 supabase>=2.7.0
 pydantic>=2.0.0
+openpyxl>=3.1.0
+pandas>=2.0.0
+psycopg[binary]>=3.1.0
+python-multipart>=0.0.6

@@ -39,7 +39,17 @@ from openai import OpenAI
 from PIL import Image
 from pydantic import BaseModel
 from supabase import Client, create_client
+from pos_import import router as pos_router
 
+# === Phase 2: psycopg connection for POS bulk imports ===
+# (Phase 1 uses supabase client for OCR flows — this is for high-volume
+#  executemany() inserts that need raw PG driver)
+
+import psycopg
+
+def get_db_conn():
+    """Open a fresh psycopg v3 connection to Supabase Postgres."""
+    return psycopg.connect(os.environ["DATABASE_URL"])
 
 # ============================================================
 # Config
@@ -82,7 +92,8 @@ def get_openai() -> OpenAI:
 # ============================================================
 # FastAPI app
 # ============================================================
-app = FastAPI(title="VEXONHQ OCR API", version="3.6.0")
+app = FastAPI(title="VEXONHQ OCR API", version="3.7.0")
+app.include_router(pos_router)
 
 app.add_middleware(
     CORSMiddleware,
