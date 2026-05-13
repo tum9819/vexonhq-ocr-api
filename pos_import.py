@@ -797,5 +797,4 @@ async def detect_only(file: UploadFile = File(...)):
         "row_count": len(df),
         "first_row": df.iloc[0].to_dict() if len(df) else None,
     }
- None,
-    }
+
