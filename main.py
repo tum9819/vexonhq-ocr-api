@@ -1,5 +1,5 @@
 """
-VEXONHQ OCR API — v3.4 (Phase 1.6: item recall tuning + higher PDF scale)
+VEXONHQ OCR API — v3.5 (Phase 1.7: filter "ไม่ระบุ" placeholder items)
 
 Endpoints:
   GET  /                              Service info
@@ -82,7 +82,7 @@ def get_openai() -> OpenAI:
 # ============================================================
 # FastAPI app
 # ============================================================
-app = FastAPI(title="VEXONHQ OCR API", version="3.4.0")
+app = FastAPI(title="VEXONHQ OCR API", version="3.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -104,7 +104,7 @@ def root():
     return {
         "success": True,
         "service": "VEXONHQ OCR API",
-        "version": "3.4.0",
+        "version": "3.5.0",
         "status": "running",
     }
 
@@ -590,11 +590,21 @@ CRITICAL RULES — read carefully, these errors are common:
     NOT a product code. The product_name column is EMPTY for these rows.
     The quantity is the SUM of all items with that VAT rate.
 
-    Rule: if "product_name" / "DESCRIPTION" column is EMPTY OR contains
-    only a digit ("1", "2") → SKIP this row, it's a tax category summary.
+    SKIP RULE — any row where product_name matches one of these patterns:
+      - EMPTY / null / blank
+      - "ไม่ระบุ" (= "unspecified" in Thai)
+      - "N/A", "n/a", "NA", "ไม่มี"
+      - "-", "—", "_"
+      - just a digit "1", "2", "3" with no name
+      - "unspecified", "unknown", "blank"
+      - "รหัส ภ.พ.", "ภ.พ.", "VAT", "TAX CODE"
 
-    Real items always have a descriptive product name (e.g. "เห็ดนางรมหลวง",
-    "เบียร์ SINGHA RESERVE").
+    A REAL item ALWAYS has a meaningful descriptive name:
+      ✅ "เห็ดนางรมหลวง ขนาด L 1 กก." → KEEP
+      ✅ "เบียร์ SINGHA RESERVE (12x620CC)" → KEEP
+      ❌ "ไม่ระบุ" → DROP, never include (it's a placeholder)
+      ❌ null product_name → DROP, never include
+      ❌ "1" → DROP, it's a tax code not a product
 
 6. PRODUCT NAMES — READ THE EXACT TEXT
    Read each product name CHARACTER-BY-CHARACTER from the image.
@@ -897,15 +907,47 @@ def _save_invoice(
     return invoice_id, batch_id, page_no, merged
 
 
+# Placeholder product names that GPT sometimes returns instead of null.
+# These are NEVER real items — they are tax-category summary rows or
+# unrecognized rows. Filter aggressively at the backend so they never reach
+# the items table, regardless of what the prompt told Vision to do.
+_PLACEHOLDER_NAMES = {
+    "ไม่ระบุ", "ไม่มี", "ไม่ทราบ",
+    "n/a", "na", "none", "null",
+    "unspecified", "unknown", "blank",
+    "รหัส ภ.พ.", "ภ.พ.", "vat code", "tax code", "vat", "tax",
+    "-", "—", "_",
+}
+
+
+def _is_real_item(it: dict[str, Any]) -> bool:
+    """Return True only if this item dict looks like a real product row."""
+    name = (it.get("product_name") or "").strip()
+    if not name:
+        return False
+    name_lower = name.lower()
+    if name_lower in _PLACEHOLDER_NAMES:
+        return False
+    # Pure digit name (e.g. "1", "2") is a tax code, not a product
+    if name.isdigit():
+        return False
+    # Very short non-alphanumeric like "-" or "—" after lower-stripping
+    if len(name) <= 2 and not any(c.isalnum() for c in name):
+        return False
+    return True
+
+
 def _insert_items(invoice_id: str, items: list[dict[str, Any]], source_page: int):
-    """Bulk insert line items for this invoice page."""
+    """Bulk insert line items for this invoice page (with placeholder filter)."""
     if not items:
         return
     sb = get_supabase()
     rows = []
+    dropped = 0
     for idx, it in enumerate(items, start=1):
-        if not it.get("product_name"):
-            continue  # skip empty
+        if not _is_real_item(it):
+            dropped += 1
+            continue
         rows.append({
             "vendor_bill_id": invoice_id,
             "line_no": it.get("line_no") or idx,
@@ -917,6 +959,8 @@ def _insert_items(invoice_id: str, items: list[dict[str, Any]], source_page: int
             "amount": it.get("amount"),
             "source_page": source_page,
         })
+    if dropped:
+        log.info("filtered %d placeholder item(s) from page %d", dropped, source_page)
     if rows:
         sb.table("invoice_items").insert(rows).execute()
 
