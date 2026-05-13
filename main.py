@@ -45,11 +45,11 @@ from pos_import import router as pos_router
 # (Phase 1 uses supabase client for OCR flows — this is for high-volume
 #  executemany() inserts that need raw PG driver)
 
-import psycopg
+import psycopg2
 
 def get_db_conn():
     """Open a fresh psycopg v3 connection to Supabase Postgres."""
-    return psycopg.connect(os.environ["DATABASE_URL"])
+    return psycopg2.connect(os.environ["DATABASE_URL"])
 
 # ============================================================
 # Config
