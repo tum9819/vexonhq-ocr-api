@@ -1,0 +1,225 @@
+"""
+VEXONHQ Phase 3 F2 — Daybook Routes
+====================================
+Unified chronological feed of POS sales + vendor_bills + manual_entries + AR/AP payments.
+Companion to 09_phase3_f2_daybook_view.sql.
+
+Endpoints (3):
+    GET  /daybook/list      — paginated entries with filters (date/source/direction/q)
+    GET  /daybook/summary   — totals per direction + source for a date range
+    GET  /daybook/health    — smoke test (DB + view)
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import date, datetime, timedelta
+from typing import Any, Optional
+from uuid import UUID
+
+from fastapi import APIRouter, HTTPException, Query
+
+try:
+    from main import get_db_conn  # type: ignore
+except ImportError:
+    import os
+    import psycopg2
+    def get_db_conn():
+        return psycopg2.connect(os.environ["DATABASE_URL"])
+
+
+logger = logging.getLogger("phase3_daybook_routes")
+router = APIRouter(tags=["phase3-daybook"])
+
+VALID_SOURCES = {"pos_sale", "vendor_bill", "manual", "ar_payment", "ap_payment"}
+VALID_DIRECTIONS = {"income", "expense"}
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def _serialize_row(row: dict) -> dict:
+    out: dict[str, Any] = {}
+    for k, v in row.items():
+        if isinstance(v, UUID):
+            out[k] = str(v)
+        elif isinstance(v, (datetime, date)):
+            out[k] = v.isoformat()
+        elif hasattr(v, "__float__") and not isinstance(v, (int, float, bool)):
+            out[k] = float(v)
+        else:
+            out[k] = v
+    return out
+
+
+def _rows_to_dicts(cur) -> list[dict]:
+    if cur.description is None:
+        return []
+    cols = [d[0] for d in cur.description]
+    return [_serialize_row(dict(zip(cols, r))) for r in cur.fetchall()]
+
+
+def _default_range() -> tuple[date, date]:
+    """Default: this month from day 1 to today."""
+    today = date.today()
+    return today.replace(day=1), today
+
+
+# ============================================================
+# Endpoints
+# ============================================================
+
+@router.get("/daybook/list")
+def list_daybook(
+    date_from: Optional[date] = Query(None),
+    date_to: Optional[date] = Query(None),
+    source: Optional[str] = Query(None, description="comma-separated: pos_sale,vendor_bill,manual,ar_payment,ap_payment"),
+    direction: Optional[str] = Query(None, description="income | expense"),
+    q: Optional[str] = Query(None, description="search label/counterparty/doc_no/notes"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """Paginated daybook entries, newest first."""
+    df, dt = (date_from, date_to)
+    if not df and not dt:
+        df, dt = _default_range()
+
+    where: list[str] = []
+    params: list[Any] = []
+    if df:
+        where.append("entry_date >= %s"); params.append(df)
+    if dt:
+        where.append("entry_date <= %s"); params.append(dt)
+    if direction:
+        if direction not in VALID_DIRECTIONS:
+            raise HTTPException(400, f"direction must be one of {sorted(VALID_DIRECTIONS)}")
+        where.append("direction = %s"); params.append(direction)
+    if source:
+        # Comma-separated allowed
+        sources = [s.strip() for s in source.split(",") if s.strip()]
+        bad = [s for s in sources if s not in VALID_SOURCES]
+        if bad:
+            raise HTTPException(400, f"Unknown source(s): {bad}. Valid: {sorted(VALID_SOURCES)}")
+        where.append("source = ANY(%s)"); params.append(sources)
+    if q:
+        where.append("(label ILIKE %s OR counterparty ILIKE %s OR doc_no ILIKE %s OR notes ILIKE %s)")
+        params.extend([f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%"])
+
+    sql_where = (" WHERE " + " AND ".join(where)) if where else ""
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT source, entry_date, direction, amount, label, counterparty, "
+                f"       branch_code, source_id, doc_no, category_code, payment_method, notes, created_at "
+                f"FROM public.v_daybook{sql_where} "
+                f"ORDER BY entry_date DESC, created_at DESC "
+                f"LIMIT %s OFFSET %s",
+                params + [limit, offset],
+            )
+            rows = _rows_to_dicts(cur)
+
+            cur.execute(
+                f"SELECT count(*) FROM public.v_daybook{sql_where}",
+                params,
+            )
+            total = cur.fetchone()[0]
+        return {
+            "rows": rows,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "date_from": df.isoformat() if df else None,
+            "date_to": dt.isoformat() if dt else None,
+        }
+    finally:
+        conn.close()
+
+
+@router.get("/daybook/summary")
+def daybook_summary(
+    date_from: Optional[date] = Query(None),
+    date_to: Optional[date] = Query(None),
+):
+    """Totals per direction and per source for the date range.
+    Default range: this month."""
+    df, dt = (date_from, date_to)
+    if not df and not dt:
+        df, dt = _default_range()
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # Direction totals
+            cur.execute(
+                """SELECT direction,
+                          count(*)::int                     AS count,
+                          sum(amount)::numeric(14,2)        AS total
+                   FROM public.v_daybook
+                   WHERE entry_date >= %s AND entry_date <= %s
+                   GROUP BY direction""",
+                (df, dt),
+            )
+            direction_rows = cur.fetchall()
+            by_direction = {
+                "income":  {"count": 0, "total": 0.0},
+                "expense": {"count": 0, "total": 0.0},
+            }
+            for d, count, total in direction_rows:
+                by_direction[d] = {"count": int(count), "total": float(total or 0)}
+
+            net = by_direction["income"]["total"] - by_direction["expense"]["total"]
+
+            # Source breakdown
+            cur.execute(
+                """SELECT source,
+                          direction,
+                          count(*)::int                    AS count,
+                          sum(amount)::numeric(14,2)       AS total
+                   FROM public.v_daybook
+                   WHERE entry_date >= %s AND entry_date <= %s
+                   GROUP BY source, direction
+                   ORDER BY source""",
+                (df, dt),
+            )
+            by_source: dict[str, dict[str, Any]] = {}
+            for s, d, count, total in cur.fetchall():
+                if s not in by_source:
+                    by_source[s] = {"income": {"count": 0, "total": 0.0},
+                                    "expense": {"count": 0, "total": 0.0}}
+                by_source[s][d] = {"count": int(count), "total": float(total or 0)}
+
+        return {
+            "date_from": df.isoformat(),
+            "date_to":   dt.isoformat(),
+            "by_direction": by_direction,
+            "net":          float(net),
+            "by_source":    by_source,
+        }
+    finally:
+        conn.close()
+
+
+@router.get("/daybook/health")
+def daybook_health():
+    """Smoke: DB reachable + view queryable + breakdown counts."""
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM public.v_daybook")
+            total = cur.fetchone()[0]
+            cur.execute(
+                """SELECT source, count(*)::int
+                   FROM public.v_daybook
+                   GROUP BY source ORDER BY source"""
+            )
+            sources = {row[0]: int(row[1]) for row in cur.fetchall()}
+        return {
+            "db": "ok",
+            "total_entries": int(total),
+            "by_source": sources,
+        }
+    finally:
+        conn.close()
