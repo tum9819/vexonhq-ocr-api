@@ -44,6 +44,7 @@ from phase2_routes import router as phase2_router
 from phase3_arap_routes import router as phase3_arap_router
 from phase3_quick_entry_routes import router as phase3_quick_entry_router
 from phase3_daybook_routes import router as phase3_daybook_router
+from phase3_category_routes import router as phase3_category_router
 # === Phase 2: psycopg connection for POS bulk imports ===
 # (Phase 1 uses supabase client for OCR flows — this is for high-volume
 #  executemany() inserts that need raw PG driver)
@@ -101,6 +102,7 @@ app.include_router(phase2_router)
 app.include_router(phase3_arap_router)
 app.include_router(phase3_quick_entry_router)
 app.include_router(phase3_daybook_router)
+app.include_router(phase3_category_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
