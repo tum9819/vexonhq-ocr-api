@@ -41,6 +41,7 @@ from pydantic import BaseModel
 from supabase import Client, create_client
 from pos_import import router as pos_router
 from phase2_routes import router as phase2_router
+from phase3_arap_routes import router as phase3_arap_router
 # === Phase 2: psycopg connection for POS bulk imports ===
 # (Phase 1 uses supabase client for OCR flows — this is for high-volume
 #  executemany() inserts that need raw PG driver)
@@ -95,6 +96,7 @@ def get_openai() -> OpenAI:
 app = FastAPI(title="VEXONHQ OCR API", version="3.7.0")
 app.include_router(pos_router)
 app.include_router(phase2_router)
+app.include_router(phase3_arap_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
