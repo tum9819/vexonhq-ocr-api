@@ -723,11 +723,16 @@ async def import_pos_excel(
                 if not rows:
                     continue
                 if table == "_inventory_items":
-                    # special: needs snapshot id from preceding insert
+                    # special: needs snapshot id from the snapshot we JUST inserted
                     cur.execute("SELECT id FROM pos_inventory_snapshots "
-                                "WHERE source_import_id IS NULL "
-                                "ORDER BY created_at DESC LIMIT 1")
-                    snap_id = cur.fetchone()[0]
+                                "WHERE source_import_id = %s "
+                                "ORDER BY created_at DESC LIMIT 1",
+                                (import_id,))
+                    snap_row = cur.fetchone()
+                    if not snap_row:
+                        logger.warning("inventory items present but no snapshot row found")
+                        continue
+                    snap_id = snap_row[0]
                     for it in rows:
                         it["snapshot_id"] = snap_id
                     cols = list(rows[0].keys())
