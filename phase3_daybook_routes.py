@@ -142,25 +142,41 @@ def list_daybook(
 def daybook_summary(
     date_from: Optional[date] = Query(None),
     date_to: Optional[date] = Query(None),
+    source: Optional[str] = Query(None, description="comma-separated sources to include"),
 ):
     """Totals per direction and per source for the date range.
+    If `source` is passed, totals reflect only those sources.
     Default range: this month."""
     df, dt = (date_from, date_to)
     if not df and not dt:
         df, dt = _default_range()
+
+    # Parse source filter
+    sources_filter: Optional[list[str]] = None
+    if source:
+        sources_filter = [s.strip() for s in source.split(",") if s.strip()]
+        bad = [s for s in sources_filter if s not in VALID_SOURCES]
+        if bad:
+            raise HTTPException(400, f"Unknown source(s): {bad}. Valid: {sorted(VALID_SOURCES)}")
+
+    base_where = "entry_date >= %s AND entry_date <= %s"
+    base_params: list[Any] = [df, dt]
+    if sources_filter:
+        base_where += " AND source = ANY(%s)"
+        base_params.append(sources_filter)
 
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
             # Direction totals
             cur.execute(
-                """SELECT direction,
-                          count(*)::int                     AS count,
-                          sum(amount)::numeric(14,2)        AS total
-                   FROM public.v_daybook
-                   WHERE entry_date >= %s AND entry_date <= %s
-                   GROUP BY direction""",
-                (df, dt),
+                f"""SELECT direction,
+                           count(*)::int              AS count,
+                           sum(amount)::numeric(14,2) AS total
+                    FROM public.v_daybook
+                    WHERE {base_where}
+                    GROUP BY direction""",
+                base_params,
             )
             direction_rows = cur.fetchall()
             by_direction = {
@@ -172,7 +188,8 @@ def daybook_summary(
 
             net = by_direction["income"]["total"] - by_direction["expense"]["total"]
 
-            # Source breakdown
+            # Source breakdown — always show ALL sources here so users see
+            # which sources are hidden by filter (helpful UX context)
             cur.execute(
                 """SELECT source,
                           direction,
@@ -197,6 +214,7 @@ def daybook_summary(
             "by_direction": by_direction,
             "net":          float(net),
             "by_source":    by_source,
+            "applied_sources": sources_filter,
         }
     finally:
         conn.close()
