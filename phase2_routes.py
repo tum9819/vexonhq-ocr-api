@@ -27,13 +27,19 @@ Dependencies: psycopg2-binary (already in requirements.txt)
 
 from __future__ import annotations
 
+import io
 import logging
+import urllib.request
+import zipfile
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import Response
 from pydantic import BaseModel
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 
 # Reuse main.get_db_conn (same pattern as pos_import.py)
 try:
@@ -973,10 +979,6 @@ def export_summary(
 
 def _xlsx_bytes(headers: list[str], rows: list[list], sheet_name: str = "Sheet1") -> bytes:
     """Build a simple XLSX file in-memory and return bytes."""
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment
-    import io
-
     wb = Workbook()
     ws = wb.active
     ws.title = sheet_name[:31]
@@ -1007,7 +1009,6 @@ def export_vat_report(
     month: Optional[str] = Query(None),
 ):
     """รายงานภาษีซื้อ — XLSX, vendor_bills with VAT for the month."""
-    from fastapi.responses import Response
     period_month = _month_start(month)
     pe = _next_month(period_month)
 
@@ -1047,7 +1048,6 @@ def export_vat_report(
 @router.get("/export/wht-3-53")
 def export_wht(month: Optional[str] = Query(None)):
     """ภ.ง.ด. 3/53 — placeholder (empty until WHT schema added)."""
-    from fastapi.responses import Response
     period_month = _month_start(month)
     headers = ["วันที่", "ผู้รับเงิน", "เลขประจำตัวผู้เสียภาษี",
                "ประเภทเงินได้", "จำนวนเงิน", "ภาษีที่หัก"]
@@ -1064,7 +1064,6 @@ def export_wht(month: Optional[str] = Query(None)):
 @router.get("/export/category-summary")
 def export_category_summary(month: Optional[str] = Query(None)):
     """สรุปค่าใช้จ่ายตามหมวด — XLSX."""
-    from fastapi.responses import Response
     period_month = _month_start(month)
     pe = _next_month(period_month)
 
@@ -1100,9 +1099,6 @@ def export_category_summary(month: Optional[str] = Query(None)):
 @router.get("/export/zip-bundle")
 def export_zip_bundle(month: Optional[str] = Query(None)):
     """รวมรูปต้นฉบับ + ใบแทนเป็น ZIP. NOTE: streams from Supabase Storage — slow on first call."""
-    from fastapi.responses import Response
-    import io, zipfile, urllib.request
-
     period_month = _month_start(month)
     pe = _next_month(period_month)
 
