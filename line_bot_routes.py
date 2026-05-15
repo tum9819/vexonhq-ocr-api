@@ -251,9 +251,10 @@ def _save_quick_expense(description: str, amount: float) -> str:
         entry_id = str(uuid.uuid4())
         cur.execute("""
             INSERT INTO public.manual_entries
-                (id, entry_date, direction, amount, description, category_code, branch_code)
-            VALUES (%s, %s, 'expense', %s, %s, 'other_expense', 'thawi_watthana')
-        """, (entry_id, date.today(), amount, description))
+                (id, entry_date, direction, amount, label, description,
+                 category_code, payment_method, branch_code)
+            VALUES (%s, %s, 'expense', %s, %s, %s, 'other_expense', 'cash', 'thawi_watthana')
+        """, (entry_id, date.today(), amount, description, description))
         conn.commit()
         return entry_id
     finally:
