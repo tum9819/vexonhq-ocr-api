@@ -893,7 +893,7 @@ async def import_pos_excel(
             # 7. Update import record
             cur.execute(
                 "UPDATE public.pos_imports "
-                "SET status='done', period_start=%s, period_end=%s, "
+                "SET status='success', period_start=%s, period_end=%s, "
                 "row_count=%s, finished_at=now() WHERE id=%s",
                 (ps, pe, total_rows, import_id))
             conn.commit()
@@ -901,7 +901,7 @@ async def import_pos_excel(
         return ImportResponse(
             import_id=import_id,
             report_type=rtype,
-            status="done",
+            status="success",
             rows_imported=total_rows,
             period_start=ps,
             period_end=pe,
