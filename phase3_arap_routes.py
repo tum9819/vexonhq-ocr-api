@@ -557,6 +557,23 @@ def create_payment(body: PaymentCreate):
                     f"requested: {body.amount:.2f}",
                 )
 
+            # ── Duplicate guard: same (entry_id, payment_date, amount) within 30s ──
+            cur.execute(
+                """SELECT id FROM public.ar_ap_payments
+                   WHERE entry_id = %s
+                     AND payment_date = %s
+                     AND amount = %s
+                     AND created_at > NOW() - INTERVAL '30 seconds'
+                   LIMIT 1""",
+                (str(eid), body.payment_date, body.amount),
+            )
+            if cur.fetchone():
+                raise HTTPException(
+                    409,
+                    "รายการซ้ำกัน — พบการชำระเงินจำนวนเดียวกันในวันเดียวกันเมื่อครู่นี้ "
+                    "กรุณารอ 30 วินาทีหากต้องการบันทึกซ้ำ",
+                )
+
             cur.execute(
                 """INSERT INTO public.ar_ap_payments
                        (entry_id, payment_date, amount, method, reference_no, notes, created_by)
