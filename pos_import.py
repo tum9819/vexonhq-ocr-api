@@ -894,7 +894,7 @@ async def import_pos_excel(
             cur.execute(
                 "UPDATE public.pos_imports "
                 "SET status='done', period_start=%s, period_end=%s, "
-                "row_count=%s, completed_at=now() WHERE id=%s",
+                "row_count=%s, finished_at=now() WHERE id=%s",
                 (ps, pe, total_rows, import_id))
             conn.commit()
 
@@ -915,7 +915,7 @@ async def import_pos_excel(
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE public.pos_imports SET status='error', "
-                    "error_msg=%s WHERE id=%s",
+                    "error_message=%s WHERE id=%s",
                     (str(e)[:2000], import_id))
                 conn.commit()
         except Exception:
@@ -946,7 +946,7 @@ def list_imports(
                 params.append(report_type)
             cur.execute(
                 "SELECT id, report_type, source_file, row_count, status, "
-                "period_start, period_end, uploaded_at, completed_at, error_msg "
+                "period_start, period_end, uploaded_at, finished_at, error_message "
                 "FROM public.pos_imports {} "
                 "ORDER BY uploaded_at DESC LIMIT %s OFFSET %s".format(where),
                 (*params, limit, offset))
