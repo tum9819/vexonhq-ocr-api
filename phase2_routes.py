@@ -374,7 +374,7 @@ def dashboard_overview(
                    WHERE month = %s AND branch_code = %s
                      AND status IN ('warning','over')
                    ORDER BY pct_used DESC NULLS LAST""",
-                (month_start, branch),
+                (month_start.strftime("%Y-%m"), branch),
             )
             budget_alerts = [
                 {
