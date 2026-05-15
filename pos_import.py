@@ -990,7 +990,7 @@ async def detect_only(file: UploadFile = File(...)):
         raise HTTPException(400, f"Cannot read Excel: {e}")
     rtype = detect_report_type(list(df.columns))
     return {
-        "detected":  rtype,
-        "headers":   list(df.columns)[:12],
-        "row_count": len(df) - 1,
+        "report_type": rtype,
+        "headers":     list(df.columns)[:12],
+        "row_count":   len(df) - 1,
     }
