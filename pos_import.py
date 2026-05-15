@@ -61,6 +61,13 @@ router = APIRouter(prefix="/pos", tags=["pos"])
 SIGNATURES: dict[str, list[str]] = {
     # Most specific first (drawer must be checked before daily_summary
     # because both share "วันที่" + "ยอดก่อนลด")
+    #
+    # Type 8: cashflow_detail — "รายละเอียดการจ่ายเข้า/ออก"
+    # Unique columns: เวลา (full datetime) + รายละเอียด + ประเภท
+    # Must be checked BEFORE daily_drawer (both have รหัสถาดเก็บเงิน)
+    "cashflow_detail": [
+        "เวลา", "รายละเอียด", "ประเภท", "รหัสถาดเก็บเงิน",
+    ],
     "daily_drawer": [
         "วันที่", "รหัสถาดเก็บเงิน", "ยอดก่อนลด", "จำนวนบิล",
     ],
@@ -572,6 +579,110 @@ def parse_bill_detail(df: pd.DataFrame, **_) -> dict:
             }}
 
 
+# ============================================================
+# Type 8 — cashflow_detail  ("รายละเอียดการจ่ายเข้า/ออก")
+# ============================================================
+# FoodStory records every manual cash-in/out from the physical
+# tray here.  In practice the current data is 100% เงินออก
+# (cash taken OUT).  Amounts in Excel are negative; we store
+# them as positive and direction is always 'expense'.
+#
+# Special rule — "คืนเงิน" rows:
+#   is_refund = True  → category_code set to 'customer_refund'
+#   These rows appear in v_daybook as source='pos_cashflow_refund'
+#   so P&L can deduct them from revenue rather than add to opex.
+# ============================================================
+
+def _parse_cashflow_datetime(v: Any) -> Optional[datetime]:
+    """Parse FoodStory cashflow datetime: 'DD/MM/YYYY HH:MM' or Timestamp."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    if isinstance(v, datetime):
+        return v
+    if isinstance(v, date):
+        return datetime(v.year, v.month, v.day)
+    s = str(v).strip()
+    if not s:
+        return None
+    for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            pass
+    # fallback: try date-only
+    d = to_date(v)
+    return datetime(d.year, d.month, d.day) if d else None
+
+
+def parse_cashflow_detail(df: pd.DataFrame, **_) -> dict:
+    """
+    Parse FoodStory Type 8: รายละเอียดการจ่ายเข้า/ออก.
+
+    Returns rows for table: pos_cashflow_entries
+    Columns used from df:
+        เวลา              → txn_at  (DD/MM/YYYY HH:MM)
+        รหัสถาดเก็บเงิน  → drawer_code
+        รายละเอียด       → description
+        ประเภท            → txn_type  (always "เงินออก" in current data)
+        จำนวน             → amount  (negative in Excel → stored positive)
+        สาขา              → branch_code
+        หมวดหมู่         → ignored (always NaN in FoodStory export)
+    """
+    rows: list[dict] = []
+    for _, r in df.iterrows():
+        if is_total_row(r):
+            continue
+
+        txn_at = _parse_cashflow_datetime(r.get("เวลา"))
+        if txn_at is None:
+            continue  # skip malformed rows
+
+        drawer = str(r.get("รหัสถาดเก็บเงิน") or "").strip() or None
+        if not drawer:
+            continue
+
+        raw_desc = strip_html(r.get("รายละเอียด")) or ""
+        if not raw_desc:
+            continue
+
+        raw_amount = to_num(r.get("จำนวน"))
+        if raw_amount is None:
+            continue
+        amount = abs(raw_amount)       # store as positive
+
+        txn_type  = strip_html(r.get("ประเภท")) or "เงินออก"
+        direction = "income" if txn_type == "เงินเข้า" else "expense"
+
+        # Detect informal customer refunds (only in เงินออก rows)
+        is_refund = direction == "expense" and "คืนเงิน" in raw_desc.lower()
+
+        rows.append({
+            "txn_at":        txn_at.isoformat(),
+            "txn_date":      txn_at.date().isoformat(),   # explicit — not GENERATED
+            "drawer_code":   drawer,
+            "description":   raw_desc,
+            "txn_type":      txn_type,
+            "direction":     direction,
+            "amount":        amount,
+            "branch_code":   map_branch(r.get("สาขา")),
+            "is_refund":     is_refund,
+            # Pre-seed category for refunds; everything else → pending AI cat.
+            "category_code": "misc" if is_refund else None,  # misc = closest valid code; no customer_refund in expense_categories
+            "ai_cat_status": "skipped" if is_refund else "pending",
+        })
+
+    ps = min(datetime.fromisoformat(r["txn_at"]).date() for r in rows) if rows else None
+    pe = max(datetime.fromisoformat(r["txn_at"]).date() for r in rows) if rows else None
+
+    return {
+        "period_start": ps,
+        "period_end":   pe,
+        "tables": {
+            "pos_cashflow_entries": rows,
+        },
+    }
+
+
 PARSERS = {
     "monthly_summary":      parse_monthly_summary,
     "daily_summary":        parse_daily_summary,
@@ -580,6 +691,7 @@ PARSERS = {
     "sales_by_product":     parse_sales_by_product,
     "inventory":            parse_inventory,
     "bill_detail":          parse_bill_detail,
+    "cashflow_detail":      parse_cashflow_detail,   # Type 8 — petty cash tray
 }
 
 
@@ -644,6 +756,13 @@ WRITER_CONFIG = {
                      "payment_type_raw","payment_method","custom_code",
                      "promo_type","bill_gross","bill_discount","bill_net",
                      "opened_by","closed_by","source_import_id"]),
+    # Type 8 — petty cash tray entries
+    # Dedup key: (drawer_code, txn_at, description, amount)
+    # On re-import only non-classification columns are overwritten;
+    # category_code + ai_cat_status are LEFT UNCHANGED so manual overrides survive.
+    "pos_cashflow_entries": dict(
+        conflict_cols=["drawer_code","txn_at","description","amount"],
+        update_cols=["txn_date","txn_type","direction","branch_code","is_refund"]),
 }
 
 
@@ -752,55 +871,52 @@ async def import_pos_excel(
                         if bid:
                             it["bill_id"] = bid[0]
                     rows = [r for r in rows if "bill_id" in r]
+                    cols = list(rows[0].keys()) if rows else []
                     if rows:
-                        cols = list(rows[0].keys())
                         cur.executemany(
-                            f"INSERT INTO pos_sales_items ({','.join(cols)}) "
-                            f"VALUES ({_values_clause(rows, cols)})", rows)
+                            "INSERT INTO public.pos_sales_items ({}) VALUES ({})".format(
+                                ",".join(cols), _values_clause(rows, cols)),
+                            rows)
                         total_rows += len(rows)
                     continue
-                if table == "pos_inventory_snapshots":
-                    rows[0]["source_import_id"] = import_id
-                    cols = list(rows[0].keys())
-                    cur.executemany(
-                        f"INSERT INTO {table} ({','.join(cols)}) "
-                        f"VALUES ({_values_clause(rows, cols)})", rows)
-                    total_rows += len(rows)
-                    continue
-                # generic upsert
-                cfg = WRITER_CONFIG.get(table)
-                # add source_import_id to every row that has the column
-                for r in rows:
-                    if cfg and "source_import_id" in cfg["update_cols"]:
-                        r["source_import_id"] = import_id
-                if cfg:
-                    _upsert(cur, table, rows, cfg["conflict_cols"],
-                            cfg["update_cols"])
-                    total_rows += len(rows)
-                else:
-                    # fallback plain insert (e.g. pos_sales_payment_summary)
-                    cols = list(rows[0].keys())
-                    cur.executemany(
-                        f"INSERT INTO {table} ({','.join(cols)}) "
-                        f"VALUES ({_values_clause(rows, cols)}) "
-                        f"ON CONFLICT DO NOTHING", rows)
-                    total_rows += len(rows)
 
-            # 7. Finalize import row
-            cur.execute("""UPDATE pos_imports SET status='success',
-                              row_count=%s, period_start=%s, period_end=%s,
-                              finished_at=now() WHERE id=%s""",
-                        (total_rows, ps, pe, import_id))
+                # Regular WRITER_CONFIG tables
+                cfg = WRITER_CONFIG.get(table)
+                if not cfg:
+                    logger.warning("No WRITER_CONFIG for table %s â skipped", table)
+                    continue
+                for r in rows:
+                    r["source_import_id"] = import_id
+                n = _upsert(cur, table, rows, **cfg)
+                total_rows += n
+
+            # 7. Update import record
+            cur.execute(
+                "UPDATE public.pos_imports "
+                "SET status='done', period_start=%s, period_end=%s, "
+                "row_count=%s, completed_at=now() WHERE id=%s",
+                (ps, pe, total_rows, import_id))
             conn.commit()
 
+        return ImportResponse(
+            import_id=import_id,
+            report_type=rtype,
+            status="done",
+            rows_imported=total_rows,
+            period_start=ps,
+            period_end=pe,
+        )
+
+    except HTTPException:
+        raise
     except Exception as e:
-        conn.rollback()
-        logger.exception("Import failed")
+        logger.exception("POS import failed")
         try:
             with conn.cursor() as cur:
-                cur.execute("""UPDATE pos_imports SET status='failed',
-                                  error_message=%s, finished_at=now()
-                                  WHERE id=%s""", (str(e), import_id))
+                cur.execute(
+                    "UPDATE public.pos_imports SET status='error', "
+                    "error_msg=%s WHERE id=%s",
+                    (str(e)[:2000], import_id))
                 conn.commit()
         except Exception:
             pass
@@ -808,74 +924,73 @@ async def import_pos_excel(
     finally:
         conn.close()
 
-    return ImportResponse(
-        import_id=import_id, report_type=rtype, status="success",
-        rows_imported=total_rows, period_start=ps, period_end=pe,
-        detail={"filename": file.filename, "file_size": len(content)})
-
 
 # ============================================================
-# 6. Helper endpoints
+# 6. GET /pos/imports  +  GET /pos/imports/{id}
 # ============================================================
 
 @router.get("/imports")
-def list_imports(limit: int = 50):
-    """List recent imports."""
+def list_imports(
+    report_type: Optional[str] = None,
+    branch_code: str = "thawi_watthana",
+    limit: int = 20,
+    offset: int = 0,
+):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, report_type, branch_code, source_file, status,
-                       row_count, period_start, period_end, uploaded_at,
-                       finished_at, error_message
-                FROM pos_imports
-                ORDER BY uploaded_at DESC
-                LIMIT %s
-            """, (limit,))
+            where = "WHERE branch_code = %s"
+            params: list = [branch_code]
+            if report_type:
+                where += " AND report_type = %s"
+                params.append(report_type)
+            cur.execute(
+                "SELECT id, report_type, source_file, row_count, status, "
+                "period_start, period_end, uploaded_at, completed_at, error_msg "
+                "FROM public.pos_imports {} "
+                "ORDER BY uploaded_at DESC LIMIT %s OFFSET %s".format(where),
+                (*params, limit, offset))
+            rows = cur.fetchall()
             cols = [d[0] for d in cur.description]
-            return [
-                {k: (str(v) if hasattr(v, 'hex') else
-                     v.isoformat() if hasattr(v, 'isoformat') else v)
-                 for k, v in zip(cols, row)}
-                for row in cur.fetchall()
-            ]
+            return {"imports": [dict(zip(cols, r)) for r in rows]}
     finally:
         conn.close()
 
 
 @router.get("/imports/{import_id}")
-def get_import(import_id: str):
+def get_import_detail(import_id: str):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM pos_imports WHERE id=%s", (import_id,))
+            cur.execute("SELECT * FROM public.pos_imports WHERE id = %s", (import_id,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(404, "Import not found")
             cols = [d[0] for d in cur.description]
-            return {
-                k: (str(v) if hasattr(v, 'hex') else
-                    v.isoformat() if hasattr(v, 'isoformat') else v)
-                for k, v in zip(cols, row)
-            }
+            return dict(zip(cols, row))
     finally:
         conn.close()
 
 
+# ============================================================
+# 7. POST /pos/detect-only  â dry-run, no DB write
+# ============================================================
+
 @router.post("/detect-only")
 async def detect_only(file: UploadFile = File(...)):
-    """Dry-run: detect report type without saving anything."""
+    """Detect FoodStory report type from XLSX without saving."""
+    import io as _io
     content = await file.read()
-    import io
+    if not content:
+        raise HTTPException(400, "Empty file")
     try:
-        df = pd.read_excel(io.BytesIO(content), header=1)
+        df = pd.read_excel(_io.BytesIO(content), header=1)
         df = normalize_columns(df)
     except Exception as e:
         raise HTTPException(400, f"Cannot read Excel: {e}")
     rtype = detect_report_type(list(df.columns))
     return {
-        "report_type": rtype,
-        "headers_seen": [str(c) for c in df.columns],
-        "row_count": len(df),
-        "first_row": df.iloc[0].to_dict() if len(df) else None,
+        "detected":  rtype,
+        "headers":   list(df.columns)[:12],
+        "row_count": len(df) - 1,
     }

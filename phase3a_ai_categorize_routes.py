@@ -543,3 +543,159 @@ def ai_categorize_health():
         }
     finally:
         conn.close()
+
+
+# ============================================================
+# CASHFLOW CATEGORIZATION — Phase 3B extension
+# Handles pos_cashflow_entries.ai_cat_status = 'pending'
+# No ai_categorization_log (cashflow tracks status in-table).
+# Uses same 2-tier: rules ILIKE first → GPT-4o-mini fallback.
+# ============================================================
+
+def _build_cashflow_prompt(description: str, categories: list[dict]) -> str:
+    """Prompt tailored for short Thai petty-cash descriptions."""
+    cat_lines = "\n".join(
+        f"  {c['code']}: {c['name_th']}"
+        + (f" (ลูก: {c['parent_code']})" if c.get("parent_code") else "")
+        for c in categories
+    )
+    return f"""คุณเป็นระบบบัญชีร้านอาหารไทย ช่วยจัดหมวดค่าใช้จ่ายเงินสดหน้าร้านด้านล่างนี้
+
+รายการ: "{description}"
+
+หมวดที่มีให้เลือก:
+{cat_lines}
+
+ตัวอย่าง:
+- น้ำแข็ง, ผัก, หมู, ไก่, มะนาว, เอ็น, ไส้กรอก → raw_food
+- ผ้าขี้ริ้ว, กระเช็บ, ถัง, กล่อง → supplies
+- นักร้อง, ดนตรี → entertainment
+- คืนเงิน → customer_refund
+
+ตอบ JSON เท่านั้น (ไม่มีข้อความอื่น):
+{{"category_code": "<code>", "confidence": <0.0-1.0>, "reason": "<เหตุผลสั้น>"}}"""
+
+
+def _categorize_cashflow_one(conn, entry_id: str, allow_llm: bool = True) -> dict:
+    """2-tier categorisation for one pos_cashflow_entries row."""
+    with conn.cursor() as cur:
+        # Fetch entry
+        cur.execute(
+            "SELECT id, description, is_refund, ai_cat_status "
+            "FROM public.pos_cashflow_entries WHERE id = %s",
+            (entry_id,)
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"Cashflow entry not found: {entry_id}")
+        eid, description, is_refund, status = row
+
+        if status != "pending":
+            raise HTTPException(409, f"Entry already processed: {status}")
+
+        # Tier 1 — rules
+        rule_result = _try_rules(cur, description)
+        if rule_result:
+            cat = rule_result["category_code"]
+            cur.execute(
+                "UPDATE public.pos_cashflow_entries "
+                "SET category_code=%s, ai_cat_status='confirmed' WHERE id=%s",
+                (cat, entry_id)
+            )
+            conn.commit()
+            return {"entry_id": entry_id, "description": description,
+                    "tier": "rule", "category_code": cat,
+                    "confidence": 1.0, "cost_usd": 0.0}
+
+        # Tier 2 — LLM
+        if not allow_llm:
+            return {"entry_id": entry_id, "description": description,
+                    "tier": "skipped", "category_code": None,
+                    "confidence": 0.0, "cost_usd": 0.0}
+
+        cats = _fetch_categories(cur)
+        prompt = _build_cashflow_prompt(description, cats)
+        llm = _call_llm(prompt)
+
+        cat = llm.get("category_code", "misc")
+        if not _validate_category_exists(cur, cat):
+            cat = "misc"
+
+        cur.execute(
+            "UPDATE public.pos_cashflow_entries "
+            "SET category_code=%s, ai_cat_status='confirmed' WHERE id=%s",
+            (cat, entry_id)
+        )
+        conn.commit()
+        return {"entry_id": entry_id, "description": description,
+                "tier": "llm", "category_code": cat,
+                "confidence": llm.get("confidence", 0.5),
+                "cost_usd": llm.get("cost_usd", 0.0)}
+
+
+@router.post("/ai/categorize/cashflow/batch")
+def categorize_cashflow_batch(
+    limit: int = Query(100, ge=1, le=500),
+    allow_llm: bool = Query(True),
+):
+    """
+    Auto-categorize pending pos_cashflow_entries.
+    Cron target (same as /ai/categorize/batch).
+    Skips is_refund=true rows (already set to customer_refund).
+    """
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM public.pos_cashflow_entries "
+                "WHERE ai_cat_status='pending' AND is_refund=false "
+                "ORDER BY txn_at ASC LIMIT %s",
+                (limit,)
+            )
+            entry_ids = [str(r[0]) for r in cur.fetchall()]
+
+        processed, errors = [], []
+        for eid in entry_ids:
+            try:
+                result = _categorize_cashflow_one(conn, eid, allow_llm=allow_llm)
+                processed.append(result)
+            except HTTPException as e:
+                errors.append({"entry_id": eid, "error": e.detail})
+            except Exception as e:
+                errors.append({"entry_id": eid, "error": str(e)})
+
+        by_tier = {}
+        total_cost = 0.0
+        for p in processed:
+            by_tier[p["tier"]] = by_tier.get(p["tier"], 0) + 1
+            total_cost += p.get("cost_usd", 0.0)
+
+        return {
+            "processed":           len(processed),
+            "total_pending_before": len(entry_ids),
+            "by_tier":             by_tier,
+            "total_cost_usd":      round(total_cost, 6),
+            "errors":              errors,
+        }
+    finally:
+        conn.close()
+
+
+@router.get("/ai/categorize/cashflow/pending")
+def list_cashflow_pending(limit: int = Query(50)):
+    """List cashflow entries still awaiting categorisation."""
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, txn_date, drawer_code, description, amount, direction "
+                "FROM public.pos_cashflow_entries "
+                "WHERE ai_cat_status='pending' AND is_refund=false "
+                "ORDER BY txn_at ASC LIMIT %s",
+                (limit,)
+            )
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        return {"pending": len(rows), "entries": rows}
+    finally:
+        conn.close()
