@@ -96,105 +96,106 @@ def _clean_number(raw: str) -> float:
 
 def _extract_transactions(pdf_bytes: bytes) -> list[dict]:
     """
-    Extract transaction rows from KBank PDF.
-    Returns list of {txn_date, description, debit, credit, balance}
+    Extract transaction rows from KBank PDF (K+ / KBank Online format).
+
+    KBank PDF structure per page:
+      tables[0] = account info header
+      tables[1] = transaction data — 2 rows:
+        row[0] = column headers
+        row[1] = ALL transactions concatenated by \\n in each cell:
+          col[0] = วันที่/เวลา  e.g. "01-11-25 06:01 รับ"  (DD-MM-YY HH:MM TYPE)
+          col[2] = amount      e.g. "10,000.00"
+          col[3] = balance
+          col[5] = รายละเอียด  e.g. "จาก X4826 บจก.ไลน์ เพย์ (ประ++"
+
+    Direction logic (from col[5]):
+      starts with "จาก"         → income  (credit)
+      starts with "โอนไป"       → expense (debit)
+      starts with "เพื่อชำระ"   → expense (debit)
     """
     rows = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
-            # Try table extraction first
             tables = page.extract_tables()
-            for table in tables:
-                for row in table:
-                    if not row or len(row) < 4:
-                        continue
-                    # Try to find a date in first cell
-                    first = str(row[0] or "").strip()
-                    txn_date = _parse_kbank_date(first)
-                    if not txn_date:
-                        continue
 
-                    # KBank table: Date | Description | Withdrawal | Deposit | Balance
-                    # Column positions may vary — find numeric columns
-                    cells = [str(c or "").strip() for c in row]
+            # ── KBank format: look for table with 6 columns ──
+            data_table = None
+            for t in tables:
+                if len(t) >= 2 and len(t[1]) >= 6:
+                    data_table = t
+                    break
 
-                    # Description is usually the longest non-numeric cell after date
-                    description = ""
-                    debit = 0.0
-                    credit = 0.0
-                    balance = 0.0
+            if data_table is None:
+                continue
 
-                    numeric_vals = []
-                    for cell in cells[1:]:
-                        num = _clean_number(cell)
-                        if num > 0 and re.search(r"\d", cell):
-                            numeric_vals.append((cell, num))
-                        elif cell and not re.match(r"^\d", cell):
-                            if len(cell) > len(description):
-                                description = cell
+            data_row = data_table[1]   # all transactions packed in one row
 
-                    # Assign numeric columns based on position and context
-                    if len(numeric_vals) >= 3:
-                        # Last is balance, first two are debit/credit (one will be 0)
-                        balance = numeric_vals[-1][1]
-                        val1 = numeric_vals[-3][1] if len(numeric_vals) >= 3 else 0
-                        val2 = numeric_vals[-2][1] if len(numeric_vals) >= 2 else 0
-                        # Determine which is debit vs credit from description
-                        desc_lower = description.lower()
-                        if any(w in desc_lower for w in ["รับ", "โอนเข้า", "ฝาก", "receive", "credit"]):
-                            credit = val1 or val2
-                        elif any(w in desc_lower for w in ["จ่าย", "โอนออก", "ถอน", "transfer", "debit"]):
-                            debit = val1 or val2
-                        else:
-                            # Use position: col[-3]=debit, col[-2]=credit typically
-                            debit = val1
-                            credit = val2
-                    elif len(numeric_vals) == 2:
-                        balance = numeric_vals[-1][1]
-                        amt = numeric_vals[-2][1]
-                        desc_lower = description.lower()
-                        if any(w in desc_lower for w in ["รับ", "โอนเข้า", "ฝาก", "receive"]):
-                            credit = amt
-                        else:
-                            debit = amt
+            col_date   = str(data_row[0] or "")
+            col_amount = str(data_row[2] or "")
+            col_detail = str(data_row[5] or "")
 
-                    if debit == 0 and credit == 0:
-                        continue
+            # ── Parse dates: skip "ยอดยกมา" opening-balance line ──
+            date_entries: list[date] = []
+            for line in col_date.split("\n"):
+                line = line.strip()
+                # Must have HH:MM to be a real transaction (not opening balance)
+                m = re.match(r"(\d{2})-(\d{2})-(\d{2})\s+\d{2}:\d{2}", line)
+                if not m:
+                    continue
+                d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3)) + 2000
+                try:
+                    date_entries.append(date(y, mo, d))
+                except ValueError:
+                    pass
 
-                    rows.append({
-                        "txn_date": txn_date,
-                        "description": description or first,
-                        "debit": debit,
-                        "credit": credit,
-                        "balance": balance,
-                    })
+            # ── Parse amounts ──
+            amount_entries: list[float] = []
+            for line in col_amount.split("\n"):
+                line = line.strip()
+                val = _clean_number(line)
+                if val > 0:
+                    amount_entries.append(val)
 
-            # Fallback: text extraction for non-table PDFs
-            if not rows:
-                text = page.extract_text() or ""
-                for line in text.split("\n"):
-                    line = line.strip()
-                    txn_date = _parse_kbank_date(line[:12])
-                    if not txn_date:
-                        continue
-                    numbers = re.findall(r"[\d,]+\.\d{2}", line)
-                    if len(numbers) < 2:
-                        continue
-                    nums = [_clean_number(n) for n in numbers]
-                    balance = nums[-1]
-                    # Find debit/credit from second-to-last and third-to-last
-                    debit = nums[-3] if len(nums) >= 3 else 0
-                    credit = nums[-2] if len(nums) >= 2 else 0
-                    desc_start = 12
-                    desc_end = line.rfind(numbers[0])
-                    description = line[desc_start:desc_end].strip() if desc_end > desc_start else line
-                    rows.append({
-                        "txn_date": txn_date,
-                        "description": description,
-                        "debit": debit,
-                        "credit": credit,
-                        "balance": balance,
-                    })
+            # ── Parse details: merge wrapped continuation lines ──
+            # New entry starts with "จาก", "โอนไป", or "เพื่อชำระ"
+            INCOME_PREFIXES  = ("จาก",)
+            EXPENSE_PREFIXES = ("โอนไป", "เพื่อชำระ")
+            ALL_PREFIXES     = INCOME_PREFIXES + EXPENSE_PREFIXES
+
+            detail_entries: list[str] = []
+            current = ""
+            for line in col_detail.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                if any(line.startswith(p) for p in ALL_PREFIXES):
+                    if current:
+                        detail_entries.append(current)
+                    current = line
+                else:
+                    current = (current + " " + line).strip() if current else line
+            if current:
+                detail_entries.append(current)
+
+            # ── Align and build rows ──
+            n = min(len(date_entries), len(amount_entries), len(detail_entries))
+            for i in range(n):
+                txn_date = date_entries[i]
+                amount   = amount_entries[i]
+                detail   = detail_entries[i]
+
+                if any(detail.startswith(p) for p in INCOME_PREFIXES):
+                    credit, debit = amount, 0.0
+                else:
+                    credit, debit = 0.0, amount
+
+                rows.append({
+                    "txn_date":    txn_date,
+                    "description": detail,
+                    "debit":       debit,
+                    "credit":      credit,
+                    "balance":     0.0,
+                })
 
     return rows
 
