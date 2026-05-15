@@ -89,6 +89,11 @@ SIGNATURES: dict[str, list[str]] = {
     "payment_type_summary": [
         "ประเภทการชำระเงิน", "วิธีบันทึกรายการชำระ", "ยอดก่อนลด",
     ],
+    # Rider delivery platforms — detected BEFORE normalise_columns (raw headers)
+    # Lineman daily summary (XLSX, header row 0, English col names)
+    "lineman_daily": [
+        "time", "sales", "orders", "avgBasketSize",
+    ],
     # Least specific last
     "daily_summary": [
         "วันที่", "ยอดก่อนลด", "ส่วนลดบิล", "จำนวนบิล",
@@ -103,6 +108,65 @@ def detect_report_type(headers: list[str]) -> Optional[str]:
         if all(col in hset for col in required):
             return rtype
     return None
+
+
+# ============================================================
+# 1b. File reader + auto-detector (XLSX / CSV unified)
+# ============================================================
+# Handles:
+#   • FoodStory XLSX  (header on row index 1)
+#   • Lineman XLSX    (header on row index 0, English cols)
+#   • Grab CSV        (UTF-8 BOM, header on row index 0)
+#
+# Returns (df, report_type) or raises HTTPException 400.
+
+def read_and_detect(content: bytes, filename: str):
+    """Parse uploaded file and detect its report type.
+
+    Returns (df, rtype) on success.
+    Raises HTTPException(400) if the type cannot be determined.
+    """
+    import io as _io
+    fname = (filename or "").lower()
+
+    # ── CSV path (Grab Transaction) ────────────────────────────────
+    if fname.endswith(".csv"):
+        try:
+            df = pd.read_csv(_io.BytesIO(content), encoding="utf-8-sig")
+        except Exception as e:
+            raise HTTPException(400, f"Cannot read CSV: {e}")
+        hset = {str(h).strip() for h in df.columns if h is not None}
+        # Grab Transaction: has unique combo of Thai + English headers
+        if "Transaction ID" in hset and "ค่าคอมมิชชันแพลตฟอร์ม" in hset:
+            return df, "grab_transaction"
+        raise HTTPException(
+            400,
+            f"Cannot detect CSV type. Headers seen: {list(df.columns)[:10]}"
+        )
+
+    # ── XLSX path ─────────────────────────────────────────────────
+    try:
+        # Try header=0 first (Lineman + future non-FoodStory XLSX)
+        df0 = pd.read_excel(_io.BytesIO(content), header=0)
+        hset0 = {str(h).strip() for h in df0.columns if h is not None}
+        if {"time", "sales", "orders", "avgBasketSize"}.issubset(hset0):
+            return df0, "lineman_daily"
+
+        # Fall back to FoodStory XLSX (header on row 1)
+        df1 = pd.read_excel(_io.BytesIO(content), header=1)
+        df1 = normalize_columns(df1)
+        rtype = detect_report_type(list(df1.columns))
+        if rtype:
+            return df1, rtype
+
+        raise HTTPException(
+            400,
+            f"Cannot detect report type. Headers seen: {list(df1.columns)[:10]}"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"Cannot read Excel: {e}")
 
 
 # ============================================================
@@ -683,6 +747,144 @@ def parse_cashflow_detail(df: pd.DataFrame, **_) -> dict:
     }
 
 
+
+# ============================================================
+# Type grab_transaction — Grab Food daily CSV
+# ============================================================
+# Grab exports one CSV row per order. We aggregate to daily totals.
+# Key columns (Thai):
+#   วันที่สร้าง          — order creation datetime e.g. "29 Apr 2026 6:22 PM"
+#   ยอด                  — gross order value (positive)
+#   ค่าคอมมิชชันแพลตฟอร์ม — platform commission (negative = cost)
+#   ส่วนลด (ออกโดยร้าน)  — store-funded promo (negative or 0)
+#   ทั้งหมด               — net payout to store (positive)
+# Filter: only rows with หมวดหมู่ == 'ชำระเงิน' (payment rows only)
+
+_GRAB_DATE_FMTS = ["%d %b %Y %I:%M %p", "%d %b %Y %H:%M"]
+
+def _parse_grab_date(v: Any) -> Optional[date]:
+    """Parse Grab datetime string to date. e.g. '29 Apr 2026 6:22 PM'"""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    if isinstance(v, (datetime, date)):
+        return v.date() if isinstance(v, datetime) else v
+    s = str(v).strip()
+    # Normalise: single-digit hour may be missing leading zero
+    for fmt in _GRAB_DATE_FMTS:
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    # Last resort: try dateutil
+    try:
+        from dateutil import parser as _dp
+        return _dp.parse(s).date()
+    except Exception:
+        return None
+
+
+def parse_grab_transaction(df: pd.DataFrame, **_) -> dict:
+    """Aggregate Grab CSV to daily rider_deliveries rows."""
+    # Filter to payment rows only (safety — Grab only exports ชำระเงิน)
+    if "หมวดหมู่" in df.columns:
+        df = df[df["หมวดหมู่"].astype(str).str.strip() == "ชำระเงิน"].copy()
+
+    daily: dict = {}  # date → aggregated values
+    for _, r in df.iterrows():
+        d = _parse_grab_date(r.get("วันที่สร้าง"))
+        if d is None:
+            continue
+        gross   = to_num(r.get("ยอด")) or 0
+        gp      = to_num(r.get("ค่าคอมมิชชันแพลตฟอร์ม")) or 0
+        promo_s = to_num(r.get("ส่วนลด (ออกโดยร้าน)")) or 0
+        payout  = to_num(r.get("ทั้งหมด")) or 0
+        if d not in daily:
+            daily[d] = {"gross_sales": 0.0, "gp_amount": 0.0,
+                        "promo_store": 0.0, "net_payout": 0.0, "order_count": 0}
+        daily[d]["gross_sales"]  += gross
+        daily[d]["gp_amount"]    += gp
+        daily[d]["promo_store"]  += promo_s
+        daily[d]["net_payout"]   += payout
+        daily[d]["order_count"]  += 1
+
+    if not daily:
+        raise HTTPException(400, "No valid Grab payment rows found")
+
+    rows = []
+    for d, agg in sorted(daily.items()):
+        rows.append({
+            "platform":        "grab",
+            "delivery_date":   d,
+            "gross_sales":     round(agg["gross_sales"], 2),
+            "gp_amount":       round(agg["gp_amount"], 2),
+            "gp_is_estimated": False,
+            "promo_store":     round(agg["promo_store"], 2),
+            "net_payout":      round(agg["net_payout"], 2),
+            "order_count":     agg["order_count"],
+            "branch_code":     "thawi_watthana",
+        })
+
+    dates = [r["delivery_date"] for r in rows]
+    return {
+        "period_start": min(dates),
+        "period_end":   max(dates),
+        "tables": {"rider_deliveries": rows},
+    }
+
+
+# ============================================================
+# Type lineman_daily — Lineman daily summary XLSX
+# ============================================================
+# Lineman XLSX (sheet name LINEMAN) columns (English):
+#   time           — YYYY-MM-DD date string or datetime
+#   sales          — gross sales (baht, can be decimal)
+#   orders         — order count (int)
+#   avgBasketSize  — average basket (not stored, just for reference)
+#
+# GP is estimated at 32.1% of gross:
+#   30% platform commission + 7% VAT on the commission
+#   (30% × 1.07 = 32.1%)
+
+_LINEMAN_GP_RATE = 0.321
+
+
+def parse_lineman_daily(df: pd.DataFrame, **_) -> dict:
+    """Parse Lineman daily XLSX to rider_deliveries rows."""
+    rows = []
+    for _, r in df.iterrows():
+        d = to_date(r.get("time"))
+        if d is None:
+            continue
+        gross = to_num(r.get("sales")) or 0
+        if gross <= 0:
+            continue
+        orders = to_int(r.get("orders")) or 0
+        gp_est = round(-gross * _LINEMAN_GP_RATE, 2)   # negative = expense
+        payout = round(gross + gp_est, 2)               # gross - GP
+
+        rows.append({
+            "platform":        "lineman",
+            "delivery_date":   d,
+            "gross_sales":     round(gross, 2),
+            "gp_amount":       gp_est,
+            "gp_is_estimated": True,
+            "promo_store":     0.0,
+            "net_payout":      payout,
+            "order_count":     orders,
+            "branch_code":     "thawi_watthana",
+        })
+
+    if not rows:
+        raise HTTPException(400, "No valid Lineman rows found")
+
+    dates = [r["delivery_date"] for r in rows]
+    return {
+        "period_start": min(dates),
+        "period_end":   max(dates),
+        "tables": {"rider_deliveries": rows},
+    }
+
+
 PARSERS = {
     "monthly_summary":      parse_monthly_summary,
     "daily_summary":        parse_daily_summary,
@@ -692,6 +894,9 @@ PARSERS = {
     "inventory":            parse_inventory,
     "bill_detail":          parse_bill_detail,
     "cashflow_detail":      parse_cashflow_detail,   # Type 8 — petty cash tray
+    # Rider delivery platforms
+    "grab_transaction":     parse_grab_transaction,  # Grab Food CSV
+    "lineman_daily":        parse_lineman_daily,     # Lineman daily XLSX
 }
 
 
@@ -757,6 +962,12 @@ WRITER_CONFIG = {
                      "promo_type","bill_gross","bill_discount","bill_net",
                      "opened_by","closed_by","source_import_id"]),
     # Type 8 — petty cash tray entries
+    "rider_deliveries": dict(
+        conflict_cols=["platform","delivery_date","branch_code"],
+        update_cols=["gross_sales","gp_amount","gp_is_estimated",
+                     "promo_store","net_payout","order_count",
+                     "source_import_id"]),
+
     # Dedup key: (drawer_code, txn_at, description, amount)
     # On re-import only non-classification columns are overwritten;
     # category_code + ai_cat_status are LEFT UNCHANGED so manual overrides survive.
@@ -797,19 +1008,8 @@ async def import_pos_excel(
         raise HTTPException(400, "Empty file")
     file_hash = hashlib.sha256(content).hexdigest()
 
-    # 2. Parse Excel (header row index = 1)
-    try:
-        import io
-        df = pd.read_excel(io.BytesIO(content), header=1)
-        df = normalize_columns(df)        # rename verbose headers → short forms
-    except Exception as e:
-        raise HTTPException(400, f"Cannot read Excel: {e}")
-
-    # 3. Detect type
-    rtype = detect_report_type(list(df.columns))
-    if not rtype:
-        raise HTTPException(400,
-            f"Cannot detect report type. Headers seen: {list(df.columns)[:10]}")
+    # 2. Parse file + detect type (handles XLSX and CSV)
+    df, rtype = read_and_detect(content, file.filename or "")
 
     # 4. Open DB + create pos_imports row
     conn = get_db_conn()
@@ -978,19 +1178,13 @@ def get_import_detail(import_id: str):
 
 @router.post("/detect-only")
 async def detect_only(file: UploadFile = File(...)):
-    """Detect FoodStory report type from XLSX without saving."""
-    import io as _io
+    """Detect report type from XLSX or CSV without saving."""
     content = await file.read()
     if not content:
         raise HTTPException(400, "Empty file")
-    try:
-        df = pd.read_excel(_io.BytesIO(content), header=1)
-        df = normalize_columns(df)
-    except Exception as e:
-        raise HTTPException(400, f"Cannot read Excel: {e}")
-    rtype = detect_report_type(list(df.columns))
+    df, rtype = read_and_detect(content, file.filename or "")
     return {
         "report_type": rtype,
         "headers":     list(df.columns)[:12],
-        "row_count":   len(df) - 1,
+        "row_count":   len(df),
     }
