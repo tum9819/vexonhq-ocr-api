@@ -251,7 +251,8 @@ def get_receipt(receipt_id: str):
 # ============================================================
 
 def _summarize_month(cur, period_month: date, branch_code: str) -> dict:
-    """Helper: pull sales+expense totals for one month + branch from v_daybook (all sources)."""
+    """Helper: pull sales+expense totals for one month + branch from v_daybook (all sources).
+    Excludes owner equity movements and transfer errors from P&L calculations."""
     pe = _next_month(period_month)
     cur.execute(
         """SELECT
@@ -261,7 +262,8 @@ def _summarize_month(cur, period_month: date, branch_code: str) -> dict:
                COUNT(CASE WHEN direction = 'expense' THEN 1 END)::int                            AS expense_bill_count
            FROM public.v_daybook
            WHERE branch_code = %s
-             AND entry_date >= %s AND entry_date < %s""",
+             AND entry_date >= %s AND entry_date < %s
+             AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error')""",
         (branch_code, period_month, pe),
     )
     row = cur.fetchone()
@@ -312,7 +314,8 @@ def dashboard_overview(
                            COALESCE(SUM(CASE WHEN direction='expense' THEN amount ELSE 0 END),0)::numeric
                        FROM public.v_daybook
                        WHERE branch_code = %s
-                         AND entry_date >= %s AND entry_date < %s""",
+                         AND entry_date >= %s AND entry_date < %s
+                         AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error')""",
                     (branch, year_start, ytd_end),
                 )
                 ytd_row = cur.fetchone()

@@ -93,6 +93,7 @@ def pnl_daily(
                  AND s.branch_code = d.branch_code
                 WHERE d.branch_code = %s
                   AND d.entry_date BETWEEN %s AND %s
+                  AND d.source NOT IN ('owner_capital', 'owner_advance', 'transfer_error')
                 GROUP BY d.entry_date
                 ORDER BY d.entry_date
             """, (branch_code, from_date, to_date))
@@ -159,6 +160,7 @@ def pnl_monthly(
                 FROM public.v_daybook d
                 WHERE d.branch_code = %s
                   AND EXTRACT(YEAR FROM d.entry_date) = %s
+                  AND d.source NOT IN ('owner_capital', 'owner_advance', 'transfer_error')
                 GROUP BY TO_CHAR(d.entry_date, 'YYYY-MM')
                 ORDER BY month
             """, (branch_code, year))
@@ -231,6 +233,7 @@ def pnl_by_category(
                 WHERE direction = 'income'
                   AND branch_code = %s
                   AND entry_date BETWEEN %s AND %s
+                  AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error')
             """, (branch_code, from_date, to_date))
             sales_net = float(cur.fetchone()[0] or 0)
 
@@ -246,6 +249,7 @@ def pnl_by_category(
                 WHERE d.direction = 'expense'
                   AND d.branch_code = %s
                   AND d.entry_date BETWEEN %s AND %s
+                  AND d.source NOT IN ('owner_capital', 'owner_advance', 'transfer_error')
                 GROUP BY d.category_code, ec.name_th
                 ORDER BY expense DESC
             """, (branch_code, from_date, to_date))
@@ -260,6 +264,7 @@ def pnl_by_category(
                 WHERE direction = 'expense'
                   AND branch_code = %s
                   AND entry_date BETWEEN %s AND %s
+                  AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error')
                 GROUP BY category_code
             """, (branch_code, prev_from, prev_to))
             prev_map = {
