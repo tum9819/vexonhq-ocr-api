@@ -451,6 +451,63 @@ def list_pending(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge
         conn.close()
 
 
+@router.get("/ai/categorize/log/list")
+def list_log_entries(
+    user_action: Optional[str] = Query(None, description="pending | accept | reject | override | all"),
+    tier: Optional[str] = Query(None, description="rule | llm | manual | fallback"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """List AI categorization log entries with bill context.
+    Default: pending review (user_action IS NULL)."""
+    where: list[str] = []
+    params: list[Any] = []
+
+    if user_action == "pending" or user_action is None:
+        where.append("l.user_action IS NULL")
+    elif user_action in ("accept", "reject", "override"):
+        where.append("l.user_action = %s"); params.append(user_action)
+    elif user_action == "all":
+        pass
+    else:
+        raise HTTPException(400, "user_action must be pending | accept | reject | override | all")
+
+    if tier:
+        if tier not in ("rule", "llm", "manual", "fallback"):
+            raise HTTPException(400, "tier must be rule | llm | manual | fallback")
+        where.append("l.tier_used = %s"); params.append(tier)
+
+    sql_where = (" WHERE " + " AND ".join(where)) if where else ""
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT l.id, l.bill_id, l.tier_used, l.suggested_category,
+                           c.name_th AS category_name, c.color AS category_color,
+                           l.confidence, l.rule_pattern, l.model_name,
+                           l.prompt_tokens, l.completion_tokens, l.cost_usd, l.reason,
+                           l.applied_at, l.user_action, l.user_action_at, l.override_category,
+                           vb.vendor_name, vb.amount, vb.bill_date, vb.invoice_no
+                    FROM public.ai_categorization_log l
+                    LEFT JOIN public.vendor_bills vb ON vb.id = l.bill_id
+                    LEFT JOIN public.expense_categories c ON c.code = l.suggested_category
+                    {sql_where}
+                    ORDER BY l.applied_at DESC
+                    LIMIT %s OFFSET %s""",
+                params + [limit, offset],
+            )
+            rows = _rows_to_dicts(cur)
+            cur.execute(
+                f"SELECT count(*) FROM public.ai_categorization_log l{sql_where}",
+                params,
+            )
+            total = cur.fetchone()[0]
+        return {"rows": rows, "total": int(total), "limit": limit, "offset": offset}
+    finally:
+        conn.close()
+
+
 @router.get("/ai/categorize/stats")
 def categorize_stats():
     """Per-month cost + accuracy stats."""
