@@ -297,8 +297,15 @@ def _build_category_summary(month: str) -> openpyxl.Workbook:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT d.category_code,
-                          COALESCE(ec.name_th, d.category_code) AS name_th,
+                """SELECT COALESCE(d.category_code, d.source) AS category_code,
+                          COALESCE(ec.name_th, d.category_code,
+                            CASE d.source
+                              WHEN 'pos_sale'    THEN 'ยอดขาย POS'
+                              WHEN 'ar_payment'  THEN 'รับชำระ AR'
+                              WHEN 'manual'      THEN 'บันทึกรายรับ'
+                              ELSE d.source
+                            END
+                          ) AS name_th,
                           COALESCE(ec.name_en, '') AS name_en,
                           COUNT(*) AS cnt,
                           SUM(d.amount) AS total_amount
@@ -370,8 +377,8 @@ def _build_daybook(month: str) -> openpyxl.Workbook:
             cur.execute(
                 """SELECT entry_date,
                           direction,
-                          COALESCE(ec.name_th, d.category_code, '') AS category_name,
-                          COALESCE(d.description, d.vendor_name, '') AS detail,
+                          COALESCE(ec.name_th, d.category_code, d.source, '') AS category_name,
+                          COALESCE(d.label, d.counterparty, '') AS detail,
                           d.source,
                           CASE WHEN d.direction = 'income'  THEN d.amount ELSE NULL END AS income,
                           CASE WHEN d.direction = 'expense' THEN d.amount ELSE NULL END AS expense,
@@ -495,7 +502,7 @@ def _build_pnd3(month: str) -> openpyxl.Workbook:
             # ดึงรายการ musician_fee + freelancer จาก v_daybook
             cur.execute(
                 """SELECT entry_date,
-                          COALESCE(vendor_name, description, 'ไม่ระบุชื่อ') AS name,
+                          COALESCE(label, counterparty, 'ไม่ระบุชื่อ') AS name,
                           amount,
                           category_code,
                           source
