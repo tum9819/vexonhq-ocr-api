@@ -399,6 +399,44 @@ def dashboard_overview(
             except Exception as e:
                 logger.error("dashboard_overview: v_budget_status query failed: %s", e)
 
+            # ── Platform breakdown (income by source) ─────────────────────────
+            platform_breakdown = []
+            try:
+                pe = _next_month(month_start)
+                cur.execute(
+                    """SELECT source,
+                              COALESCE(SUM(amount), 0)::numeric AS total,
+                              COUNT(*)::int AS txn_count
+                       FROM public.v_daybook
+                       WHERE direction = 'income'
+                         AND branch_code = %s
+                         AND entry_date >= %s AND entry_date < %s
+                         AND source IN ('pos_sale','rider_income_grab','rider_income_lineman',
+                                        'pos_cashflow','manual','ar_payment')
+                       GROUP BY source
+                       ORDER BY total DESC""",
+                    (branch, month_start, pe),
+                )
+                _SOURCE_LABEL = {
+                    "pos_sale":             "หน้าร้าน (FoodStory)",
+                    "rider_income_grab":    "Grab",
+                    "rider_income_lineman": "Lineman",
+                    "pos_cashflow":         "FoodStory Cashflow",
+                    "manual":               "Manual Entry",
+                    "ar_payment":           "รับชำระ AR",
+                }
+                platform_breakdown = [
+                    {
+                        "source": r[0],
+                        "label": _SOURCE_LABEL.get(r[0], r[0]),
+                        "total": float(r[1] or 0),
+                        "txn_count": int(r[2] or 0),
+                    }
+                    for r in cur.fetchall()
+                ]
+            except Exception as e:
+                logger.error("dashboard_overview: platform_breakdown query failed: %s", e)
+
         return {
             "month": month_start.strftime("%Y-%m"),
             "branch_code": branch,
@@ -412,6 +450,7 @@ def dashboard_overview(
             "trend": trend,
             "top_categories": top_categories,
             "budget_status": budget_alerts,
+            "platform_breakdown": platform_breakdown,
         }
     finally:
         conn.close()
