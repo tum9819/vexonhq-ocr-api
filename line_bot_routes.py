@@ -6,6 +6,9 @@ Endpoints:
   POST /line/digest/today      — build + send today's financial digest
   POST /line/digest/{date}     — build + send digest for a specific date (YYYY-MM-DD)
 
+Built-in scheduler:
+  Runs daily at 06:00 Bangkok time (Asia/Bangkok) — sends yesterday's digest automatically.
+
 Required env vars (set in Coolify):
   LINE_CHANNEL_TOKEN  — long-lived channel access token from LINE Developers Console
   LINE_USER_ID        — TUM's personal LINE user ID (starts with U...)
@@ -16,10 +19,11 @@ import logging
 import os
 import urllib.request
 import urllib.error
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 import psycopg2
+from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import APIRouter, HTTPException
 
 log = logging.getLogger("vexonhq-line")
@@ -138,7 +142,7 @@ def _build_digest(target_date: date) -> str:
             )
             open_anomalies = int(cur.fetchone()[0])
         except Exception:
-            pass  # table may not exist yet
+            pass
 
         net = income_total - expense_total
         margin = (net / income_total * 100) if income_total > 0 else 0.0
@@ -147,7 +151,6 @@ def _build_digest(target_date: date) -> str:
 
         # ── 4. Assemble message ──
         if not income_lines and not expense_lines:
-            # No data for this day
             lines = [
                 "📊 สรุปการเงิน MARA STATION",
                 f"📅 {date_str}",
@@ -193,6 +196,36 @@ def _build_digest(target_date: date) -> str:
 
 
 # ─────────────────────────────────────────────
+# Scheduled job — runs daily at 06:00 Bangkok
+# ─────────────────────────────────────────────
+
+def _scheduled_daily_digest():
+    """APScheduler job: send yesterday's digest to LINE at 06:00 Bangkok time."""
+    yesterday = date.today() - timedelta(days=1)
+    log.info("Scheduled digest — sending for %s", yesterday)
+    try:
+        text = _build_digest(yesterday)
+        _push_text(text)
+        log.info("Scheduled digest sent OK for %s", yesterday)
+    except Exception as e:
+        log.error("Scheduled digest FAILED for %s: %s", yesterday, e)
+
+
+# Start scheduler when module loads (FastAPI startup)
+_scheduler = BackgroundScheduler(timezone="Asia/Bangkok")
+_scheduler.add_job(
+    _scheduled_daily_digest,
+    trigger="cron",
+    hour=6,
+    minute=0,
+    id="daily_line_digest",
+    replace_existing=True,
+)
+_scheduler.start()
+log.info("LINE digest scheduler started — fires daily at 06:00 Asia/Bangkok")
+
+
+# ─────────────────────────────────────────────
 # Endpoints
 # ─────────────────────────────────────────────
 
@@ -224,3 +257,21 @@ def digest_by_date(target_date: str):
     text = _build_digest(d)
     result = _push_text(text)
     return {"success": True, "date": str(d), "message_sent": text, "line_response": result}
+
+
+@router.get("/scheduler/status")
+def scheduler_status():
+    """Check if the daily digest scheduler is running."""
+    jobs = [
+        {
+            "id": j.id,
+            "next_run": str(j.next_run_time),
+        }
+        for j in _scheduler.get_jobs()
+    ]
+    return {
+        "running": _scheduler.running,
+        "timezone": "Asia/Bangkok",
+        "schedule": "daily at 06:00",
+        "jobs": jobs,
+    }
