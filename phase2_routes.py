@@ -321,6 +321,7 @@ def dashboard_overview(
             except Exception as e:
                 logger.error("dashboard_overview: YTD query failed: %s", e)
                 ytd_sales, ytd_expense = 0.0, 0.0
+                conn.rollback()
 
             # ── 6-month trend ─────────────────────────────────────────────────
             trend = []
@@ -338,6 +339,7 @@ def dashboard_overview(
                     })
             except Exception as e:
                 logger.error("dashboard_overview: trend query failed: %s", e)
+                conn.rollback()
 
             # ── Top categories ────────────────────────────────────────────────
             top_categories = []
@@ -371,6 +373,7 @@ def dashboard_overview(
                 ]
             except Exception as e:
                 logger.error("dashboard_overview: top_categories query failed: %s", e)
+                conn.rollback()
 
             # ── Budget alerts ─────────────────────────────────────────────────
             budget_alerts = []
@@ -398,6 +401,7 @@ def dashboard_overview(
                 ]
             except Exception as e:
                 logger.error("dashboard_overview: v_budget_status query failed: %s", e)
+                conn.rollback()
 
             # ── Platform breakdown (income by source) ─────────────────────────
             platform_breakdown = []
