@@ -1,17 +1,23 @@
 """
-line_bot_routes.py — Phase 7: LINE Bot daily digest
-=====================================================
+line_bot_routes.py — Phase 7 + Phase 13: LINE Bot daily digest + OCR Bot
+=========================================================================
 Endpoints:
   GET  /line/test              — send a test ping to TUM's LINE
   POST /line/digest/today      — build + send today's financial digest
   POST /line/digest/{date}     — build + send digest for a specific date (YYYY-MM-DD)
+  POST /line/webhook           — LINE Messaging API webhook
+
+Webhook handles:
+  - text message → AI Search (Phase 11), or quick expense entry (e.g. "ค่าน้ำมัน 450")
+  - image message → GPT Vision OCR → save to vendor_bills (Phase 13 LINE OCR Bot)
 
 Built-in scheduler:
   Runs daily at 06:00 Bangkok time (Asia/Bangkok) — sends yesterday's digest automatically.
 
 Required env vars (set in Coolify):
-  LINE_CHANNEL_TOKEN  — long-lived channel access token from LINE Developers Console
-  LINE_USER_ID        — TUM's personal LINE user ID (starts with U...)
+  LINE_CHANNEL_TOKEN   — long-lived channel access token from LINE Developers Console
+  LINE_CHANNEL_SECRET  — channel secret (for webhook signature verification)
+  LINE_USER_ID         — TUM's personal LINE user ID (starts with U...)
 """
 
 import base64
@@ -22,6 +28,7 @@ import logging
 import os
 import urllib.request
 import urllib.error
+import uuid
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -32,8 +39,9 @@ from fastapi import APIRouter, Header, HTTPException, Request
 log = logging.getLogger("vexonhq-line")
 router = APIRouter(prefix="/line", tags=["line"])
 
-LINE_PUSH_URL  = "https://api.line.me/v2/bot/message/push"
-LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
+LINE_PUSH_URL    = "https://api.line.me/v2/bot/message/push"
+LINE_REPLY_URL   = "https://api.line.me/v2/bot/message/reply"
+LINE_CONTENT_URL = "https://api-data.line.me/v2/bot/message/{message_id}/content"
 
 
 def _get_config() -> tuple[str, str]:
@@ -49,7 +57,7 @@ def _get_db_conn():
 
 
 # ─────────────────────────────────────────────
-# LINE Push helper
+# LINE Push / Reply helpers
 # ─────────────────────────────────────────────
 
 def _push_text(text: str) -> dict:
@@ -83,6 +91,175 @@ def _push_text(text: str) -> dict:
         raise HTTPException(502, f"LINE push failed: {e}")
 
 
+def _reply_line(reply_token: str, text: str) -> None:
+    token = os.environ.get("LINE_CHANNEL_TOKEN", "")
+    payload = json.dumps({
+        "replyToken": reply_token,
+        "messages": [{"type": "text", "text": text}],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        LINE_REPLY_URL,
+        data=payload,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+    except Exception as e:
+        log.error("LINE reply failed: %s", e)
+
+
+# ─────────────────────────────────────────────
+# Phase 13: Image download from LINE Content API
+# ─────────────────────────────────────────────
+
+def _download_line_image(message_id: str) -> bytes:
+    """Download image bytes from LINE Content API."""
+    token = os.environ.get("LINE_CHANNEL_TOKEN", "")
+    url = LINE_CONTENT_URL.format(message_id=message_id)
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        log.error("LINE Content API %s: %s", e.code, body)
+        raise RuntimeError(f"LINE Content API error {e.code}: {body}")
+    except Exception as e:
+        log.error("LINE image download failed: %s", e)
+        raise RuntimeError(f"image download failed: {e}")
+
+
+def _ocr_invoice_image(image_bytes: bytes) -> dict:
+    """
+    Run GPT Vision OCR on image bytes.
+    Reuses _run_gpt_vision from main.py.
+    Returns parsed dict (vendor_name, invoice_no, amount, items, etc.)
+    """
+    try:
+        from main import _run_gpt_vision
+        return _run_gpt_vision(image_bytes, "image/jpeg", "")
+    except Exception as e:
+        log.error("GPT Vision OCR failed: %s", e)
+        raise RuntimeError(f"OCR failed: {e}")
+
+
+def _save_invoice_from_line(parsed: dict, image_bytes: bytes) -> str:
+    """
+    Save OCR result to vendor_bills + invoice_items.
+    Upload image to Supabase Storage (best-effort).
+    Returns invoice_id (UUID).
+    """
+    try:
+        from main import _save_invoice, _upload_to_storage
+    except ImportError as e:
+        raise RuntimeError(f"Cannot import from main: {e}")
+
+    file_name = f"line-ocr-{uuid.uuid4().hex[:8]}.jpg"
+    file_url = None
+    try:
+        file_url, _ = _upload_to_storage(image_bytes, file_name, "image/jpeg")
+    except Exception as e:
+        log.warning("storage upload failed (continuing without file_url): %s", e)
+
+    invoice_id, batch_id, page_no, merged = _save_invoice(
+        parsed=parsed,
+        ocr_text="",
+        file_url=file_url,
+        file_name=file_name,
+        mime_type="image/jpeg",
+    )
+    return invoice_id
+
+
+def _format_ocr_reply(parsed: dict, invoice_id: str) -> str:
+    """Format a friendly LINE reply summarising the OCR result."""
+    vendor = parsed.get("vendor_name") or "ไม่ทราบร้าน"
+    amount = parsed.get("amount")
+    inv_no = parsed.get("invoice_no") or "-"
+    bill_date = parsed.get("bill_date") or "-"
+    items = parsed.get("items") or []
+    item_count = len(items)
+
+    amt_str = f"฿{float(amount):,.2f}" if amount is not None else "ไม่ทราบ"
+
+    lines = [
+        "🧾 OCR สำเร็จ!",
+        "─" * 24,
+        f"🏪 ร้าน: {vendor}",
+        f"📋 เลขที่บิล: {inv_no}",
+        f"📅 วันที่: {bill_date}",
+        f"💰 ยอดรวม: {amt_str}",
+        f"📦 รายการ: {item_count} รายการ",
+        "─" * 24,
+        "✅ บันทึกแล้ว — รอ review ในระบบ",
+        f"🔑 ID: {invoice_id[:8]}...",
+    ]
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────
+# Phase 13: Quick expense text entry
+# e.g. "ค่าน้ำมัน 450" or "ค่าข้าว 120 บาท"
+# ─────────────────────────────────────────────
+
+def _parse_quick_expense(text: str) -> Optional[dict]:
+    """
+    Detect quick expense: first word starts with ค่า/จ่าย/ซื้อ
+    and message contains a number.
+    Examples: "ค่าน้ำมัน 450", "จ่ายค่าไฟ 1200 บาท", "ซื้อผัก 80"
+    """
+    text = text.strip()
+    parts = text.split()
+    if len(parts) < 2:
+        return None
+
+    first = parts[0]
+    if not (first.startswith("ค่า") or
+            first.startswith("จ่าย") or
+            first.startswith("ซื้อ")):
+        return None
+
+    # Find a number anywhere in the message (last number wins)
+    amount: Optional[float] = None
+    for part in reversed(parts):
+        cleaned = part.replace(",", "").replace("บาท", "").replace("฿", "").strip()
+        try:
+            val = float(cleaned)
+            if val > 0:
+                amount = val
+                break
+        except ValueError:
+            continue
+
+    if amount is None:
+        return None
+
+    return {"description": first, "amount": amount}
+
+
+def _save_quick_expense(description: str, amount: float) -> str:
+    """Save quick expense to manual_entries. Returns the new entry ID."""
+    conn = _get_db_conn()
+    try:
+        cur = conn.cursor()
+        entry_id = str(uuid.uuid4())
+        cur.execute("""
+            INSERT INTO public.manual_entries
+                (id, entry_date, direction, amount, description, category_code, branch_code)
+            VALUES (%s, %s, 'expense', %s, %s, 'other_expense', 'thawi_watthana')
+        """, (entry_id, date.today(), amount, description))
+        conn.commit()
+        return entry_id
+    finally:
+        conn.close()
+
+
 # ─────────────────────────────────────────────
 # Digest builder
 # ─────────────────────────────────────────────
@@ -99,6 +276,7 @@ SOURCE_LABELS = {
     "pos_cashflow_refund":  "↩️ คืนเงิน",
     "rider_gp_grab":        "📱 GP Grab",
     "rider_gp_lineman":     "📱 GP Lineman",
+    "bank_statement":       "🏦 Bank Statement",
 }
 
 
@@ -148,12 +326,22 @@ def _build_digest(target_date: date) -> str:
         except Exception:
             pass
 
+        # ── 4. Bank statement needs_review ──
+        bank_needs_review = 0
+        try:
+            cur.execute(
+                "SELECT COUNT(*) FROM public.bank_statement_entries WHERE match_status = 'needs_review'"
+            )
+            bank_needs_review = int(cur.fetchone()[0])
+        except Exception:
+            pass
+
         net = income_total - expense_total
         margin = (net / income_total * 100) if income_total > 0 else 0.0
         date_str = target_date.strftime("%d/%m/%Y")
         sep = "─" * 26
 
-        # ── 4. Assemble message ──
+        # ── 5. Assemble message ──
         if not income_lines and not expense_lines:
             lines = [
                 "📊 สรุปการเงิน MARA STATION",
@@ -187,11 +375,13 @@ def _build_digest(target_date: date) -> str:
             net_icon = "✅" if net >= 0 else "⚠️"
             lines.append(f"{net_icon} กำไรสุทธิ: ฿{net:,.0f} ({margin:.1f}%)")
 
-        # ── 5. Alerts ──
+        # ── 6. Alerts ──
         if pending_bills > 0:
             lines.append(f"\n⏳ รอ review: {pending_bills} ใบ")
         if open_anomalies > 0:
             lines.append(f"🚨 Anomaly: {open_anomalies} รายการ")
+        if bank_needs_review > 0:
+            lines.append(f"🏦 Statement รอจัด: {bank_needs_review} รายการ")
 
         return "\n".join(lines)
 
@@ -275,25 +465,6 @@ def _verify_signature(body: bytes, signature: str) -> bool:
     return base64.b64encode(digest).decode() == signature
 
 
-def _reply_line(reply_token: str, text: str) -> None:
-    token = os.environ.get("LINE_CHANNEL_TOKEN", "")
-    payload = json.dumps({
-        "replyToken": reply_token,
-        "messages": [{"type": "text", "text": text}],
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        LINE_REPLY_URL,
-        data=payload,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10):
-            pass
-    except Exception as e:
-        log.error("LINE reply failed: %s", e)
-
-
 SOURCE_LABELS_SHORT = {
     "pos_sale":             "POS",
     "rider_income_grab":    "Grab",
@@ -328,13 +499,24 @@ def _format_search_for_line(query: str, count: int, total_income: float,
     return "\n".join(lines)
 
 
+# ─────────────────────────────────────────────
+# Webhook — main handler
+# ─────────────────────────────────────────────
+
 @router.post("/webhook")
 async def line_webhook(
     request: Request,
     x_line_signature: str = Header(None, alias="x-line-signature"),
 ):
     """
-    LINE Messaging API webhook — รับข้อความจากผู้ใช้ → AI Search → ตอบกลับ
+    LINE Messaging API webhook
+
+    Routes:
+      📷 image message  → OCR (GPT Vision) → vendor_bills
+      💬 text message:
+          - "ค่าXXX 999"  → quick expense → manual_entries
+          - "help"        → usage help
+          - anything else → AI Search (Phase 11)
 
     ตั้งค่า Webhook URL ใน LINE Developers Console:
       https://<your-domain>/line/webhook
@@ -350,43 +532,97 @@ async def line_webhook(
     for event in data.get("events", []):
         if event.get("type") != "message":
             continue
+
         msg = event.get("message", {})
-        if msg.get("type") != "text":
-            continue
-
-        text = msg.get("text", "").strip()
+        msg_type = msg.get("type")
         reply_token = event.get("replyToken", "")
-        if not text or not reply_token:
+        if not reply_token:
             continue
 
-        log.info("LINE webhook message: %r", text)
+        # ────────────────────────────────────────
+        # 📷 IMAGE MESSAGE — Phase 13 OCR Bot
+        # ────────────────────────────────────────
+        if msg_type == "image":
+            message_id = msg.get("id", "")
+            log.info("LINE webhook image: message_id=%s", message_id)
 
-        # Help message
-        if text.lower() in ("help", "ช่วยเหลือ", "?", "วิธีใช้"):
-            _reply_line(reply_token,
-                "🤖 VEXONHQ AI Search\n"
-                "─────────────────────\n"
-                "พิมพ์คำค้นหาภาษาไทยได้เลยครับ เช่น:\n"
-                "• รายรับจาก Grab เดือนเมษา\n"
-                "• ค่าแก๊สทั้งหมด\n"
-                "• รายจ่ายเกิน 5000 บาท\n"
-                "• บิล Makro เดือนนี้"
-            )
-            continue
+            try:
+                # 1. Download image from LINE
+                image_bytes = _download_line_image(message_id)
 
-        # AI Search
-        try:
-            from phase11_search_routes import _call_claude_filter, _build_and_run_query
-            search_filter = _call_claude_filter(text)
-            results = _build_and_run_query(search_filter, 20)
-            total_income  = sum(r["amount"] for r in results if r["direction"] == "income")
-            total_expense = sum(r["amount"] for r in results if r["direction"] == "expense")
-            reply = _format_search_for_line(text, len(results), total_income, total_expense, results)
-        except Exception as e:
-            log.error("Search for LINE failed: %s", e)
-            reply = f"❌ เกิดข้อผิดพลาด กรุณาลองใหม่\n({str(e)[:80]})"
+                # 2. OCR via GPT Vision
+                _reply_line(reply_token, "⏳ กำลัง OCR ใบกำกับ... รอสักครู่นะครับ")
+                parsed = _ocr_invoice_image(image_bytes)
 
-        _reply_line(reply_token, reply)
+                # 3. Save to vendor_bills
+                invoice_id = _save_invoice_from_line(parsed, image_bytes)
+
+                # 4. Reply result
+                reply = _format_ocr_reply(parsed, invoice_id)
+                _push_text(reply)
+
+            except Exception as e:
+                log.error("LINE OCR flow failed: %s", e)
+                _push_text(f"❌ OCR ล้มเหลว กรุณาลองใหม่\n({str(e)[:80]})")
+
+        # ────────────────────────────────────────
+        # 💬 TEXT MESSAGE
+        # ────────────────────────────────────────
+        elif msg_type == "text":
+            text = msg.get("text", "").strip()
+            if not text:
+                continue
+
+            log.info("LINE webhook text: %r", text)
+
+            # Help
+            if text.lower() in ("help", "ช่วยเหลือ", "?", "วิธีใช้"):
+                _reply_line(reply_token,
+                    "🤖 VEXONHQ LINE Bot\n"
+                    "─────────────────────────\n"
+                    "📷 ส่งรูปใบกำกับ/บิล → OCR อัตโนมัติ\n\n"
+                    "💬 พิมพ์บันทึกค่าใช้จ่ายด่วน:\n"
+                    "  ค่าน้ำมัน 450\n"
+                    "  ค่าแก๊ส 350 บาท\n"
+                    "  ซื้อผัก 200\n\n"
+                    "🔍 หรือค้นหาข้อมูล:\n"
+                    "  รายรับ Grab เดือนเมษา\n"
+                    "  ค่าแก๊สทั้งหมด\n"
+                    "  บิล Makro เดือนนี้"
+                )
+                continue
+
+            # Quick expense entry
+            quick = _parse_quick_expense(text)
+            if quick:
+                try:
+                    entry_id = _save_quick_expense(quick["description"], quick["amount"])
+                    amt_str = f"฿{quick['amount']:,.0f}"
+                    _reply_line(reply_token,
+                        f"✅ บันทึกรายจ่ายแล้ว!\n"
+                        f"─────────────────────────\n"
+                        f"📝 {quick['description']}: {amt_str}\n"
+                        f"📅 {date.today().strftime('%d/%m/%Y')}\n"
+                        f"🔑 ID: {entry_id[:8]}..."
+                    )
+                except Exception as e:
+                    log.error("Quick expense save failed: %s", e)
+                    _reply_line(reply_token, f"❌ บันทึกไม่สำเร็จ: {str(e)[:80]}")
+                continue
+
+            # AI Search (Phase 11)
+            try:
+                from phase11_search_routes import _call_claude_filter, _build_and_run_query
+                search_filter = _call_claude_filter(text)
+                results = _build_and_run_query(search_filter, 20)
+                total_income  = sum(r["amount"] for r in results if r["direction"] == "income")
+                total_expense = sum(r["amount"] for r in results if r["direction"] == "expense")
+                reply = _format_search_for_line(text, len(results), total_income, total_expense, results)
+            except Exception as e:
+                log.error("Search for LINE failed: %s", e)
+                reply = f"❌ เกิดข้อผิดพลาด กรุณาลองใหม่\n({str(e)[:80]})"
+
+            _reply_line(reply_token, reply)
 
     return {"status": "ok"}
 

@@ -298,96 +298,117 @@ def dashboard_overview(
     month_start = _month_start(month)
     prev_start = _prev_month(month_start)
     year_start = date(month_start.year, 1, 1)
+    ytd_end = _next_month(date(month_start.year, 12, 1))
 
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            current = _summarize_month(cur, month_start, branch)
-            prev = _summarize_month(cur, prev_start, branch)
+            # ── Current & prev month summaries ──────────────────────────────
+            try:
+                current = _summarize_month(cur, month_start, branch)
+                prev = _summarize_month(cur, prev_start, branch)
+            except Exception as e:
+                logger.error("dashboard_overview: _summarize_month failed: %s", e)
+                raise
 
-            # YTD
-            cur.execute(
-                """SELECT COALESCE(SUM(net_total),0)::numeric AS sales
-                   FROM public.pos_sales_daily
-                   WHERE branch_code = %s
-                     AND sales_date >= %s AND sales_date <= %s""",
-                (branch, year_start, month_start.replace(day=1) + timedelta(days=31)),
-            )
-            ytd_sales = float(cur.fetchone()[0] or 0)
-            cur.execute(
-                """SELECT COALESCE(SUM(amount),0)::numeric AS expense
-                   FROM public.vendor_bills
-                   WHERE review_status = 'confirmed' AND bill_date IS NOT NULL
-                     AND bill_date >= %s AND bill_date <= %s""",
-                (year_start, month_start.replace(day=1) + timedelta(days=31)),
-            )
-            ytd_expense = float(cur.fetchone()[0] or 0)
+            # ── YTD ──────────────────────────────────────────────────────────
+            try:
+                cur.execute(
+                    """SELECT COALESCE(SUM(net_total),0)::numeric
+                       FROM public.pos_sales_daily
+                       WHERE branch_code = %s
+                         AND sales_date >= %s AND sales_date < %s""",
+                    (branch, year_start, ytd_end),
+                )
+                ytd_sales = float(cur.fetchone()[0] or 0)
+                cur.execute(
+                    """SELECT COALESCE(SUM(amount),0)::numeric
+                       FROM public.vendor_bills
+                       WHERE review_status = 'confirmed' AND bill_date IS NOT NULL
+                         AND bill_date >= %s AND bill_date < %s""",
+                    (year_start, ytd_end),
+                )
+                ytd_expense = float(cur.fetchone()[0] or 0)
+            except Exception as e:
+                logger.error("dashboard_overview: YTD query failed: %s", e)
+                ytd_sales, ytd_expense = 0.0, 0.0
 
-            # 6-month trend ending on current month
+            # ── 6-month trend ─────────────────────────────────────────────────
             trend = []
-            for i in range(5, -1, -1):
-                m = month_start
-                for _ in range(i):
-                    m = _prev_month(m)
-                summ = _summarize_month(cur, m, branch)
-                trend.append({
-                    "month": m.strftime("%Y-%m"),
-                    "sales_net": summ["sales_net"],
-                    "expense_total": summ["expense_total"],
-                    "gross_profit": summ["gross_profit"],
-                })
+            try:
+                for i in range(5, -1, -1):
+                    m = month_start
+                    for _ in range(i):
+                        m = _prev_month(m)
+                    summ = _summarize_month(cur, m, branch)
+                    trend.append({
+                        "month": m.strftime("%Y-%m"),
+                        "sales_net": summ["sales_net"],
+                        "expense_total": summ["expense_total"],
+                        "gross_profit": summ["gross_profit"],
+                    })
+            except Exception as e:
+                logger.error("dashboard_overview: trend query failed: %s", e)
 
-            # Top categories (current month only)
-            pe = _next_month(month_start)
-            cur.execute(
-                """SELECT vb.category_code,
-                          COALESCE(ec.name_th, vb.category_code) AS name_th,
-                          SUM(vb.amount)::numeric AS spent
-                   FROM public.vendor_bills vb
-                   LEFT JOIN public.expense_categories ec ON ec.code = vb.category_code
-                   WHERE vb.review_status = 'confirmed'
-                     AND vb.bill_date IS NOT NULL
-                     AND vb.bill_date >= %s AND vb.bill_date < %s
-                     AND vb.category_code IS NOT NULL
-                   GROUP BY vb.category_code, ec.name_th
-                   ORDER BY spent DESC
-                   LIMIT 5""",
-                (month_start, pe),
-            )
-            top_rows = cur.fetchall()
-            total_categorized = sum(float(r[2] or 0) for r in top_rows) or 1.0
-            top_categories = [
-                {
-                    "category_code": r[0],
-                    "name_th": r[1],
-                    "spent": float(r[2] or 0),
-                    "pct": round(float(r[2] or 0) / total_categorized * 100, 1),
-                }
-                for r in top_rows
-            ]
+            # ── Top categories ────────────────────────────────────────────────
+            top_categories = []
+            try:
+                pe = _next_month(month_start)
+                cur.execute(
+                    """SELECT vb.category_code,
+                              COALESCE(ec.name_th, vb.category_code) AS name_th,
+                              SUM(vb.amount)::numeric AS spent
+                       FROM public.vendor_bills vb
+                       LEFT JOIN public.expense_categories ec ON ec.code = vb.category_code
+                       WHERE vb.review_status = 'confirmed'
+                         AND vb.bill_date IS NOT NULL
+                         AND vb.bill_date >= %s AND vb.bill_date < %s
+                         AND vb.category_code IS NOT NULL
+                       GROUP BY vb.category_code, ec.name_th
+                       ORDER BY spent DESC
+                       LIMIT 5""",
+                    (month_start, pe),
+                )
+                top_rows = cur.fetchall()
+                total_categorized = sum(float(r[2] or 0) for r in top_rows) or 1.0
+                top_categories = [
+                    {
+                        "category_code": r[0],
+                        "name_th": r[1],
+                        "spent": float(r[2] or 0),
+                        "pct": round(float(r[2] or 0) / total_categorized * 100, 1),
+                    }
+                    for r in top_rows
+                ]
+            except Exception as e:
+                logger.error("dashboard_overview: top_categories query failed: %s", e)
 
-            # Budget alerts (warning + over)
-            cur.execute(
-                """SELECT category_code, category_name_th, budget_amount, actual_amount,
-                          pct_used, status
-                   FROM public.v_budget_status
-                   WHERE month = %s AND branch_code = %s
-                     AND status IN ('warning','over')
-                   ORDER BY pct_used DESC NULLS LAST""",
-                (month_start.strftime("%Y-%m"), branch),
-            )
-            budget_alerts = [
-                {
-                    "category_code": r[0],
-                    "name_th": r[1],
-                    "amount_limit": float(r[2] or 0),
-                    "spent": float(r[3] or 0),
-                    "usage_pct": float(r[4] or 0),
-                    "status": r[5],
-                    "alert_at_pct": 80,
-                }
-                for r in cur.fetchall()
-            ]
+            # ── Budget alerts ─────────────────────────────────────────────────
+            budget_alerts = []
+            try:
+                cur.execute(
+                    """SELECT category_code, category_name_th, budget_amount, actual_amount,
+                              pct_used, status
+                       FROM public.v_budget_status
+                       WHERE month = %s AND branch_code = %s
+                         AND status IN ('warning','over')
+                       ORDER BY pct_used DESC NULLS LAST""",
+                    (month_start.strftime("%Y-%m"), branch),
+                )
+                budget_alerts = [
+                    {
+                        "category_code": r[0],
+                        "name_th": r[1],
+                        "amount_limit": float(r[2] or 0),
+                        "spent": float(r[3] or 0),
+                        "usage_pct": float(r[4] or 0),
+                        "status": r[5],
+                        "alert_at_pct": 80,
+                    }
+                    for r in cur.fetchall()
+                ]
+            except Exception as e:
+                logger.error("dashboard_overview: v_budget_status query failed: %s", e)
 
         return {
             "month": month_start.strftime("%Y-%m"),
