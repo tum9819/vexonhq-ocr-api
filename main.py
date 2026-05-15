@@ -1081,4 +1081,9 @@ def _revalidate_bill(invoice_id: str) -> list[dict[str, str]]:
     # Replace only UNRESOLVED warnings (preserve resolved ones for audit trail)
     sb.table("invoice_validation_warnings").delete().eq(
         "vendor_bill_id", invoice_id
-    ).eq("resolved", False).e
+    ).eq("resolved", False).execute()
+
+    if fresh_warnings:
+        _save_warnings(invoice_id, fresh_warnings)
+
+    return fresh_warnings
