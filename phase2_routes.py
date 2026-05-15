@@ -366,14 +366,14 @@ def dashboard_overview(
                 for r in top_rows
             ]
 
-            # Budget alerts (warn + over)
+            # Budget alerts (warning + over)
             cur.execute(
-                """SELECT category_code, category_name, amount_limit, spent,
-                          usage_pct, status, alert_at_pct
+                """SELECT category_code, category_name_th, budget_amount, actual_amount,
+                          pct_used, status
                    FROM public.v_budget_status
-                   WHERE period_month = %s AND branch_code = %s
-                     AND status IN ('warn','over')
-                   ORDER BY usage_pct DESC NULLS LAST""",
+                   WHERE month = %s AND branch_code = %s
+                     AND status IN ('warning','over')
+                   ORDER BY pct_used DESC NULLS LAST""",
                 (month_start, branch),
             )
             budget_alerts = [
@@ -384,7 +384,7 @@ def dashboard_overview(
                     "spent": float(r[3] or 0),
                     "usage_pct": float(r[4] or 0),
                     "status": r[5],
-                    "alert_at_pct": r[6],
+                    "alert_at_pct": 80,
                 }
                 for r in cur.fetchall()
             ]

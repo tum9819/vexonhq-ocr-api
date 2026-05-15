@@ -52,6 +52,7 @@ from line_bot_routes import router as line_router
 from budget_routes import router as budget_router
 from export_routes import router as export_router
 from phase10_narrative_routes import router as narrative_router
+from phase11_search_routes import router as search_router
 # === Phase 2: psycopg connection for POS bulk imports ===
 # (Phase 1 uses supabase client for OCR flows — this is for high-volume
 #  executemany() inserts that need raw PG driver)
@@ -117,6 +118,7 @@ app.include_router(line_router)
 app.include_router(budget_router)
 app.include_router(export_router)
 app.include_router(narrative_router)
+app.include_router(search_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
