@@ -14,6 +14,9 @@ Required env vars (set in Coolify):
   LINE_USER_ID        — TUM's personal LINE user ID (starts with U...)
 """
 
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -24,12 +27,13 @@ from typing import Optional
 
 import psycopg2
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
 
 log = logging.getLogger("vexonhq-line")
 router = APIRouter(prefix="/line", tags=["line"])
 
-LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
+LINE_PUSH_URL  = "https://api.line.me/v2/bot/message/push"
+LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 
 
 def _get_config() -> tuple[str, str]:
@@ -257,6 +261,134 @@ def digest_by_date(target_date: str):
     text = _build_digest(d)
     result = _push_text(text)
     return {"success": True, "date": str(d), "message_sent": text, "line_response": result}
+
+
+# ─────────────────────────────────────────────
+# Webhook helpers
+# ─────────────────────────────────────────────
+
+def _verify_signature(body: bytes, signature: str) -> bool:
+    secret = os.environ.get("LINE_CHANNEL_SECRET", "")
+    if not secret:
+        return True  # skip verification if secret not set
+    digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).digest()
+    return base64.b64encode(digest).decode() == signature
+
+
+def _reply_line(reply_token: str, text: str) -> None:
+    token = os.environ.get("LINE_CHANNEL_TOKEN", "")
+    payload = json.dumps({
+        "replyToken": reply_token,
+        "messages": [{"type": "text", "text": text}],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        LINE_REPLY_URL,
+        data=payload,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+    except Exception as e:
+        log.error("LINE reply failed: %s", e)
+
+
+SOURCE_LABELS_SHORT = {
+    "pos_sale":             "POS",
+    "rider_income_grab":    "Grab",
+    "rider_income_lineman": "Lineman",
+    "ar_payment":           "รับชำระ",
+    "ap_payment":           "จ่ายชำระ",
+    "manual":               "บันทึกเอง",
+    "bank_statement":       "Bank",
+}
+
+
+def _format_search_for_line(query: str, count: int, total_income: float,
+                              total_expense: float, results: list) -> str:
+    sep = "─" * 24
+    if count == 0:
+        return f'🔍 "{query}"\n{sep}\nไม่พบรายการที่ตรงกันครับ'
+
+    lines = [f'🔍 "{query}"', sep, f"พบ {count} รายการ"]
+    if total_income > 0:
+        lines.append(f"💚 รายรับรวม: ฿{total_income:,.0f}")
+    if total_expense > 0:
+        lines.append(f"🔴 รายจ่ายรวม: ฿{total_expense:,.0f}")
+    lines.append(sep)
+
+    for r in results[:8]:
+        icon = "💚" if r["direction"] == "income" else "🔴"
+        detail = (r.get("detail") or SOURCE_LABELS_SHORT.get(r["source"], r["source"]))[:20]
+        lines.append(f"{icon} {r['entry_date']}: {detail} ฿{r['amount']:,.0f}")
+
+    if count > 8:
+        lines.append(f"... และอีก {count - 8} รายการ")
+    return "\n".join(lines)
+
+
+@router.post("/webhook")
+async def line_webhook(
+    request: Request,
+    x_line_signature: str = Header(None, alias="x-line-signature"),
+):
+    """
+    LINE Messaging API webhook — รับข้อความจากผู้ใช้ → AI Search → ตอบกลับ
+
+    ตั้งค่า Webhook URL ใน LINE Developers Console:
+      https://<your-domain>/line/webhook
+    """
+    body = await request.body()
+
+    if not _verify_signature(body, x_line_signature or ""):
+        log.warning("LINE webhook: invalid signature")
+        return {"status": "invalid signature"}
+
+    data = json.loads(body)
+
+    for event in data.get("events", []):
+        if event.get("type") != "message":
+            continue
+        msg = event.get("message", {})
+        if msg.get("type") != "text":
+            continue
+
+        text = msg.get("text", "").strip()
+        reply_token = event.get("replyToken", "")
+        if not text or not reply_token:
+            continue
+
+        log.info("LINE webhook message: %r", text)
+
+        # Help message
+        if text.lower() in ("help", "ช่วยเหลือ", "?", "วิธีใช้"):
+            _reply_line(reply_token,
+                "🤖 VEXONHQ AI Search\n"
+                "─────────────────────\n"
+                "พิมพ์คำค้นหาภาษาไทยได้เลยครับ เช่น:\n"
+                "• รายรับจาก Grab เดือนเมษา\n"
+                "• ค่าแก๊สทั้งหมด\n"
+                "• รายจ่ายเกิน 5000 บาท\n"
+                "• บิล Makro เดือนนี้"
+            )
+            continue
+
+        # AI Search
+        try:
+            from phase11_search_routes import _call_claude_filter, _build_and_run_query
+            search_filter = _call_claude_filter(text)
+            results = _build_and_run_query(search_filter, 20)
+            total_income  = sum(r["amount"] for r in results if r["direction"] == "income")
+            total_expense = sum(r["amount"] for r in results if r["direction"] == "expense")
+            reply = _format_search_for_line(text, len(results), total_income, total_expense, results)
+        except Exception as e:
+            log.error("Search for LINE failed: %s", e)
+            reply = f"❌ เกิดข้อผิดพลาด กรุณาลองใหม่\n({str(e)[:80]})"
+
+        _reply_line(reply_token, reply)
+
+    return {"status": "ok"}
 
 
 @router.get("/scheduler/status")
