@@ -375,8 +375,8 @@ def _build_daybook(month: str) -> openpyxl.Workbook:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT entry_date,
-                          direction,
+                """SELECT d.entry_date,
+                          d.direction,
                           COALESCE(ec.name_th, d.category_code, d.source, '') AS category_name,
                           COALESCE(d.label, d.counterparty, '') AS detail,
                           d.source,
