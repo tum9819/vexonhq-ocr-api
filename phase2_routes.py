@@ -251,31 +251,24 @@ def get_receipt(receipt_id: str):
 # ============================================================
 
 def _summarize_month(cur, period_month: date, branch_code: str) -> dict:
-    """Helper: pull sales+expense totals for one month + branch."""
+    """Helper: pull sales+expense totals for one month + branch from v_daybook (all sources)."""
     pe = _next_month(period_month)
-    # sales from pos_sales_daily
     cur.execute(
-        """SELECT COALESCE(SUM(net_total),0)::numeric AS sales_net,
-                  COALESCE(SUM(bill_count),0)::int   AS sales_bill_count
-           FROM public.pos_sales_daily
+        """SELECT
+               COALESCE(SUM(CASE WHEN direction = 'income'  THEN amount ELSE 0 END), 0)::numeric AS sales_net,
+               COUNT(CASE WHEN direction = 'income'  THEN 1 END)::int                            AS sales_bill_count,
+               COALESCE(SUM(CASE WHEN direction = 'expense' THEN amount ELSE 0 END), 0)::numeric AS expense_total,
+               COUNT(CASE WHEN direction = 'expense' THEN 1 END)::int                            AS expense_bill_count
+           FROM public.v_daybook
            WHERE branch_code = %s
-             AND sales_date >= %s AND sales_date < %s""",
+             AND entry_date >= %s AND entry_date < %s""",
         (branch_code, period_month, pe),
     )
-    s = cur.fetchone()
-    sales_net, sales_bill_count = float(s[0] or 0), int(s[1] or 0)
-
-    cur.execute(
-        """SELECT COALESCE(SUM(amount),0)::numeric AS expense_total,
-                  count(*)::int AS expense_bill_count
-           FROM public.vendor_bills
-           WHERE review_status = 'confirmed'
-             AND bill_date IS NOT NULL
-             AND bill_date >= %s AND bill_date < %s""",
-        (period_month, pe),
-    )
-    e = cur.fetchone()
-    expense_total, expense_bill_count = float(e[0] or 0), int(e[1] or 0)
+    row = cur.fetchone()
+    sales_net          = float(row[0] or 0)
+    sales_bill_count   = int(row[1] or 0)
+    expense_total      = float(row[2] or 0)
+    expense_bill_count = int(row[3] or 0)
 
     gross_profit = sales_net - expense_total
     margin_pct = round(gross_profit / sales_net * 100, 2) if sales_net else None
@@ -311,24 +304,20 @@ def dashboard_overview(
                 logger.error("dashboard_overview: _summarize_month failed: %s", e)
                 raise
 
-            # ── YTD ──────────────────────────────────────────────────────────
+            # ── YTD (v_daybook — all sources) ────────────────────────────────
             try:
                 cur.execute(
-                    """SELECT COALESCE(SUM(net_total),0)::numeric
-                       FROM public.pos_sales_daily
+                    """SELECT
+                           COALESCE(SUM(CASE WHEN direction='income'  THEN amount ELSE 0 END),0)::numeric,
+                           COALESCE(SUM(CASE WHEN direction='expense' THEN amount ELSE 0 END),0)::numeric
+                       FROM public.v_daybook
                        WHERE branch_code = %s
-                         AND sales_date >= %s AND sales_date < %s""",
+                         AND entry_date >= %s AND entry_date < %s""",
                     (branch, year_start, ytd_end),
                 )
-                ytd_sales = float(cur.fetchone()[0] or 0)
-                cur.execute(
-                    """SELECT COALESCE(SUM(amount),0)::numeric
-                       FROM public.vendor_bills
-                       WHERE review_status = 'confirmed' AND bill_date IS NOT NULL
-                         AND bill_date >= %s AND bill_date < %s""",
-                    (year_start, ytd_end),
-                )
-                ytd_expense = float(cur.fetchone()[0] or 0)
+                ytd_row = cur.fetchone()
+                ytd_sales   = float(ytd_row[0] or 0)
+                ytd_expense = float(ytd_row[1] or 0)
             except Exception as e:
                 logger.error("dashboard_overview: YTD query failed: %s", e)
                 ytd_sales, ytd_expense = 0.0, 0.0
