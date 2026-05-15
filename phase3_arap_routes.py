@@ -691,6 +691,79 @@ def ar_ap_summary():
 
 
 # ============================================================
+# SECTION E — Phase 14: AP Due Date Reminder (LINE)
+# ============================================================
+
+@router.post("/ap/due-reminder")
+def ap_due_reminder():
+    """
+    Phase 14 — ส่ง LINE แจ้งเตือน AP ที่ครบกำหนดภายใน 3 วัน
+    เรียกจาก Coolify cron: 0 9 * * * (09:00 Bangkok)
+    หรือเรียก manual: POST /ap/due-reminder
+    """
+    from line_bot_routes import _push_text  # noqa: PLC0415
+
+    today = date.today()
+    deadline = today + timedelta(days=3)
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    e.id,
+                    COALESCE(c.name, e.counterparty_name_snapshot, 'ไม่ระบุ') AS vendor_name,
+                    e.doc_no,
+                    e.due_date,
+                    e.amount_total,
+                    e.amount_paid,
+                    (e.amount_total - e.amount_paid) AS remaining
+                FROM public.ar_ap_entries e
+                LEFT JOIN public.counterparties c ON c.id = e.counterparty_id
+                WHERE e.direction = 'payable'
+                  AND e.status IN ('pending', 'partial')
+                  AND e.due_date BETWEEN %s AND %s
+                ORDER BY e.due_date ASC
+                """,
+                (today.isoformat(), deadline.isoformat()),
+            )
+            rows = _rows_to_dicts(cur)
+    finally:
+        conn.close()
+
+    if not rows:
+        return {"sent": False, "message": "ไม่มี AP ครบกำหนดใน 3 วันข้างหน้า", "count": 0}
+
+    # ── Build LINE message ──
+    lines = ["⚠️ แจ้งเตือน AP ครบกำหนด (3 วัน)\n"]
+    for r in rows:
+        due_str = r["due_date"]
+        days_left = (date.fromisoformat(due_str) - today).days
+        if days_left == 0:
+            day_label = "🔴 วันนี้!"
+        elif days_left == 1:
+            day_label = "🟠 พรุ่งนี้"
+        else:
+            day_label = f"🟡 อีก {days_left} วัน"
+
+        vendor = r["vendor_name"]
+        remaining = float(r["remaining"])
+        doc = f" ({r['doc_no']})" if r.get("doc_no") else ""
+        lines.append(
+            f"{day_label} — {vendor}{doc}\n"
+            f"ครบกำหนด: {due_str}\n"
+            f"ค้างจ่าย: ฿{remaining:,.2f}\n"
+        )
+
+    lines.append(f"รวม {len(rows)} รายการ — กรุณาชำระตามกำหนด")
+    message = "\n".join(lines)
+
+    _push_text(message)
+    return {"sent": True, "count": len(rows), "entries": rows}
+
+
+# ============================================================
 # Health check
 # ============================================================
 
