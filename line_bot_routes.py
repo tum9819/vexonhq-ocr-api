@@ -804,22 +804,3 @@ async def line_webhook(
     return {"status": "ok"}
 
 
-@router.get("/scheduler/status")
-def scheduler_status():
-    """Check if the daily digest scheduler is running."""
-    jobs = [
-        {
-            "id": j.id,
-            "next_run": str(j.next_run_time),
-        }
-        for j in _scheduler.get_jobs()
-    ]
-    return {
-        "running": _scheduler.running,
-        "timezone": "Asia/Bangkok",
-        "schedules": {
-            "daily_line_digest": "06:00 — ส่ง daily digest",
-            "daily_ap_due_reminder": "09:00 — AP due reminder (Phase 20)",
-        },
-        "jobs": jobs,
-    }
