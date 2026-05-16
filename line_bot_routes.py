@@ -428,6 +428,111 @@ def _scheduled_ap_due_reminder():
         log.error("AP due reminder FAILED: %s", e)
 
 
+# ─────────────────────────────────────────────
+# Phase 21: Weekly Summary — every Monday 08:00
+# ─────────────────────────────────────────────
+
+_THAI_MONTHS_W = ["","ม.ค.","ก.พ.","มี.ค.","เม.ย.","พ.ค.","มิ.ย.","ก.ค.","ส.ค.","ก.ย.","ต.ค.","พ.ย.","ธ.ค."]
+
+
+def _thai_date_w(d: date) -> str:
+    return f"{d.day} {_THAI_MONTHS_W[d.month]}"
+
+
+def _build_weekly_summary() -> str:
+    """Build weekly P&L summary for last Mon–Sun."""
+    conn = _get_db_conn()
+    try:
+        today = date.today()
+        # Last week Mon–Sun (if today is Mon, go back 7 days)
+        days_since_mon = today.weekday()  # 0=Mon, 6=Sun
+        week_end = today - timedelta(days=days_since_mon + 1)    # last Sunday
+        week_start = week_end - timedelta(days=6)                 # last Monday
+
+        cur = conn.cursor()
+
+        # Income / expense totals
+        cur.execute("""
+            SELECT
+                COALESCE(SUM(CASE WHEN direction='income'  THEN amount ELSE 0 END), 0) AS inc,
+                COALESCE(SUM(CASE WHEN direction='expense' THEN amount ELSE 0 END), 0) AS exp
+            FROM public.v_daybook
+            WHERE entry_date BETWEEN %s AND %s
+              AND source NOT IN ('owner_capital','owner_advance','transfer_error')
+        """, (week_start.isoformat(), week_end.isoformat()))
+        row = cur.fetchone()
+        income  = float(row[0])
+        expense = float(row[1])
+        net     = income - expense
+        margin  = (net / income * 100) if income > 0 else 0.0
+
+        # Top 3 expense categories
+        cur.execute("""
+            SELECT COALESCE(cat.name, d.category_code, 'อื่นๆ') AS cat_name,
+                   COALESCE(SUM(d.amount), 0) AS total
+            FROM public.v_daybook d
+            LEFT JOIN public.categories cat ON cat.code = d.category_code
+            WHERE d.entry_date BETWEEN %s AND %s
+              AND d.direction = 'expense'
+              AND d.source NOT IN ('owner_capital','owner_advance','transfer_error')
+            GROUP BY COALESCE(cat.name, d.category_code, 'อื่นๆ')
+            ORDER BY total DESC
+            LIMIT 3
+        """, (week_start.isoformat(), week_end.isoformat()))
+        top_cats = cur.fetchall()
+
+        # Pending AP bills
+        ap_count, ap_total = 0, 0.0
+        try:
+            cur.execute("""
+                SELECT COUNT(*),
+                       COALESCE(SUM(amount_total - amount_paid), 0)
+                FROM public.ar_ap_entries
+                WHERE direction='payable' AND status IN ('pending','partial')
+            """)
+            ap_row = cur.fetchone()
+            ap_count = int(ap_row[0] or 0)
+            ap_total = float(ap_row[1] or 0)
+        except Exception:
+            pass
+
+        be_year = week_end.year + 543
+        sep = "─" * 26
+        net_icon = "✅" if net >= 0 else "⚠️"
+
+        lines = [
+            "📊 สรุปสัปดาห์ MARA STATION",
+            f"📅 {_thai_date_w(week_start)} – {_thai_date_w(week_end)} {be_year}",
+            sep,
+            f"💚 รายรับ:   ฿{income:,.0f}",
+            f"🔴 รายจ่าย:  ฿{expense:,.0f}",
+            f"{net_icon} กำไร:      ฿{net:,.0f} ({margin:.1f}%)",
+        ]
+        if top_cats:
+            lines.append(sep)
+            lines.append("📋 รายจ่ายสูงสุด 3 อันดับ:")
+            for cat_name, total in top_cats:
+                lines.append(f"  • {cat_name}: ฿{float(total):,.0f}")
+        if ap_count > 0:
+            lines.append(sep)
+            lines.append(f"⏳ AP ค้างจ่าย: {ap_count} บิล / ฿{ap_total:,.0f}")
+
+        return "\n".join(lines)
+    finally:
+        conn.close()
+
+
+def _scheduled_weekly_summary():
+    """APScheduler job: send weekly summary to LINE every Monday 08:00 Bangkok."""
+    log.info("Scheduled weekly summary — running")
+    try:
+        text = _build_weekly_summary()
+        _push_text(text)
+        log.info("Weekly summary sent OK")
+    except Exception as e:
+        log.error("Weekly summary FAILED: %s", e)
+
+
 # Start scheduler when module loads (FastAPI startup)
 _scheduler = BackgroundScheduler(timezone="Asia/Bangkok")
 _scheduler.add_job(
@@ -446,9 +551,19 @@ _scheduler.add_job(
     id="daily_ap_due_reminder",
     replace_existing=True,
 )
+_scheduler.add_job(
+    _scheduled_weekly_summary,
+    trigger="cron",
+    day_of_week="mon",
+    hour=8,
+    minute=0,
+    id="weekly_summary",
+    replace_existing=True,
+)
 _scheduler.start()
 log.info("LINE digest scheduler started — fires daily at 06:00 Asia/Bangkok")
 log.info("AP due reminder scheduler started — fires daily at 09:00 Asia/Bangkok")
+log.info("Weekly summary scheduler started — fires every Monday 08:00 Asia/Bangkok")
 
 
 # ─────────────────────────────────────────────
@@ -483,6 +598,36 @@ def digest_by_date(target_date: str):
     text = _build_digest(d)
     result = _push_text(text)
     return {"success": True, "date": str(d), "message_sent": text, "line_response": result}
+
+
+@router.post("/weekly-summary")
+def line_weekly_summary():
+    """Build and send last week's P&L summary to LINE (Phase 21)."""
+    text = _build_weekly_summary()
+    _push_text(text)
+    return {"sent": True, "preview": text}
+
+
+@router.get("/scheduler/status")
+def scheduler_status():
+    """Show APScheduler job list and next run times."""
+    jobs = []
+    for job in _scheduler.get_jobs():
+        nxt = job.next_run_time
+        jobs.append({
+            "id": job.id,
+            "next_run": str(nxt) if nxt else None,
+        })
+    return {
+        "running": _scheduler.running,
+        "timezone": "Asia/Bangkok",
+        "schedules": {
+            "daily_line_digest":    "06:00 — ส่ง daily digest",
+            "daily_ap_due_reminder":"09:00 — AP due reminder (Phase 20)",
+            "weekly_summary":       "จันทร์ 08:00 — Weekly P&L summary (Phase 21)",
+        },
+        "jobs": jobs,
+    }
 
 
 # ─────────────────────────────────────────────

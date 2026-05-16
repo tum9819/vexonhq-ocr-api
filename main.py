@@ -58,6 +58,8 @@ from bill_payment_routes import router as bill_payment_router
 from menu_routes import router as menu_router
 from yearly_routes import router as yearly_router
 from inventory_forecast_routes import router as inventory_forecast_router
+from supplier_routes import router as supplier_router
+from cashflow_routes import router as cashflow_router
 from auth_routes import router as auth_router, verify_token
 # === Phase 2: psycopg connection for POS bulk imports ===
 # (Phase 1 uses supabase client for OCR flows — this is for high-volume
@@ -131,6 +133,8 @@ app.include_router(bill_payment_router)
 app.include_router(menu_router)
 app.include_router(yearly_router)
 app.include_router(inventory_forecast_router)
+app.include_router(supplier_router)
+app.include_router(cashflow_router)
 # ============================================================
 # JWT Auth Middleware — protects all routes except public ones
 # NOTE: Must be added BEFORE CORSMiddleware so CORS is outermost.
