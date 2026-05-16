@@ -58,8 +58,9 @@ JWT_EXPIRE_HOURS = 8
 VEXON_USER = os.environ.get("VEXON_USER", "vexonhq")
 VEXON_HASH = os.environ.get(
     "VEXON_HASH",
-    "pbkdf2:sha256:260000:7db527859b2a325c5f6896f0c5e71160:JdEka8dh6r17YlBZsmNlUsvk4qHfsk8cIinwu2L/gVY="
+    "pbkdf2:sha256:260000:3aca8935884bee634378925756665515:Z5xUmbAylUBocnq4FchR1f2nfYGeK1WfIPfe62qSvPs="
 )
+# Default password: mara2026  (override via VEXON_HASH env var in Coolify)
 
 # Simple in-memory rate limiter: {ip: [timestamp, ...]}
 _login_attempts: dict[str, list[float]] = {}
