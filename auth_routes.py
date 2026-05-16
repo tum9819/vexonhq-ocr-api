@@ -58,7 +58,7 @@ JWT_EXPIRE_HOURS = 8
 VEXON_USER = os.environ.get("VEXON_USER", "vexonhq")
 VEXON_HASH = os.environ.get(
     "VEXON_HASH",
-    "pbkdf2:sha256:260000:de343f6dd1a13b5506a6b34f15f99f4d:svo3yRsZ22V3yJ1X/y4UZ5FJJEiZZe/Ss0Uc+uhptdk="
+    "pbkdf2:sha256:260000:7db527859b2a325c5f6896f0c5e71160:JdEka8dh6r17YlBZsmNlUsvk4qHfsk8cIinwu2L/gVY="
 )
 
 # Simple in-memory rate limiter: {ip: [timestamp, ...]}

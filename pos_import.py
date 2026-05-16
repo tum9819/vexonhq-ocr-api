@@ -1111,7 +1111,7 @@ async def import_pos_excel(
         raise
     except Exception as e:
         err_str = str(e)
-        # Duplicate file — return 409 instead of 500
+        # Duplicate file — silently skip, return the original import record
         if "uq_pos_imports_hash" in err_str or (
             "duplicate key" in err_str and "file_hash" in err_str
         ):
@@ -1119,13 +1119,27 @@ async def import_pos_excel(
                 conn.rollback()
             except Exception:
                 pass
-            raise HTTPException(
-                409,
-                detail={
-                    "error": "duplicate_file",
-                    "message": "ไฟล์นี้เคยนำเข้าแล้ว (file hash ซ้ำ)",
-                    "file_hash": file_hash,
-                },
+            # Look up the original import by hash
+            try:
+                conn2 = get_db_conn()
+                with conn2.cursor() as cur2:
+                    cur2.execute(
+                        "SELECT id, report_type, row_count, period_start, period_end "
+                        "FROM public.pos_imports WHERE file_hash=%s AND status='success' "
+                        "ORDER BY uploaded_at DESC LIMIT 1",
+                        (file_hash,))
+                    orig = cur2.fetchone()
+                conn2.close()
+            except Exception:
+                orig = None
+            return ImportResponse(
+                import_id=orig[0] if orig else "duplicate",
+                report_type=orig[1] if orig else rtype,
+                status="already_imported",
+                rows_imported=orig[2] if orig else 0,
+                period_start=orig[3] if orig else None,
+                period_end=orig[4] if orig else None,
+                detail={"message": "ไฟล์นี้นำเข้าไปแล้ว ข้ามซ้ำโดยอัตโนมัติ"},
             )
         logger.exception("POS import failed")
         try:
