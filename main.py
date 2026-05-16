@@ -55,6 +55,10 @@ from phase10_narrative_routes import router as narrative_router
 from phase11_search_routes import router as search_router
 from phase12_bank_statement_routes import router as bank_statement_router
 from bill_payment_routes import router as bill_payment_router
+from menu_routes import router as menu_router
+from yearly_routes import router as yearly_router
+from inventory_forecast_routes import router as inventory_forecast_router
+from auth_routes import router as auth_router, verify_token
 # === Phase 2: psycopg connection for POS bulk imports ===
 # (Phase 1 uses supabase client for OCR flows — this is for high-volume
 #  executemany() inserts that need raw PG driver)
@@ -107,6 +111,7 @@ def get_openai() -> OpenAI:
 # FastAPI app
 # ============================================================
 app = FastAPI(title="VEXONHQ OCR API", version="3.7.0")
+app.include_router(auth_router)   # Auth FIRST — /auth/* routes are public
 app.include_router(pos_router)
 app.include_router(phase2_router)
 app.include_router(phase3_arap_router)
@@ -123,6 +128,9 @@ app.include_router(narrative_router)
 app.include_router(search_router)
 app.include_router(bank_statement_router)
 app.include_router(bill_payment_router)
+app.include_router(menu_router)
+app.include_router(yearly_router)
+app.include_router(inventory_forecast_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -133,6 +141,50 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ============================================================
+# JWT Auth Middleware — protects all routes except public ones
+# ============================================================
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import JSONResponse as StarletteJSONResponse
+
+PUBLIC_PATHS = {"/", "/health", "/auth/login", "/auth/logout", "/docs", "/openapi.json", "/redoc"}
+
+class JWTAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):
+        path = request.url.path
+        # Allow public routes and LINE webhook without auth
+        if (path in PUBLIC_PATHS
+                or path.startswith("/auth/")
+                or path.startswith("/line/")
+                or path.startswith("/docs")
+                or path.startswith("/redoc")):
+            return await call_next(request)
+
+        # Check Authorization header
+        auth_header = request.headers.get("Authorization", "")
+        token = None
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+
+        if not token:
+            return StarletteJSONResponse(
+                status_code=401,
+                content={"detail": "กรุณาเข้าสู่ระบบก่อน"},
+            )
+
+        payload = verify_token(token)
+        if not payload:
+            return StarletteJSONResponse(
+                status_code=401,
+                content={"detail": "Session หมดอายุ กรุณาเข้าสู่ระบบใหม่"},
+            )
+
+        return await call_next(request)
+
+app.add_middleware(JWTAuthMiddleware)
 
 
 # ============================================================
@@ -1088,12 +1140,20 @@ def _revalidate_bill(invoice_id: str) -> list[dict[str, str]]:
         "vat": bill.get("vat"),
         "amount": bill.get("amount"),
     }
+
+    # Re-run validation against merged bill state
     fresh_warnings = _validate_invoice(parsed_like)
 
-    # Replace only UNRESOLVED warnings (preserve resolved ones for audit trail)
-    sb.table("invoice_validation_warnings").delete().eq(
-        "vendor_bill_id", invoice_id
-    ).eq("resolved", False).execute()
+    # Delete existing UNRESOLVED warnings (preserve resolved ones — user marked done)
+    try:
+        sb.table("invoice_validation_warnings").delete().eq(
+            "vendor_bill_id", invoice_id
+        ).eq("resolved", False).execute()
+    except Exception:
+        # resolved column may not exist yet — delete all and reinsert
+        sb.table("invoice_validation_warnings").delete().eq(
+            "vendor_bill_id", invoice_id
+        ).execute()
 
     if fresh_warnings:
         _save_warnings(invoice_id, fresh_warnings)

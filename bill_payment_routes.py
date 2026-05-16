@@ -101,6 +101,7 @@ class BillPaymentPatch(BaseModel):
 def list_bills_payment(
     month: Optional[str] = Query(None, description="YYYY-MM, defaults to current month"),
     status: Optional[str] = Query(None, description="unpaid | paid | credit_card | partial"),
+    vendor: Optional[str] = Query(None, description="ค้นหาชื่อ vendor (partial match)"),
     branch: str = Query(DEFAULT_BRANCH),
 ):
     """
@@ -110,10 +111,14 @@ def list_bills_payment(
     start, end = _month_bounds(month)
 
     status_filter = ""
+    vendor_filter = ""
     params: list[Any] = [branch, start, end]
     if status and status in VALID_STATUSES:
         status_filter = "AND vb.payment_status = %s"
         params.append(status)
+    if vendor and vendor.strip():
+        vendor_filter = "AND vb.vendor_name ILIKE %s"
+        params.append(f"%{vendor.strip()}%")
 
     conn = get_db_conn()
     try:
@@ -140,6 +145,7 @@ def list_bills_payment(
                   AND vb.bill_date >= %s
                   AND vb.bill_date < %s
                   {status_filter}
+                  {vendor_filter}
                 ORDER BY vb.bill_date DESC, vb.amount DESC
                 """,
                 [branch] + params,
