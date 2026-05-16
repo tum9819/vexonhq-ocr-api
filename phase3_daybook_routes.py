@@ -109,7 +109,8 @@ def list_daybook(
             raise HTTPException(400, f"Unknown source(s): {bad}. Valid: {sorted(VALID_SOURCES)}")
         where.append("source = ANY(%s)"); params.append(sources)
     if q:
-        where.append("(label ILIKE %s OR counterparty ILIKE %s OR doc_no ILIKE %s OR notes ILIKE %s)")
+        # v_daybook migration-16: only label, counterparty, category_code, ref_id available
+        where.append("(label ILIKE %s OR counterparty ILIKE %s OR category_code ILIKE %s OR ref_id::text ILIKE %s)")
         params.extend([f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%"])
 
     sql_where = (" WHERE " + " AND ".join(where)) if where else ""

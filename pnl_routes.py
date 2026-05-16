@@ -154,9 +154,9 @@ def pnl_monthly(
                     COALESCE(SUM(CASE WHEN d.direction='expense'
                                       THEN d.amount ELSE 0 END), 0)            AS expense_total,
                     COUNT(DISTINCT CASE WHEN d.source='pos_sale'
-                                        THEN d.source_id END)                  AS bill_count_sales,
+                                        THEN d.ref_id END)                     AS bill_count_sales,
                     COUNT(DISTINCT CASE WHEN d.direction='expense'
-                                        THEN d.source_id END)                  AS bill_count_expense
+                                        THEN d.ref_id END)                     AS bill_count_expense
                 FROM public.v_daybook d
                 WHERE d.branch_code = %s
                   AND EXTRACT(YEAR FROM d.entry_date) = %s
