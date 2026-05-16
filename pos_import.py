@@ -1110,6 +1110,23 @@ async def import_pos_excel(
     except HTTPException:
         raise
     except Exception as e:
+        err_str = str(e)
+        # Duplicate file — return 409 instead of 500
+        if "uq_pos_imports_hash" in err_str or (
+            "duplicate key" in err_str and "file_hash" in err_str
+        ):
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise HTTPException(
+                409,
+                detail={
+                    "error": "duplicate_file",
+                    "message": "ไฟล์นี้เคยนำเข้าแล้ว (file hash ซ้ำ)",
+                    "file_hash": file_hash,
+                },
+            )
         logger.exception("POS import failed")
         try:
             with conn.cursor() as cur:
