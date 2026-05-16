@@ -61,6 +61,7 @@ from inventory_forecast_routes import router as inventory_forecast_router
 from supplier_routes import router as supplier_router
 from cashflow_routes import router as cashflow_router
 from stock_routes import router as stock_router
+from recipe_routes import router as recipe_router, ingredient_router
 from auth_routes import router as auth_router, verify_token
 # === Phase 2: psycopg connection for POS bulk imports ===
 # (Phase 1 uses supabase client for OCR flows — this is for high-volume
@@ -137,6 +138,8 @@ app.include_router(inventory_forecast_router)
 app.include_router(supplier_router)
 app.include_router(cashflow_router)
 app.include_router(stock_router)
+app.include_router(recipe_router)
+app.include_router(ingredient_router)
 # ============================================================
 # JWT Auth Middleware — protects all routes except public ones
 # NOTE: Must be added BEFORE CORSMiddleware so CORS is outermost.

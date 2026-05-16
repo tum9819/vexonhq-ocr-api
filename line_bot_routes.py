@@ -669,10 +669,23 @@ _FINANCIAL_OVERRIDE_KEYWORDS = (
     "ใบแจ้งหนี้", "invoice", "ค่าใช้จ่าย", "จ่ายเงิน",
 )
 
+# คำที่บ่งบอกว่าต้องการให้ AI แนะนำเมนู
+_RECIPE_SUGGEST_KEYWORDS = (
+    "แนะนำเมนู", "คิดเมนู", "ทำเมนูอะไร", "ทำอะไรได้บ้าง",
+    "เมนูวันนี้", "ทำเมนูใหม่", "ไอเดียเมนู", "เมนูจากของที่มี",
+)
+
+# คำที่บ่งบอกว่าถามต้นทุนเมนู
+_RECIPE_COST_KEYWORDS = (
+    "ต้นทุน", "gp", "กำไรต่อจาน", "กำไรเมนู", "costเมนู",
+)
+
 
 def _classify_intent(text: str) -> str:
     """
     Classify LINE message intent:
+    - recipe_suggest : ขอให้ AI แนะนำเมนูจาก stock
+    - recipe_cost    : ถามต้นทุน/GP% ของเมนู
       'stock_summary'  — เช็ค stock ทั้งหมด
       'stock_product'  — หา stock รายการสินค้าเฉพาะ (เบียร์ช้าง, สิงห์, ...)
       'financial'      — ค้นหาข้อมูลการเงิน (ยอดโอนเบียร์ช้าง, รายจ่ายเบียร์)
@@ -683,6 +696,14 @@ def _classify_intent(text: str) -> str:
     # Check financial override first — ถ้ามีคำเงิน → financial เสมอ
     if any(kw in lower for kw in _FINANCIAL_OVERRIDE_KEYWORDS):
         return "financial"
+
+    # Check recipe suggest keywords
+    if any(kw in lower for kw in _RECIPE_SUGGEST_KEYWORDS):
+        return "recipe_suggest"
+
+    # Check recipe cost keywords
+    if any(kw in lower for kw in _RECIPE_COST_KEYWORDS):
+        return "recipe_cost"
 
     # Check stock summary keywords
     if any(kw in lower for kw in _STOCK_SUMMARY_KEYWORDS):
@@ -724,6 +745,142 @@ def _handle_stock_product(query: str) -> str:
         return format_product_stock_for_line(items, snapshot_at, query)
     except Exception as e:
         log.error("Stock product search failed: %s", e)
+        return f"❌ เกิดข้อผิดพลาด: {str(e)[:80]}"
+
+
+def _handle_recipe_suggest() -> str:
+    """Call AI suggest endpoint and format for LINE."""
+    import json as _json
+    import urllib.request as _req
+    import urllib.error as _uerr
+    import os as _os
+
+    api_key = _os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return "❌ ยังไม่ได้ตั้งค่า ANTHROPIC_API_KEY"
+
+    try:
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT ii.item_name, ii.qty, ii.unit
+                    FROM public.pos_inventory_items ii
+                    JOIN public.pos_inventory_snapshots s ON s.id = ii.snapshot_id
+                    WHERE s.branch_code = 'thawi_watthana'
+                    ORDER BY s.snapshot_at DESC, ii.item_name
+                    LIMIT 80
+                """)
+                stock_items = cur.fetchall()
+
+                cur.execute("""
+                    SELECT name, unit, price_per_unit, yield_pct
+                    FROM public.ingredients WHERE price_per_unit > 0
+                """)
+                ingredients = cur.fetchall()
+        finally:
+            conn.close()
+
+        if not stock_items:
+            return "❌ ไม่พบข้อมูล stock — กรุณา upload FoodStory stock ก่อนครับ"
+
+        stock_text = "\n".join(f"- {n}: {q} {u}" for n, q, u in stock_items)
+        ingr_text = "\n".join(
+            f"- {n} ({u}): {p:.0f} บาท"
+            for n, u, p, _ in ingredients
+        ) or "ยังไม่มีราคาวัตถุดิบ"
+
+        payload = _json.dumps({
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 512,
+            "system": "คุณคือเชฟ AI ของร้านมาลาปิ้งย่าง ตอบภาษาไทย กระชับ",
+            "messages": [{"role": "user", "content":
+                f"วัตถุดิบในร้าน:\n{stock_text}\n\nราคาวัตถุดิบ:\n{ingr_text}\n\n"
+                "แนะนำ 3 เมนูที่ทำได้จากวัตถุดิบนี้ รูปแบบ:\n"
+                "1. ชื่อเมนู — ต้นทุน ~XX บาท | ราคาขาย XXX | GP XX%\n"
+                "วัตถุดิบ: ...\n\n"
+                "ตอบสั้น ไม่เกิน 10 บรรทัด"
+            }],
+        }).encode("utf-8")
+
+        req = _req.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            method="POST",
+        )
+        with _req.urlopen(req, timeout=25) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+            answer = data["content"][0]["text"].strip()
+
+        return f"🍽️ AI แนะนำเมนูวันนี้\n{'─'*22}\n{answer}"
+
+    except Exception as e:
+        log.error("Recipe suggest LINE failed: %s", e)
+        return f"❌ ไม่สามารถแนะนำเมนูได้: {str(e)[:80]}"
+
+
+def _handle_recipe_cost(query: str) -> str:
+    """Look up recipe cost/GP% by name from DB."""
+    try:
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                # Try to find recipe by name (fuzzy)
+                clean = query.lower()
+                for kw in _RECIPE_COST_KEYWORDS:
+                    clean = clean.replace(kw, "").strip()
+                clean = clean.strip()
+
+                if not clean:
+                    # No recipe name → list all
+                    cur.execute("""
+                        SELECT name, selling_price FROM public.recipes ORDER BY name LIMIT 10
+                    """)
+                    rows = cur.fetchall()
+                    if not rows:
+                        return "📋 ยังไม่มีสูตรอาหารในระบบ\nเพิ่มได้ที่ /recipes ในเว็บครับ"
+                    lines = ["📋 เมนูในระบบ:"]
+                    for name, price in rows:
+                        lines.append(f"• {name} — ราคา {price:.0f} บาท")
+                    lines.append("\nพิมพ์ 'ต้นทุน[ชื่อเมนู]' เพื่อดูรายละเอียดครับ")
+                    return "\n".join(lines)
+
+                cur.execute("""
+                    SELECT r.id, r.name, r.selling_price,
+                           COALESCE(SUM(ri.qty_used * i.price_per_unit / NULLIF(i.yield_pct/100.0, 0)), 0) as cost
+                    FROM public.recipes r
+                    LEFT JOIN public.recipe_ingredients ri ON ri.recipe_id = r.id
+                    LEFT JOIN public.ingredients i ON i.id = ri.ingredient_id
+                    WHERE LOWER(r.name) LIKE %s
+                    GROUP BY r.id, r.name, r.selling_price
+                    LIMIT 3
+                """, (f"%{clean}%",))
+                rows = cur.fetchall()
+
+                if not rows:
+                    return f'❌ ไม่พบเมนู "{clean}" ในระบบครับ\nลองพิมพ์ "ต้นทุน" เพื่อดูรายการทั้งหมด'
+
+                lines = []
+                for rid, name, sell, cost in rows:
+                    sell = float(sell or 0)
+                    cost = float(cost or 0)
+                    gp = (sell - cost) / sell * 100 if sell > 0 else 0
+                    emoji = "🟢" if gp >= 60 else ("🟡" if gp >= 40 else "🔴")
+                    lines.append(
+                        f"{emoji} {name}\n"
+                        f"   ต้นทุน: ฿{cost:.2f} | ราคาขาย: ฿{sell:.0f}\n"
+                        f"   GP: {gp:.1f}%"
+                    )
+                return "💰 ต้นทุนเมนู\n" + "─"*22 + "\n" + "\n\n".join(lines)
+        finally:
+            conn.close()
+    except Exception as e:
+        log.error("Recipe cost LINE failed: %s", e)
         return f"❌ เกิดข้อผิดพลาด: {str(e)[:80]}"
 
 
@@ -892,7 +1049,7 @@ async def line_webhook(
                     _reply_line(reply_token, f"❌ บันทึกไม่สำเร็จ: {str(e)[:80]}")
                 continue
 
-            # ── Intent classification (Phase 27) ──
+            # ── Intent classification (Phase 27 + 31) ──
             intent = _classify_intent(text)
             log.info("LINE intent: %r → %s", text, intent)
 
@@ -902,6 +1059,14 @@ async def line_webhook(
 
             if intent == "stock_product":
                 _reply_line(reply_token, _handle_stock_product(text))
+                continue
+
+            if intent == "recipe_suggest":
+                _reply_line(reply_token, _handle_recipe_suggest())
+                continue
+
+            if intent == "recipe_cost":
+                _reply_line(reply_token, _handle_recipe_cost(text))
                 continue
 
             # intent == "financial" or "other" → AI Search (Phase 11)
