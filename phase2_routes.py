@@ -645,9 +645,9 @@ def pnl_daily(
     to_date: date = Query(..., alias="to"),
     branch: str = Query(DEFAULT_BRANCH),
 ):
-    """Daily P&L for an arbitrary date range (max 92 days)."""
-    if (to_date - from_date).days > 92:
-        raise HTTPException(400, "Range too large (max 92 days)")
+    """Daily P&L for an arbitrary date range (max 366 days)."""
+    if (to_date - from_date).days > 366:
+        raise HTTPException(400, "Range too large (max 366 days)")
     if to_date < from_date:
         raise HTTPException(400, "to_date must be >= from_date")
 
