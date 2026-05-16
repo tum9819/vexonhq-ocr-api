@@ -155,6 +155,17 @@ def read_and_detect(content: bytes, filename: str):
         # Fall back to FoodStory XLSX (header on row 1)
         df1 = pd.read_excel(_io.BytesIO(content), header=1)
         df1 = normalize_columns(df1)
+
+        # FoodStory sometimes inserts a warning row before the real header
+        # e.g. "*เนื่องจากช่วงเวลาที่เลือก ครอบวันที่..." → try header=2
+        first_col = str(list(df1.columns)[0]).strip() if len(df1.columns) > 0 else ""
+        if first_col.startswith("*เนื่องจาก") or first_col.startswith("*เน"):
+            df2 = pd.read_excel(_io.BytesIO(content), header=2)
+            df2 = normalize_columns(df2)
+            rtype2 = detect_report_type(list(df2.columns))
+            if rtype2:
+                return df2, rtype2
+
         rtype = detect_report_type(list(df1.columns))
         if rtype:
             return df1, rtype
