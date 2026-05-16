@@ -985,6 +985,7 @@ WRITER_CONFIG = {
     "pos_cashflow_entries": dict(
         conflict_cols=["drawer_code","txn_at","description","amount"],
         update_cols=["txn_date","txn_type","direction","branch_code","is_refund"]),
+
 }
 
 
@@ -1052,6 +1053,18 @@ async def import_pos_excel(
             for table, rows in result["tables"].items():
                 if not rows:
                     continue
+                if table == "pos_inventory_snapshots":
+                    # Phase 27: plain INSERT — file-hash dedup prevents re-import
+                    snap = rows[0]
+                    snap["source_import_id"] = import_id
+                    cur.execute("""
+                        INSERT INTO public.pos_inventory_snapshots
+                            (branch_code, snapshot_at, item_count, total_value, source_import_id)
+                        VALUES (%(branch_code)s, %(snapshot_at)s, %(item_count)s,
+                                %(total_value)s, %(source_import_id)s)
+                    """, snap)
+                    continue
+
                 if table == "_inventory_items":
                     # special: needs snapshot id from the snapshot we JUST inserted
                     cur.execute("SELECT id FROM pos_inventory_snapshots "
@@ -1212,21 +1225,3 @@ def get_import_detail(import_id: str):
             return dict(zip(cols, row))
     finally:
         conn.close()
-
-
-# ============================================================
-# 7. POST /pos/detect-only  â dry-run, no DB write
-# ============================================================
-
-@router.post("/detect-only")
-async def detect_only(file: UploadFile = File(...)):
-    """Detect report type from XLSX or CSV without saving."""
-    content = await file.read()
-    if not content:
-        raise HTTPException(400, "Empty file")
-    df, rtype = read_and_detect(content, file.filename or "")
-    return {
-        "report_type": rtype,
-        "headers":     list(df.columns)[:12],
-        "row_count":   len(df),
-    }
