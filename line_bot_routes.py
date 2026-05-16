@@ -35,6 +35,7 @@ from typing import Optional
 import psycopg2
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import APIRouter, Header, HTTPException, Request
+from budget_routes import run_budget_alert_check as _budget_alert_check
 
 log = logging.getLogger("vexonhq-line")
 router = APIRouter(prefix="/line", tags=["line"])
@@ -560,10 +561,19 @@ _scheduler.add_job(
     id="weekly_summary",
     replace_existing=True,
 )
+_scheduler.add_job(
+    _budget_alert_check,
+    trigger="cron",
+    hour=20,
+    minute=0,
+    id="daily_budget_alert",
+    replace_existing=True,
+)
 _scheduler.start()
 log.info("LINE digest scheduler started — fires daily at 06:00 Asia/Bangkok")
 log.info("AP due reminder scheduler started — fires daily at 09:00 Asia/Bangkok")
 log.info("Weekly summary scheduler started — fires every Monday 08:00 Asia/Bangkok")
+log.info("Budget alert scheduler started — fires daily at 20:00 Asia/Bangkok")
 
 
 # ─────────────────────────────────────────────

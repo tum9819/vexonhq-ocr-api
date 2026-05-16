@@ -282,6 +282,119 @@ def supplier_trend(
 
 
 # ─────────────────────────────────────────────────────────────
+# GET /supplier/products  — distinct product names from invoice_items
+# ─────────────────────────────────────────────────────────────
+
+@router.get("/products")
+def supplier_products(q: Optional[str] = Query(None, description="Search keyword")):
+    """
+    Return distinct product_name values from confirmed invoice_items.
+    Optionally filter by keyword (ILIKE).
+    """
+    conn = get_db_conn()
+    try:
+        cur = conn.cursor()
+        if q:
+            cur.execute("""
+                SELECT DISTINCT ii.product_name
+                FROM public.invoice_items ii
+                JOIN public.vendor_bills vb ON vb.id = ii.vendor_bill_id
+                WHERE vb.review_status = 'confirmed'
+                  AND ii.unit_price IS NOT NULL AND ii.unit_price > 0
+                  AND ii.product_name ILIKE %s
+                ORDER BY ii.product_name
+                LIMIT 50
+            """, (f"%{q}%",))
+        else:
+            cur.execute("""
+                SELECT DISTINCT ii.product_name
+                FROM public.invoice_items ii
+                JOIN public.vendor_bills vb ON vb.id = ii.vendor_bill_id
+                WHERE vb.review_status = 'confirmed'
+                  AND ii.unit_price IS NOT NULL AND ii.unit_price > 0
+                ORDER BY ii.product_name
+                LIMIT 200
+            """)
+        products = [row[0] for row in cur.fetchall() if row[0]]
+        return {"count": len(products), "products": products}
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────────────────────
+# GET /supplier/price-trend?product=&months=6
+# ─────────────────────────────────────────────────────────────
+
+@router.get("/price-trend")
+def supplier_price_trend(
+    product: str = Query(..., description="Product name to track (partial match)"),
+    months: int  = Query(6, ge=2, le=24, description="Number of months look-back"),
+):
+    """
+    Monthly avg unit_price for a given product name, broken down by supplier.
+    Joins invoice_items -> vendor_bills (confirmed only).
+    """
+    today     = date.today()
+    date_from = date(today.year, today.month, 1) - timedelta(days=(months - 1) * 30)
+    date_to   = today
+
+    month_list = []
+    for i in range(months - 1, -1, -1):
+        m_date = date(today.year, today.month, 1) - timedelta(days=i * 30)
+        month_list.append(f"{m_date.year}-{m_date.month:02d}")
+
+    conn = get_db_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT
+                to_char(vb.bill_date, 'YYYY-MM')       AS ym,
+                COALESCE(vb.vendor_name, 'ไม่ระบุ')    AS supplier,
+                ii.product_name,
+                ROUND(AVG(ii.unit_price)::numeric, 2)  AS avg_unit_price,
+                ROUND(SUM(ii.quantity)::numeric, 2)     AS total_qty,
+                COUNT(*)                                AS records
+            FROM public.invoice_items ii
+            JOIN public.vendor_bills vb ON vb.id = ii.vendor_bill_id
+            WHERE vb.review_status = 'confirmed'
+              AND vb.bill_date BETWEEN %s AND %s
+              AND ii.product_name ILIKE %s
+              AND ii.unit_price IS NOT NULL
+              AND ii.unit_price > 0
+            GROUP BY to_char(vb.bill_date, 'YYYY-MM'), vb.vendor_name, ii.product_name
+            ORDER BY ym, supplier
+        """, (date_from, date_to, f"%{product}%"))
+        rows = _rows_to_dicts(cur)
+    finally:
+        conn.close()
+
+    if not rows:
+        return {"months": month_list, "product": product, "series": [], "matched_names": []}
+
+    suppliers     = list(dict.fromkeys(r["supplier"] for r in rows))
+    matched_names = list(dict.fromkeys(r["product_name"] for r in rows))
+
+    pivot = {s: {m: None for m in month_list} for s in suppliers}
+    for r in rows:
+        ym  = r["ym"]
+        sup = r["supplier"]
+        if sup in pivot and ym in pivot[sup]:
+            pivot[sup][ym] = float(r["avg_unit_price"] or 0)
+
+    series = [
+        {"supplier": s, "data": [pivot[s].get(m) for m in month_list]}
+        for s in suppliers
+    ]
+
+    return {
+        "months":        month_list,
+        "product":       product,
+        "matched_names": matched_names,
+        "series":        series,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
 # Health
 # ─────────────────────────────────────────────────────────────
 

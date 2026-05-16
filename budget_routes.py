@@ -161,12 +161,11 @@ def budget_status(month: str, branch_code: str = "thawi_watthana"):
         conn.close()
 
 
-@router.post("/check-alerts")
-def check_budget_alerts(month: Optional[str] = None, branch_code: str = "thawi_watthana"):
+def run_budget_alert_check(month: Optional[str] = None, branch_code: str = "thawi_watthana") -> dict:
     """
-    Check all budget categories for the month.
-    Push LINE alert for any category that is OVER budget.
-    Called automatically after each new expense is confirmed.
+    Core logic: query budget status and push LINE for over + warning categories.
+    Called by the HTTP endpoint AND by the APScheduler cron job (20:00 daily).
+    Returns summary dict.
     """
     if not month:
         month = date.today().strftime("%Y-%m")
@@ -175,35 +174,62 @@ def check_budget_alerts(month: Optional[str] = None, branch_code: str = "thawi_w
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
-            SELECT category_name_th, budget_amount, actual_amount, pct_used, variance
+            SELECT category_name_th, category_code, budget_amount, actual_amount, pct_used, variance, status
             FROM public.v_budget_status
-            WHERE month = %s AND branch_code = %s AND status = 'over'
+            WHERE month = %s AND branch_code = %s AND status IN ('over', 'warning')
             ORDER BY pct_used DESC
         """, (month, branch_code))
-        over_rows = [dict(r) for r in cur.fetchall()]
+        alert_rows = [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
 
-    alerts_sent = []
-    for row in over_rows:
-        name = row["category_name_th"] or row.get("category_code", "?")
-        budget = float(row["budget_amount"] or 0)
-        actual = float(row["actual_amount"] or 0)
-        pct = float(row["pct_used"] or 0)
-        excess = actual - budget
+    if not alert_rows:
+        log.info("Budget check %s: all categories within budget", month)
+        return {"success": True, "month": month, "alerts_sent": 0, "details": []}
 
-        text = (
-            f"⚠️ เกินงบประมาณ!\n"
-            f"📂 {name}\n"
-            f"💰 ใช้ไป: ฿{actual:,.0f} / งบ ฿{budget:,.0f}\n"
-            f"📈 {pct:.1f}% (+฿{excess:,.0f})"
-        )
-        _push_line(text)
-        alerts_sent.append({"category": name, "pct_used": pct, "excess": excess})
+    # Build a single LINE message grouping over + warning
+    over_items   = [r for r in alert_rows if r["status"] == "over"]
+    warn_items   = [r for r in alert_rows if r["status"] == "warning"]
 
-    return {
-        "success": True,
-        "month": month,
-        "alerts_sent": len(alerts_sent),
-        "details": alerts_sent,
-    }
+    lines = [f"📊 สรุปงบประมาณ {month}"]
+    if over_items:
+        lines.append("\n🔴 เกินงบประมาณ:")
+        for row in over_items:
+            name   = row.get("category_name_th") or row.get("category_code", "?")
+            budget = float(row["budget_amount"] or 0)
+            actual = float(row["actual_amount"] or 0)
+            pct    = float(row["pct_used"] or 0)
+            excess = actual - budget
+            lines.append(f"  • {name}: ฿{actual:,.0f} / ฿{budget:,.0f} ({pct:.0f}%, +฿{excess:,.0f})")
+
+    if warn_items:
+        lines.append("\n🟡 ใกล้เต็มงบ (≥80%):")
+        for row in warn_items:
+            name   = row.get("category_name_th") or row.get("category_code", "?")
+            budget = float(row["budget_amount"] or 0)
+            actual = float(row["actual_amount"] or 0)
+            pct    = float(row["pct_used"] or 0)
+            remain = budget - actual
+            lines.append(f"  • {name}: ฿{actual:,.0f} / ฿{budget:,.0f} ({pct:.0f}%, เหลือ ฿{remain:,.0f})")
+
+    _push_line("\n".join(lines))
+
+    details = [
+        {
+            "category": r.get("category_name_th") or r.get("category_code", "?"),
+            "status":   r["status"],
+            "pct_used": float(r["pct_used"] or 0),
+        }
+        for r in alert_rows
+    ]
+    log.info("Budget alert %s: sent %d items (over=%d warn=%d)", month, len(alert_rows), len(over_items), len(warn_items))
+    return {"success": True, "month": month, "alerts_sent": len(alert_rows), "details": details}
+
+
+@router.post("/check-alerts")
+def check_budget_alerts(month: Optional[str] = None, branch_code: str = "thawi_watthana"):
+    """
+    HTTP endpoint: manually trigger budget alert check.
+    Also called automatically by APScheduler at 20:00 daily via run_budget_alert_check().
+    """
+    return run_budget_alert_check(month=month, branch_code=branch_code)
