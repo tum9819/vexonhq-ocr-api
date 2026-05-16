@@ -31,7 +31,13 @@ except ImportError:
 logger = logging.getLogger("phase3_daybook_routes")
 router = APIRouter(tags=["phase3-daybook"])
 
-VALID_SOURCES = {"pos_sale", "vendor_bill", "manual", "ar_payment", "ap_payment"}
+# All source values v_daybook can return (updated for migration-16 schema)
+VALID_SOURCES = {
+    "pos_sale", "vendor_bill", "manual", "ar_payment", "ap_payment",
+    "rider_income_grab", "rider_income_lineman", "pos_cashflow",
+    # bank_statement_entries.source_type values
+    "salary", "transfer", "withdrawal", "deposit",
+}
 VALID_DIRECTIONS = {"income", "expense"}
 
 
@@ -111,11 +117,14 @@ def list_daybook(
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
+            # NOTE: v_daybook was rewritten in migration-16 — new column list:
+            # entry_date, direction, amount, source, category_code, label,
+            # counterparty, branch_code, ref_id  (no doc_no/payment_method/notes/created_at)
             cur.execute(
                 f"SELECT source, entry_date, direction, amount, label, counterparty, "
-                f"       branch_code, source_id, doc_no, category_code, payment_method, notes, created_at "
+                f"       branch_code, ref_id, category_code "
                 f"FROM public.v_daybook{sql_where} "
-                f"ORDER BY entry_date DESC, created_at DESC "
+                f"ORDER BY entry_date DESC, ref_id DESC "
                 f"LIMIT %s OFFSET %s",
                 params + [limit, offset],
             )
