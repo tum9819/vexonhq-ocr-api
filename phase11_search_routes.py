@@ -53,26 +53,41 @@ _SYSTEM_PROMPT = (
     "- direction: income or expense\n"
     "- source: pos_sale, vendor_bill, rider_income_grab, rider_income_lineman,\n"
     "          ar_payment, ap_payment, pos_cashflow, manual\n"
-    "- label: description text (may be bank statement raw text)\n"
+    "- label: description text (may be bank statement raw text — raw person names, NOT brand names)\n"
     "- counterparty: supplier name\n"
     "- amount (numeric)\n"
     "- category_code: rent, staff_salary, food_raw, beverage_raw, delivery_income, musician_fee, reimbursement\n\n"
-    "IMPORTANT: Bank statement entries have raw person names as labels, not Thai keywords.\n"
-    "Use category_code instead of keyword for these:\n"
-    "- rent/ค่าเช่า -> category_code: rent\n"
-    "- salary/เงินเดือน -> category_code: staff_salary\n"
-    "- musician/ค่าดนตรี -> category_code: musician_fee\n"
-    "- reimbursement/สำรองจ่าย -> category_code: reimbursement\n"
-    "- beverage/เบียร์ -> category_code: beverage_raw\n\n"
+    "CRITICAL: Bank statement labels are raw person names (e.g. 'วัฒนา กิ่งธารา', 'มยุรฉัตร โส...').\n"
+    "NEVER set keyword for named expense categories — use category_code ONLY. Do NOT set keyword.\n\n"
+    "Category mappings (set category_code, set keyword=null):\n"
+    "- ค่าเช่า/เช่า/rent -> category_code: rent\n"
+    "- เงินเดือน/ค่าแรง/salary/พนักงาน -> category_code: staff_salary\n"
+    "- ค่าดนตรี/นักดนตรี/musician -> category_code: musician_fee\n"
+    "- สำรองจ่าย/คืนเงิน/reimbursement -> category_code: reimbursement\n"
+    "- เบียร์/เบียร์ช้าง/เบียร์สิงห์/ช้าง/สิงห์/แกรนด์รอยัล/เหล้า/สุรา/เครื่องดื่ม/วัฒนา -> category_code: beverage_raw\n"
+    "- วัตถุดิบ/อาหาร/ผัก/เนื้อ/หมู/ไก่/food_raw -> category_code: food_raw\n\n"
+    "Special date keywords:\n"
+    "- เดือนนี้ -> current month first/last day\n"
+    "- เดือนที่แล้ว -> previous month first/last day\n"
+    "- วันนี้ -> today for both date_from and date_to\n"
+    "Thai months: ม.ค.=01 ก.พ.=02 มี.ค.=03 เม.ย.=04 พ.ค.=05 มิ.ย.=06\n"
+    "             ก.ค.=07 ส.ค.=08 ก.ย.=09 ต.ค.=10 พ.ย.=11 ธ.ค.=12\n"
+    "Thai month names: มกราคม=01 กุมภาพันธ์=02 มีนาคม=03 เมษายน=04 พฤษภาคม=05 มิถุนายน=06\n"
+    "                  กรกฎาคม=07 สิงหาคม=08 กันยายน=09 ตุลาคม=10 พฤศจิกายน=11 ธันวาคม=12\n"
+    "เมษา/เมษายน = April = month 04\n\n"
     "Year is AD (CE). If user gives BE year, subtract 543 (e.g. 2569 -> 2026).\n"
-    "Current month: " + datetime.now().strftime("%Y-%m") + "\n\n"
+    "Current date: " + datetime.now().strftime("%Y-%m-%d") + "\n\n"
     "Reply JSON only, schema:\n"
     "{ date_from, date_to, direction, keyword, amount_min, amount_max, source, category_code }\n\n"
     "Examples:\n"
     '- "หาบิล Makro เดือนเมษา" -> {"date_from":"2026-04-01","date_to":"2026-04-30","direction":"expense","keyword":"Makro","amount_min":null,"amount_max":null,"source":"vendor_bill","category_code":null}\n'
     '- "รายรับจาก Grab ทั้งหมด" -> {"date_from":null,"date_to":null,"direction":"income","keyword":null,"amount_min":null,"amount_max":null,"source":"rider_income_grab","category_code":null}\n'
     '- "ค่าเช่าเดือนที่แล้ว" -> {"date_from":null,"date_to":null,"direction":"expense","keyword":null,"amount_min":null,"amount_max":null,"source":null,"category_code":"rent"}\n'
-    '- "รายจ่ายเกิน 5000 บาท" -> {"date_from":null,"date_to":null,"direction":"expense","keyword":null,"amount_min":5000,"amount_max":null,"source":null,"category_code":null}'
+    '- "เบียร์ช้าง" -> {"date_from":null,"date_to":null,"direction":"expense","keyword":null,"amount_min":null,"amount_max":null,"source":null,"category_code":"beverage_raw"}\n'
+    '- "เบียร์สิงห์เดือนเมษา" -> {"date_from":"2026-04-01","date_to":"2026-04-30","direction":"expense","keyword":null,"amount_min":null,"amount_max":null,"source":null,"category_code":"beverage_raw"}\n'
+    '- "เงินเดือนเดือนนี้" -> {"date_from":"2026-05-01","date_to":"2026-05-31","direction":"expense","keyword":null,"amount_min":null,"amount_max":null,"source":null,"category_code":"staff_salary"}\n'
+    '- "รายจ่ายเกิน 5000 บาท" -> {"date_from":null,"date_to":null,"direction":"expense","keyword":null,"amount_min":5000,"amount_max":null,"source":null,"category_code":null}\n'
+    '- "วันไหนขายดีสุดเดือนเมษา" -> {"date_from":"2026-04-01","date_to":"2026-04-30","direction":"income","keyword":null,"amount_min":null,"amount_max":null,"source":"pos_sale","category_code":null}'
 )
 
 

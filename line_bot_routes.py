@@ -641,6 +641,118 @@ def scheduler_status():
 
 
 # ─────────────────────────────────────────────
+# Phase 27: Stock / Inventory query via LINE
+# ─────────────────────────────────────────────
+
+_STOCK_KEYWORDS = (
+    "stock", "สต็อก", "สต็อค", "สต๊อก", "สต๊อค",
+    "เช็คของ", "ของเหลือ", "วัตถุดิบเหลือ", "สินค้าคงเหลือ",
+    "เหลือเท่าไร", "มีของไหม", "ของหมดไหม",
+)
+
+
+def _is_stock_query(text: str) -> bool:
+    """Return True if the message is asking about inventory/stock."""
+    lower = text.lower().strip()
+    return any(kw in lower for kw in _STOCK_KEYWORDS)
+
+
+def _handle_stock_query() -> str:
+    """
+    Return a LINE-friendly stock summary based on recent vendor_bills purchases.
+    Groups by category/vendor, shows last purchase date + monthly average spend.
+    Uses vendor_bills as the source of truth (no real-time stock tracking yet).
+    """
+    conn = _get_db_conn()
+    try:
+        cur = conn.cursor()
+
+        # Last 3 months of confirmed vendor bills grouped by category
+        cur.execute("""
+            SELECT
+                COALESCE(ec.name_th, vb.category_code, 'อื่นๆ') AS cat_name,
+                vb.category_code,
+                COUNT(*) AS bill_count,
+                COALESCE(SUM(vb.amount), 0) AS total_spend,
+                MAX(vb.bill_date) AS last_purchase,
+                CURRENT_DATE - MAX(vb.bill_date) AS days_since
+            FROM public.vendor_bills vb
+            LEFT JOIN public.expense_categories ec ON ec.code = vb.category_code
+            WHERE vb.review_status = 'confirmed'
+              AND vb.bill_date >= CURRENT_DATE - INTERVAL '90 days'
+            GROUP BY COALESCE(ec.name_th, vb.category_code, 'อื่นๆ'), vb.category_code
+            ORDER BY last_purchase DESC
+            LIMIT 10
+        """)
+        rows = cur.fetchall()
+
+        # Recent top vendors (last 30 days)
+        cur.execute("""
+            SELECT
+                COALESCE(vb.vendor_name, 'ไม่ระบุ') AS vendor,
+                COALESCE(ec.name_th, vb.category_code, 'อื่นๆ') AS cat_name,
+                COALESCE(SUM(vb.amount), 0) AS total,
+                MAX(vb.bill_date) AS last_date
+            FROM public.vendor_bills vb
+            LEFT JOIN public.expense_categories ec ON ec.code = vb.category_code
+            WHERE vb.review_status = 'confirmed'
+              AND vb.bill_date >= CURRENT_DATE - INTERVAL '30 days'
+              AND vb.vendor_name IS NOT NULL
+            GROUP BY vb.vendor_name, COALESCE(ec.name_th, vb.category_code, 'อื่นๆ')
+            ORDER BY last_date DESC
+            LIMIT 8
+        """)
+        vendors = cur.fetchall()
+
+        sep = "─" * 24
+
+        if not rows and not vendors:
+            return (
+                "📦 เช็ค Stock / วัตถุดิบ\n"
+                f"{sep}\n"
+                "ไม่พบข้อมูลใบบิลใน 90 วันที่ผ่านมา\n"
+                "💡 เพิ่มข้อมูลโดยส่งรูปใบบิลมาที่ Line Bot"
+            )
+
+        lines = ["📦 สรุปการซื้อวัตถุดิบ (90 วันล่าสุด)", sep]
+
+        if rows:
+            lines.append("📊 ตามหมวดหมู่:")
+            for cat_name, cat_code, count, total, last_date, days_since in rows:
+                days_ago = int(days_since) if days_since is not None else "?"
+                # Urgency indicator
+                if isinstance(days_ago, int):
+                    if days_ago <= 7:
+                        icon = "🟢"  # bought recently
+                    elif days_ago <= 21:
+                        icon = "🟡"  # moderate
+                    else:
+                        icon = "🔴"  # hasn't been bought in a while
+                else:
+                    icon = "⚪"
+                last_str = last_date.strftime("%d/%m") if last_date else "-"
+                lines.append(
+                    f"  {icon} {cat_name}: ฿{float(total):,.0f} "
+                    f"({count} ใบ, ล่าสุด {last_str}, {days_ago}วันที่แล้ว)"
+                )
+
+        if vendors:
+            lines.append(sep)
+            lines.append("🛒 ซัพพลายเออร์ล่าสุด (30 วัน):")
+            for vendor, cat_name, total, last_date in vendors:
+                last_str = last_date.strftime("%d/%m") if last_date else "-"
+                lines.append(f"  • {vendor} ({cat_name}): ฿{float(total):,.0f} — {last_str}")
+
+        lines.append(sep)
+        lines.append("💡 ส่งรูปใบบิลเพื่ออัปเดตข้อมูลได้เลย")
+
+        return "\n".join(lines)
+
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────
 # Webhook helpers
 # ─────────────────────────────────────────────
 
@@ -768,14 +880,22 @@ async def line_webhook(
                     "🤖 VEXONHQ LINE Bot\n"
                     "─────────────────────────\n"
                     "📷 ส่งรูปใบกำกับ/บิล → OCR อัตโนมัติ\n\n"
-                    "💬 พิมพ์บันทึกค่าใช้จ่ายด่วน:\n"
+                    "💬 บันทึกค่าใช้จ่ายด่วน:\n"
                     "  ค่าน้ำมัน 450\n"
                     "  ค่าแก๊ส 350 บาท\n"
                     "  ซื้อผัก 200\n\n"
-                    "🔍 หรือค้นหาข้อมูล:\n"
+                    "📦 เช็ค stock / วัตถุดิบ:\n"
+                    "  เช็ค stock\n"
+                    "  สต็อกเหลือเท่าไร\n"
+                    "  มีของไหม\n\n"
+                    "🔍 ค้นหาข้อมูล:\n"
+                    "  เงินเดือนเดือนเมษา\n"
+                    "  เบียร์ช้าง / เบียร์สิงห์\n"
+                    "  วันไหนขายดีสุดเดือนเมษา\n"
                     "  รายรับ Grab เดือนเมษา\n"
-                    "  ค่าแก๊สทั้งหมด\n"
-                    "  บิล Makro เดือนนี้"
+                    "  ค่าเช่าเดือนนี้\n"
+                    "  บิล Makro ทั้งหมด\n"
+                    "  รายจ่ายเกิน 5000 บาท"
                 )
                 continue
 
@@ -795,6 +915,16 @@ async def line_webhook(
                 except Exception as e:
                     log.error("Quick expense save failed: %s", e)
                     _reply_line(reply_token, f"❌ บันทึกไม่สำเร็จ: {str(e)[:80]}")
+                continue
+
+            # Stock / Inventory query (Phase 27)
+            if _is_stock_query(text):
+                try:
+                    reply = _handle_stock_query()
+                except Exception as e:
+                    log.error("Stock query failed: %s", e)
+                    reply = f"❌ เกิดข้อผิดพลาดในการเช็ค stock: {str(e)[:80]}"
+                _reply_line(reply_token, reply)
                 continue
 
             # AI Search (Phase 11)
