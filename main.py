@@ -131,20 +131,12 @@ app.include_router(bill_payment_router)
 app.include_router(menu_router)
 app.include_router(yearly_router)
 app.include_router(inventory_forecast_router)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://vexonhq-ocr.vercel.app",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
 # ============================================================
 # JWT Auth Middleware — protects all routes except public ones
+# NOTE: Must be added BEFORE CORSMiddleware so CORS is outermost.
+#       In Starlette, the LAST add_middleware call = outermost layer.
+#       Outermost CORS ensures CORS headers appear on ALL responses
+#       including 401s returned by JWTAuthMiddleware.
 # ============================================================
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
@@ -155,6 +147,11 @@ PUBLIC_PATHS = {"/", "/health", "/auth/login", "/auth/logout", "/docs", "/openap
 class JWTAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: StarletteRequest, call_next):
         path = request.url.path
+
+        # Always pass through OPTIONS (CORS preflight)
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
         # Allow public routes and LINE webhook without auth
         if (path in PUBLIC_PATHS
                 or path.startswith("/auth/")
@@ -184,7 +181,19 @@ class JWTAuthMiddleware(BaseHTTPMiddleware):
 
         return await call_next(request)
 
+# Add JWT first (inner), then CORS last (outermost) —
+# this way CORS headers are applied to ALL responses including auth errors
 app.add_middleware(JWTAuthMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "https://vexonhq-ocr.vercel.app",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ============================================================
