@@ -644,112 +644,87 @@ def scheduler_status():
 # Phase 27: Stock / Inventory query via LINE
 # ─────────────────────────────────────────────
 
-_STOCK_KEYWORDS = (
+# คำที่หมายถึง "เช็ค stock ทั้งหมด"
+_STOCK_SUMMARY_KEYWORDS = (
     "stock", "สต็อก", "สต็อค", "สต๊อก", "สต๊อค",
     "เช็คของ", "ของเหลือ", "วัตถุดิบเหลือ", "สินค้าคงเหลือ",
-    "เหลือเท่าไร", "มีของไหม", "ของหมดไหม",
+    "เหลือเท่าไร", "มีของไหม", "ของหมดไหม", "รายงานสินค้า",
+)
+
+# ชื่อสินค้าที่ค้นหาใน stock (ไม่ใช่การเงิน)
+_STOCK_PRODUCT_KEYWORDS = (
+    "เบียร์", "สิงห์", "ไฮเนเกน", "อาซาฮี", "ลีโอ", "เฟดเดอร์บราว",
+    "โซดา", "เป๊ปซี่", "มิรินด้า", "น้ำเปล่า", "น้ำแร่",
+    "โซจู", "แกรนด์", "แสงโสม", "หงษ์ทอง", "รีเจนซี่",
+    "หมูสามชั้น", "สันคอ", "สันใน", "เนื้อริบ", "วากิว",
+    "ปูอัด", "หนวดหมึก", "ปลาหมึก", "กุ้งสด", "ท้องแซลมอน",
+    "ใส้กรอก", "ไส้กรอก", "เบคอน", "ปีกไก่", "หัวใจไก่", "สันในไก่",
+    "เห็ดออรินจิ", "บล็อคโคลี่", "กระเจี๊ยบ", "ข้าวโพดอ่อน",
+    "เต้าหู้", "พริกหยวก", "ปลาไข่",
+)
+
+# คำที่บ่งบอกว่าถามเรื่องการเงิน (ถ้ามีคำนี้ → financial search แม้จะมีชื่อสินค้า)
+_FINANCIAL_OVERRIDE_KEYWORDS = (
+    "ยอดโอน", "รายจ่าย", "รายรับ", "โอนไป", "บิล",
+    "ใบแจ้งหนี้", "invoice", "ค่าใช้จ่าย", "จ่ายเงิน",
 )
 
 
-def _is_stock_query(text: str) -> bool:
-    """Return True if the message is asking about inventory/stock."""
+def _classify_intent(text: str) -> str:
+    """
+    Classify LINE message intent:
+      'stock_summary'  — เช็ค stock ทั้งหมด
+      'stock_product'  — หา stock รายการสินค้าเฉพาะ (เบียร์ช้าง, สิงห์, ...)
+      'financial'      — ค้นหาข้อมูลการเงิน (ยอดโอนเบียร์ช้าง, รายจ่ายเบียร์)
+      'other'          — ส่งต่อ AI Search หรือ handler อื่น
+    """
     lower = text.lower().strip()
-    return any(kw in lower for kw in _STOCK_KEYWORDS)
+
+    # Check financial override first — ถ้ามีคำเงิน → financial เสมอ
+    if any(kw in lower for kw in _FINANCIAL_OVERRIDE_KEYWORDS):
+        return "financial"
+
+    # Check stock summary keywords
+    if any(kw in lower for kw in _STOCK_SUMMARY_KEYWORDS):
+        return "stock_summary"
+
+    # Check product name keywords (without financial context)
+    if any(kw in lower for kw in _STOCK_PRODUCT_KEYWORDS):
+        return "stock_product"
+
+    return "other"
 
 
-def _handle_stock_query() -> str:
-    """
-    Return a LINE-friendly stock summary based on recent vendor_bills purchases.
-    Groups by category/vendor, shows last purchase date + monthly average spend.
-    Uses vendor_bills as the source of truth (no real-time stock tracking yet).
-    """
-    conn = _get_db_conn()
+def _extract_product_keyword(text: str) -> str:
+    """Extract the product keyword from the query to search in stock."""
+    lower = text.lower().strip()
+    for kw in _STOCK_PRODUCT_KEYWORDS:
+        if kw in lower:
+            return kw
+    return text.strip()
+
+
+def _handle_stock_summary() -> str:
+    """Return a LINE-friendly full stock summary from pos_inventory_items."""
     try:
-        cur = conn.cursor()
+        from stock_routes import _query_inventory, format_stock_for_line
+        items, snapshot_at = _query_inventory(low_only=False)
+        return format_stock_for_line(items, snapshot_at, "📦 สรุป Stock ทั้งหมด")
+    except Exception as e:
+        log.error("Stock summary failed: %s", e)
+        return f"❌ เกิดข้อผิดพลาดในการเช็ค stock: {str(e)[:80]}"
 
-        # Last 3 months of confirmed vendor bills grouped by category
-        cur.execute("""
-            SELECT
-                COALESCE(ec.name_th, vb.category_code, 'อื่นๆ') AS cat_name,
-                vb.category_code,
-                COUNT(*) AS bill_count,
-                COALESCE(SUM(vb.amount), 0) AS total_spend,
-                MAX(vb.bill_date) AS last_purchase,
-                CURRENT_DATE - MAX(vb.bill_date) AS days_since
-            FROM public.vendor_bills vb
-            LEFT JOIN public.expense_categories ec ON ec.code = vb.category_code
-            WHERE vb.review_status = 'confirmed'
-              AND vb.bill_date >= CURRENT_DATE - INTERVAL '90 days'
-            GROUP BY COALESCE(ec.name_th, vb.category_code, 'อื่นๆ'), vb.category_code
-            ORDER BY last_purchase DESC
-            LIMIT 10
-        """)
-        rows = cur.fetchall()
 
-        # Recent top vendors (last 30 days)
-        cur.execute("""
-            SELECT
-                COALESCE(vb.vendor_name, 'ไม่ระบุ') AS vendor,
-                COALESCE(ec.name_th, vb.category_code, 'อื่นๆ') AS cat_name,
-                COALESCE(SUM(vb.amount), 0) AS total,
-                MAX(vb.bill_date) AS last_date
-            FROM public.vendor_bills vb
-            LEFT JOIN public.expense_categories ec ON ec.code = vb.category_code
-            WHERE vb.review_status = 'confirmed'
-              AND vb.bill_date >= CURRENT_DATE - INTERVAL '30 days'
-              AND vb.vendor_name IS NOT NULL
-            GROUP BY vb.vendor_name, COALESCE(ec.name_th, vb.category_code, 'อื่นๆ')
-            ORDER BY last_date DESC
-            LIMIT 8
-        """)
-        vendors = cur.fetchall()
-
-        sep = "─" * 24
-
-        if not rows and not vendors:
-            return (
-                "📦 เช็ค Stock / วัตถุดิบ\n"
-                f"{sep}\n"
-                "ไม่พบข้อมูลใบบิลใน 90 วันที่ผ่านมา\n"
-                "💡 เพิ่มข้อมูลโดยส่งรูปใบบิลมาที่ Line Bot"
-            )
-
-        lines = ["📦 สรุปการซื้อวัตถุดิบ (90 วันล่าสุด)", sep]
-
-        if rows:
-            lines.append("📊 ตามหมวดหมู่:")
-            for cat_name, cat_code, count, total, last_date, days_since in rows:
-                days_ago = int(days_since) if days_since is not None else "?"
-                # Urgency indicator
-                if isinstance(days_ago, int):
-                    if days_ago <= 7:
-                        icon = "🟢"  # bought recently
-                    elif days_ago <= 21:
-                        icon = "🟡"  # moderate
-                    else:
-                        icon = "🔴"  # hasn't been bought in a while
-                else:
-                    icon = "⚪"
-                last_str = last_date.strftime("%d/%m") if last_date else "-"
-                lines.append(
-                    f"  {icon} {cat_name}: ฿{float(total):,.0f} "
-                    f"({count} ใบ, ล่าสุด {last_str}, {days_ago}วันที่แล้ว)"
-                )
-
-        if vendors:
-            lines.append(sep)
-            lines.append("🛒 ซัพพลายเออร์ล่าสุด (30 วัน):")
-            for vendor, cat_name, total, last_date in vendors:
-                last_str = last_date.strftime("%d/%m") if last_date else "-"
-                lines.append(f"  • {vendor} ({cat_name}): ฿{float(total):,.0f} — {last_str}")
-
-        lines.append(sep)
-        lines.append("💡 ส่งรูปใบบิลเพื่ออัปเดตข้อมูลได้เลย")
-
-        return "\n".join(lines)
-
-    finally:
-        conn.close()
+def _handle_stock_product(query: str) -> str:
+    """Return LINE-friendly stock for a specific product keyword."""
+    try:
+        from stock_routes import _query_inventory, format_product_stock_for_line
+        keyword = _extract_product_keyword(query)
+        items, snapshot_at = _query_inventory(keyword=keyword)
+        return format_product_stock_for_line(items, snapshot_at, query)
+    except Exception as e:
+        log.error("Stock product search failed: %s", e)
+        return f"❌ เกิดข้อผิดพลาด: {str(e)[:80]}"
 
 
 # ─────────────────────────────────────────────
@@ -917,17 +892,19 @@ async def line_webhook(
                     _reply_line(reply_token, f"❌ บันทึกไม่สำเร็จ: {str(e)[:80]}")
                 continue
 
-            # Stock / Inventory query (Phase 27)
-            if _is_stock_query(text):
-                try:
-                    reply = _handle_stock_query()
-                except Exception as e:
-                    log.error("Stock query failed: %s", e)
-                    reply = f"❌ เกิดข้อผิดพลาดในการเช็ค stock: {str(e)[:80]}"
-                _reply_line(reply_token, reply)
+            # ── Intent classification (Phase 27) ──
+            intent = _classify_intent(text)
+            log.info("LINE intent: %r → %s", text, intent)
+
+            if intent == "stock_summary":
+                _reply_line(reply_token, _handle_stock_summary())
                 continue
 
-            # AI Search (Phase 11)
+            if intent == "stock_product":
+                _reply_line(reply_token, _handle_stock_product(text))
+                continue
+
+            # intent == "financial" or "other" → AI Search (Phase 11)
             try:
                 from phase11_search_routes import _call_claude_filter, _build_and_run_query
                 search_filter = _call_claude_filter(text)
