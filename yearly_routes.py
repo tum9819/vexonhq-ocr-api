@@ -82,7 +82,24 @@ def pnl_yearly(
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            # ── Monthly sales (pos_sales_daily) ───────────────
+            # ── All income + expense from v_daybook (excludes equity transfers) ──
+            cur.execute(
+                """SELECT EXTRACT(MONTH FROM entry_date)::int AS m,
+                          COALESCE(SUM(CASE WHEN direction='income'
+                                           THEN amount ELSE 0 END), 0)::numeric AS income_total,
+                          COALESCE(SUM(CASE WHEN direction='expense'
+                                           THEN amount ELSE 0 END), 0)::numeric AS expense_total
+                   FROM public.v_daybook
+                   WHERE branch_code = %s
+                     AND EXTRACT(YEAR FROM entry_date) = %s
+                     AND source NOT IN ('owner_capital','owner_advance','transfer_error')
+                   GROUP BY 1""",
+                (branch, year),
+            )
+            daybook_map = {r[0]: (float(r[1] or 0), float(r[2] or 0))
+                           for r in cur.fetchall()}
+
+            # ── POS sales breakdown (for sales_net + bill_count) ──────────────
             cur.execute(
                 """SELECT EXTRACT(MONTH FROM sales_date)::int AS m,
                           SUM(net_total)::numeric             AS sales_net,
@@ -90,14 +107,13 @@ def pnl_yearly(
                    FROM public.pos_sales_daily
                    WHERE branch_code = %s
                      AND EXTRACT(YEAR FROM sales_date) = %s
-                   GROUP BY 1
-                   ORDER BY 1""",
+                   GROUP BY 1""",
                 (branch, year),
             )
             sales_map = {r[0]: (float(r[1] or 0), int(r[2] or 0))
                          for r in cur.fetchall()}
 
-            # ── Rider income (Grab + Lineman) ─────────────────
+            # ── Rider income breakdown ─────────────────────────────────────────
             cur.execute(
                 """SELECT EXTRACT(MONTH FROM delivery_date)::int AS m,
                           SUM(net_payout)::numeric              AS rider_net
@@ -109,54 +125,32 @@ def pnl_yearly(
             )
             rider_map = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
 
-            # ── Monthly expenses (vendor_bills) ───────────────
+            # ── Expense bill count ─────────────────────────────────────────────
             cur.execute(
                 """SELECT EXTRACT(MONTH FROM bill_date)::int AS m,
-                          SUM(amount)::numeric               AS expense,
-                          COUNT(*)::int                      AS bill_count
+                          COUNT(*)::int AS bill_count
                    FROM public.vendor_bills
                    WHERE review_status = 'confirmed'
                      AND bill_date IS NOT NULL
                      AND COALESCE(branch_code, %s) = %s
                      AND EXTRACT(YEAR FROM bill_date) = %s
-                   GROUP BY 1
-                   ORDER BY 1""",
+                   GROUP BY 1""",
                 (branch, branch, year),
             )
-            exp_map = {r[0]: (float(r[1] or 0), int(r[2] or 0))
-                       for r in cur.fetchall()}
-
-            # ── Owner equity exclusions ────────────────────────
-            cur.execute(
-                """SELECT EXTRACT(MONTH FROM entry_date)::int AS m,
-                          SUM(CASE WHEN direction='income' THEN amount ELSE 0 END)::numeric AS eq_in,
-                          SUM(CASE WHEN direction='expense' THEN amount ELSE 0 END)::numeric AS eq_out
-                   FROM public.v_daybook
-                   WHERE EXTRACT(YEAR FROM entry_date) = %s
-                     AND source IN ('owner_capital','owner_advance','transfer_error')
-                   GROUP BY 1""",
-                (year,),
-            )
-            eq_map = {r[0]: (float(r[1] or 0), float(r[2] or 0))
-                      for r in cur.fetchall()}
+            exp_bills_map = {r[0]: int(r[1] or 0) for r in cur.fetchall()}
 
     finally:
         conn.close()
 
-    # Build monthly rows
-    all_months = sorted(set(list(sales_map) + list(exp_map) + list(rider_map)) or range(1, 13))
     rows = []
     totals = dict(sales_net=0.0, rider_net=0.0, income_total=0.0,
                   expense_total=0.0, gross_profit=0.0, bill_count=0, expense_bill_count=0)
 
     for m in range(1, 13):
+        income, expense = daybook_map.get(m, (0.0, 0.0))
         s_net, s_bills = sales_map.get(m, (0.0, 0))
         r_net = rider_map.get(m, 0.0)
-        exp, e_bills = exp_map.get(m, (0.0, 0))
-        eq_in, eq_out = eq_map.get(m, (0.0, 0.0))
-        # Adjust: exclude owner transfers
-        income = (s_net + r_net) - eq_in
-        expense = exp - eq_out
+        e_bills = exp_bills_map.get(m, 0)
         profit = income - expense
         margin = round(profit / income * 100, 1) if income else None
 
@@ -164,11 +158,11 @@ def pnl_yearly(
             "month": m,
             "month_label": TH_MONTHS[m],
             "year_month": f"{year}-{m:02d}",
-            "sales_net": s_net,
-            "rider_net": r_net,
-            "income_total": income,
-            "expense_total": expense,
-            "gross_profit": profit,
+            "sales_net": round(s_net, 2),
+            "rider_net": round(r_net, 2),
+            "income_total": round(income, 2),
+            "expense_total": round(expense, 2),
+            "gross_profit": round(profit, 2),
             "gross_margin_pct": margin,
             "sales_bill_count": s_bills,
             "expense_bill_count": e_bills,
