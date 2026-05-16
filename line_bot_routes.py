@@ -408,6 +408,26 @@ def _scheduled_daily_digest():
         log.error("Scheduled digest FAILED for %s: %s", yesterday, e)
 
 
+# ─────────────────────────────────────────────
+# Phase 20: AP Due Date Reminder — 09:00 Bangkok
+# ─────────────────────────────────────────────
+
+def _scheduled_ap_due_reminder():
+    """APScheduler job: send AP due reminder to LINE at 09:00 Bangkok time."""
+    log.info("Scheduled AP due reminder — running")
+    try:
+        from phase3_arap_routes import _query_due_bills, _build_due_reminder_message  # noqa: PLC0415
+        rows = _query_due_bills(days_ahead=3)
+        if rows:
+            text = _build_due_reminder_message(rows)
+            _push_text(text)
+            log.info("AP due reminder sent OK: %d bill(s)", len(rows))
+        else:
+            log.info("AP due reminder: ไม่มีบิลครบกำหนดใน 3 วันข้างหน้า")
+    except Exception as e:
+        log.error("AP due reminder FAILED: %s", e)
+
+
 # Start scheduler when module loads (FastAPI startup)
 _scheduler = BackgroundScheduler(timezone="Asia/Bangkok")
 _scheduler.add_job(
@@ -418,8 +438,17 @@ _scheduler.add_job(
     id="daily_line_digest",
     replace_existing=True,
 )
+_scheduler.add_job(
+    _scheduled_ap_due_reminder,
+    trigger="cron",
+    hour=9,
+    minute=0,
+    id="daily_ap_due_reminder",
+    replace_existing=True,
+)
 _scheduler.start()
 log.info("LINE digest scheduler started — fires daily at 06:00 Asia/Bangkok")
+log.info("AP due reminder scheduler started — fires daily at 09:00 Asia/Bangkok")
 
 
 # ─────────────────────────────────────────────
@@ -643,6 +672,9 @@ def scheduler_status():
     return {
         "running": _scheduler.running,
         "timezone": "Asia/Bangkok",
-        "schedule": "daily at 06:00",
+        "schedules": {
+            "daily_line_digest": "06:00 — ส่ง daily digest",
+            "daily_ap_due_reminder": "09:00 — AP due reminder (Phase 20)",
+        },
         "jobs": jobs,
     }

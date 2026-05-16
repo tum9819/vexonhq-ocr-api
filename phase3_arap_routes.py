@@ -690,77 +690,87 @@ def ar_ap_summary():
         conn.close()
 
 
+
 # ============================================================
-# SECTION E — Phase 14: AP Due Date Reminder (LINE)
+# SECTION E — Phase 20: AP Due Date Reminder (LINE) — Improved
 # ============================================================
 
-@router.post("/ap/due-reminder")
-def ap_due_reminder():
-    """
-    Phase 14 — ส่ง LINE แจ้งเตือน AP ที่ครบกำหนดภายใน 3 วัน
-    เรียกจาก Coolify cron: 0 9 * * * (09:00 Bangkok)
-    หรือเรียก manual: POST /ap/due-reminder
-    """
-    from line_bot_routes import _push_text  # noqa: PLC0415
+_THAI_MONTHS = [
+    "", "ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.",
+    "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค.",
+]
 
+
+def _thai_short_date(d):
+    return f"{d.day} {_THAI_MONTHS[d.month]}"
+
+
+def _query_due_bills(days_ahead: int = 3):
     today = date.today()
-    deadline = today + timedelta(days=3)
-
+    date_from = today + timedelta(days=1)
+    date_to   = today + timedelta(days=days_ahead)
+    sql = (
+        "SELECT "
+        "e.id, "
+        "COALESCE(c.name, e.counterparty_name_snapshot, 'ไม่ระบุ') AS vendor_name, "
+        "e.doc_no, e.due_date, e.amount_total, e.amount_paid, "
+        "(e.amount_total - e.amount_paid) AS remaining "
+        "FROM public.ar_ap_entries e "
+        "LEFT JOIN public.counterparties c ON c.id = e.counterparty_id "
+        "WHERE e.direction = 'payable' "
+        "  AND e.status IN ('pending', 'partial') "
+        "  AND e.due_date BETWEEN %s AND %s "
+        "ORDER BY e.due_date ASC, remaining DESC"
+    )
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    e.id,
-                    COALESCE(c.name, e.counterparty_name_snapshot, 'ไม่ระบุ') AS vendor_name,
-                    e.doc_no,
-                    e.due_date,
-                    e.amount_total,
-                    e.amount_paid,
-                    (e.amount_total - e.amount_paid) AS remaining
-                FROM public.ar_ap_entries e
-                LEFT JOIN public.counterparties c ON c.id = e.counterparty_id
-                WHERE e.direction = 'payable'
-                  AND e.status IN ('pending', 'partial')
-                  AND e.due_date BETWEEN %s AND %s
-                ORDER BY e.due_date ASC
-                """,
-                (today.isoformat(), deadline.isoformat()),
-            )
-            rows = _rows_to_dicts(cur)
+            cur.execute(sql, (date_from.isoformat(), date_to.isoformat()))
+            return _rows_to_dicts(cur)
     finally:
         conn.close()
 
-    if not rows:
-        return {"sent": False, "message": "ไม่มี AP ครบกำหนดใน 3 วันข้างหน้า", "count": 0}
 
-    # ── Build LINE message ──
-    lines = ["⚠️ แจ้งเตือน AP ครบกำหนด (3 วัน)\n"]
+def _build_due_reminder_message(rows):
+    today = date.today()
+    result_lines = ["⚠️ บิลใกล้ครบกำหนด"]
+    total_amount = 0.0
     for r in rows:
-        due_str = r["due_date"]
-        days_left = (date.fromisoformat(due_str) - today).days
-        if days_left == 0:
-            day_label = "🔴 วันนี้!"
-        elif days_left == 1:
-            day_label = "🟠 พรุ่งนี้"
-        else:
-            day_label = f"🟡 อีก {days_left} วัน"
-
-        vendor = r["vendor_name"]
+        due_d     = date.fromisoformat(r["due_date"])
+        days_left = (due_d - today).days
         remaining = float(r["remaining"])
-        doc = f" ({r['doc_no']})" if r.get("doc_no") else ""
-        lines.append(
-            f"{day_label} — {vendor}{doc}\n"
-            f"ครบกำหนด: {due_str}\n"
-            f"ค้างจ่าย: ฿{remaining:,.2f}\n"
+        total_amount += remaining
+        vendor   = r["vendor_name"]
+        amt_str  = f"฿{remaining:,.0f}"
+        due_str  = _thai_short_date(due_d)
+        result_lines.append(
+            f"- {vendor} — {amt_str} — ครบ {due_str} (อีก {days_left} วัน)"
         )
+    total_str = f"฿{total_amount:,.0f}"
+    result_lines.append(f"รวม {len(rows)} บิล / {total_str}")
+    return "\n".join(result_lines)
 
-    lines.append(f"รวม {len(rows)} รายการ — กรุณาชำระตามกำหนด")
-    message = "\n".join(lines)
 
+@router.post("/ap/due-reminder")
+def ap_due_reminder(
+    days_ahead: int = Query(3, ge=1, le=7, description="days_ahead 1-7 (default 3)"),
+):
+    from line_bot_routes import _push_text  # noqa: PLC0415
+    rows = _query_due_bills(days_ahead)
+    if not rows:
+        return {
+            "sent": False,
+            "message": f"No AP bills due in {days_ahead} days",
+            "count": 0,
+        }
+    message = _build_due_reminder_message(rows)
     _push_text(message)
-    return {"sent": True, "count": len(rows), "entries": rows}
+    return {
+        "sent": True,
+        "count": len(rows),
+        "days_ahead": days_ahead,
+        "entries": rows,
+    }
 
 
 # ============================================================
@@ -769,7 +779,6 @@ def ap_due_reminder():
 
 @router.get("/ar-ap/health")
 def ar_ap_health():
-    """Quick sanity: DB reachable + counterparties seeded + views queryable."""
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
