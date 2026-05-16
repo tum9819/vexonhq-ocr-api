@@ -60,13 +60,13 @@ def supplier_summary(month: str = Query(..., description="YYYY-MM")):
         cur.execute("""
             WITH vb AS (
                 SELECT
-                    COALESCE(vendor_name, counterparty_name_snapshot, 'ไม่ระบุ') AS supplier,
+                    COALESCE(vendor_name, 'ไม่ระบุ') AS supplier,
                     SUM(amount)::numeric AS total,
                     COUNT(*)            AS bill_count
                 FROM public.vendor_bills
                 WHERE review_status = 'confirmed'
                   AND bill_date BETWEEN %s AND %s
-                GROUP BY COALESCE(vendor_name, counterparty_name_snapshot, 'ไม่ระบุ')
+                GROUP BY COALESCE(vendor_name, 'ไม่ระบุ')
             ),
             ap AS (
                 SELECT
@@ -134,7 +134,7 @@ def supplier_top(
         cur = conn.cursor()
         cur.execute("""
             WITH vb AS (
-                SELECT COALESCE(vendor_name, counterparty_name_snapshot, 'ไม่ระบุ') AS supplier,
+                SELECT COALESCE(vendor_name, 'ไม่ระบุ') AS supplier,
                        SUM(amount)::numeric AS total, COUNT(*) AS bills
                 FROM public.vendor_bills
                 WHERE review_status='confirmed' AND bill_date BETWEEN %s AND %s
@@ -205,7 +205,7 @@ def supplier_trend(
         # First get top suppliers by total over period
         cur.execute("""
             WITH vb AS (
-                SELECT COALESCE(vendor_name, counterparty_name_snapshot, 'ไม่ระบุ') AS supplier,
+                SELECT COALESCE(vendor_name, 'ไม่ระบุ') AS supplier,
                        SUM(amount)::numeric AS total
                 FROM public.vendor_bills
                 WHERE review_status='confirmed' AND bill_date BETWEEN %s AND %s
@@ -235,12 +235,12 @@ def supplier_trend(
             WITH vb AS (
                 SELECT
                     to_char(bill_date, 'YYYY-MM') AS ym,
-                    COALESCE(vendor_name, counterparty_name_snapshot, 'ไม่ระบุ') AS supplier,
+                    COALESCE(vendor_name, 'ไม่ระบุ') AS supplier,
                     SUM(amount)::numeric AS total
                 FROM public.vendor_bills
                 WHERE review_status='confirmed'
                   AND bill_date BETWEEN %s AND %s
-                  AND COALESCE(vendor_name, counterparty_name_snapshot, 'ไม่ระบุ') IN ({placeholders})
+                  AND COALESCE(vendor_name, 'ไม่ระบุ') IN ({placeholders})
                 GROUP BY 1, 2
             ),
             ap AS (
