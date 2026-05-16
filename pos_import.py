@@ -1003,6 +1003,21 @@ class ImportResponse(BaseModel):
     detail: dict = {}
 
 
+@router.post("/detect-only")
+async def detect_only(file: UploadFile = File(...)):
+    """Dry-run: detect report type without saving to DB."""
+    content = await file.read()
+    if not content:
+        raise HTTPException(400, "Empty file")
+    try:
+        _, rtype = read_and_detect(content, file.filename or "")
+        return {"report_type": rtype, "filename": file.filename}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"Detection failed: {e}")
+
+
 @router.post("/import", response_model=ImportResponse)
 async def import_pos_excel(
     file: UploadFile = File(...),
