@@ -407,6 +407,229 @@ def remove_recipe_ingredient(recipe_id: str, item_id: str):
         conn.close()
 
 
+# ── Import from POS Menu (Phase 33) ─────────────────────────
+
+@router.post("/import-from-menu")
+def import_recipes_from_menu(
+    branch_code: str = "thawi_watthana",
+    min_qty_sold: int = 1,
+):
+    """
+    Phase 33 — นำเข้าเมนูจากข้อมูล POS อัตโนมัติ
+    Query pos_sales_by_product → INSERT into recipes (skip ที่มีแล้ว)
+
+    Args:
+        branch_code: สาขา (default: thawi_watthana)
+        min_qty_sold: เฉพาะเมนูที่ขายแล้วอย่างน้อย N จาน (default: 1)
+    """
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # ── ดึงเมนู unique จาก POS ─────────────────────────────
+            cur.execute("""
+                SELECT
+                    product_name,
+                    ROUND(AVG(NULLIF(avg_price, 0)), 2) AS selling_price,
+                    MAX(category)                        AS category,
+                    SUM(qty_sold)::int                   AS total_qty_sold
+                FROM public.pos_sales_by_product
+                WHERE branch_code = %s
+                GROUP BY product_name
+                HAVING SUM(qty_sold) >= %s
+                ORDER BY SUM(qty_sold) DESC, product_name
+            """, (branch_code, min_qty_sold))
+            products = cur.fetchall()
+
+            # ── ชื่อ recipe ที่มีใน DB แล้ว (lowercase) ────────────
+            cur.execute("SELECT LOWER(name) FROM public.recipes")
+            existing = {r[0] for r in cur.fetchall()}
+
+            imported = 0
+            skipped_existing = 0
+            skipped_blank = 0
+
+            for product_name, selling_price, category, total_qty in products:
+                name_clean = (product_name or "").strip()
+                if not name_clean:
+                    skipped_blank += 1
+                    continue
+                if name_clean.lower() in existing:
+                    skipped_existing += 1
+                    continue
+
+                cur.execute("""
+                    INSERT INTO public.recipes (name, selling_price, category, notes)
+                    VALUES (%s, %s, %s, %s)
+                """, (
+                    name_clean,
+                    float(selling_price or 0),
+                    category,
+                    f"นำเข้าจากข้อมูล POS อัตโนมัติ (ขายแล้ว {total_qty} จาน)",
+                ))
+                existing.add(name_clean.lower())
+                imported += 1
+
+        conn.commit()
+        return {
+            "imported":           imported,
+            "skipped_existing":   skipped_existing,
+            "skipped_blank":      skipped_blank,
+            "total_found":        len(products),
+            "message": (
+                f"นำเข้า {imported} เมนูใหม่ "
+                f"(ข้าม {skipped_existing} ที่มีแล้ว)"
+            ),
+        }
+    finally:
+        conn.close()
+
+
+# ── AI Link Ingredients (Phase 33) ──────────────────────────
+
+@router.post("/{recipe_id}/ai-link-ingredients")
+def ai_link_ingredients(
+    recipe_id: str,
+    apply: bool = False,
+):
+    """
+    Phase 33 — AI แนะนำวัตถุดิบ + ปริมาณสำหรับ recipe
+
+    1. ดึงชื่อ recipe + รายการ ingredients ทั้งหมดใน DB
+    2. Claude Haiku วิเคราะห์ว่าเมนูนี้น่าจะใช้วัตถุดิบอะไร
+    3. คืนรายการแนะนำ {ingredient_id, name, qty_used, unit}
+    4. ถ้า apply=true → INSERT จริงใน recipe_ingredients (skip ที่มีแล้ว)
+    """
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # ── ดึงชื่อ recipe ───────────────────────────────────
+            cur.execute(
+                "SELECT name, selling_price FROM public.recipes WHERE id = %s",
+                (recipe_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "Recipe not found")
+            recipe_name, selling_price = row[0], float(row[1] or 0)
+
+            # ── ดึง ingredients ทั้งหมด ──────────────────────────
+            cur.execute("""
+                SELECT id, name, unit, price_per_unit
+                FROM public.ingredients
+                ORDER BY name
+            """)
+            all_ingredients = [
+                {"id": str(r[0]), "name": r[1], "unit": r[2], "price": float(r[3] or 0)}
+                for r in cur.fetchall()
+            ]
+
+            # ── ingredients ที่ link แล้ว (skip ถ้า apply) ───────
+            cur.execute(
+                "SELECT ingredient_id FROM public.recipe_ingredients WHERE recipe_id = %s",
+                (recipe_id,)
+            )
+            already_linked = {str(r[0]) for r in cur.fetchall()}
+    finally:
+        conn.close()
+
+    if not all_ingredients:
+        raise HTTPException(400, "ยังไม่มีวัตถุดิบในระบบ — import จาก Stock ก่อน")
+
+    # ── สร้าง ingredient list สำหรับ prompt ─────────────────
+    ingr_list = "\n".join(
+        f"- ID:{i['id']} | {i['name']} ({i['unit']}) ราคา฿{i['price']:.2f}"
+        for i in all_ingredients
+    )
+
+    system_prompt = (
+        "คุณเป็นผู้ช่วยเชฟร้านอาหารไทย เชี่ยวชาญการคำนวณสูตรและต้นทุนวัตถุดิบ\n"
+        "ตอบ JSON array เท่านั้น ห้ามมีข้อความอื่น"
+    )
+    user_prompt = f"""เมนู: {recipe_name}
+ราคาขาย: ฿{selling_price:.0f}
+
+วัตถุดิบที่มีในระบบ:
+{ingr_list}
+
+เลือกเฉพาะวัตถุดิบที่น่าจะใช้จริงในเมนูนี้ (2-8 รายการ)
+คืน JSON array รูปแบบ:
+[
+  {{"ingredient_id": "<ID>", "ingredient_name": "<ชื่อ>", "qty_used": <ปริมาณต่อจาน>, "unit": "<หน่วย>", "reason": "<เหตุผลสั้นๆ>"}}
+]
+qty_used คือปริมาณต่อ 1 จาน/เสิร์ฟ ใช้หน่วยเดียวกับ unit ของวัตถุดิบ"""
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        raise HTTPException(500, "ANTHROPIC_API_KEY not configured")
+
+    payload = json.dumps({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 1024,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_prompt}],
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=payload,
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            raw = data["content"][0]["text"].strip()
+            if "```" in raw:
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+                raw = raw.split("```")[0]
+            suggestions = json.loads(raw.strip())
+    except urllib.error.HTTPError as e:
+        body_err = e.read().decode("utf-8", errors="replace")
+        raise HTTPException(502, f"Claude API error {e.code}: {body_err}")
+    except json.JSONDecodeError:
+        raise HTTPException(502, "Claude returned invalid JSON")
+
+    # ── Apply: INSERT จริงถ้า apply=true ──────────────────────
+    applied = 0
+    skipped = 0
+    if apply:
+        conn2 = get_db_conn()
+        try:
+            with conn2.cursor() as cur:
+                for s in suggestions:
+                    ing_id = s.get("ingredient_id")
+                    qty    = float(s.get("qty_used") or 0)
+                    if not ing_id or qty <= 0:
+                        continue
+                    if ing_id in already_linked:
+                        skipped += 1
+                        continue
+                    cur.execute("""
+                        INSERT INTO public.recipe_ingredients (recipe_id, ingredient_id, qty_used)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT DO NOTHING
+                    """, (recipe_id, ing_id, qty))
+                    already_linked.add(ing_id)
+                    applied += 1
+            conn2.commit()
+        finally:
+            conn2.close()
+
+    return {
+        "recipe_name":   recipe_name,
+        "suggestions":   suggestions,
+        "applied":       applied,
+        "skipped":       skipped,
+        "apply_hint":    "เพิ่ม ?apply=true เพื่อบันทึกวัตถุดิบเหล่านี้เข้า recipe จริง",
+    }
+
+
 # ── AI Suggest Endpoint ──────────────────────────────────────
 
 @router.post("/ai-suggest")

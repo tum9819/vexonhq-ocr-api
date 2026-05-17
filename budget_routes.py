@@ -233,3 +233,151 @@ def check_budget_alerts(month: Optional[str] = None, branch_code: str = "thawi_w
     Also called automatically by APScheduler at 20:00 daily via run_budget_alert_check().
     """
     return run_budget_alert_check(month=month, branch_code=branch_code)
+
+
+# ── GET /budget/suggest ──────────────────────────────────────────────────────
+
+@router.get("/suggest")
+def suggest_budget(
+    month: str,
+    lookback: int = 3,
+    branch_code: str = "thawi_watthana",
+    buffer_pct: float = 10.0,
+):
+    """
+    Suggest budget amounts for `month` based on average spending over the past
+    `lookback` months + a buffer.
+
+    Query: vendor_bills (confirmed, expense) + manual_entries (expense) +
+           bank_statement_entries (expense) — same sources as v_daybook.
+    Returns per-category: avg_actual, suggested_amount, months_with_data.
+    """
+    try:
+        y, m = int(month[:4]), int(month[5:7])
+    except (ValueError, IndexError):
+        raise HTTPException(400, "month must be YYYY-MM")
+
+    # Start of lookback window = month - lookback months
+    start_m, start_y = m - lookback, y
+    while start_m <= 0:
+        start_m += 12
+        start_y -= 1
+    start_date = date(start_y, start_m, 1)
+    end_date   = date(y, m, 1)  # exclusive — up to but not including target month
+
+    conn = _get_db()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # ── vendor_bills actuals ──
+            cur.execute("""
+                SELECT
+                    vb.category_code,
+                    COALESCE(ec.name_th, vb.category_code) AS category_name_th,
+                    DATE_TRUNC('month', vb.bill_date)::date AS month_dt,
+                    SUM(vb.amount)::numeric AS month_total
+                FROM public.vendor_bills vb
+                LEFT JOIN public.expense_categories ec ON ec.code = vb.category_code
+                WHERE vb.branch_code = %s
+                  AND vb.confirmed = TRUE
+                  AND vb.direction = 'expense'
+                  AND vb.bill_date >= %s
+                  AND vb.bill_date < %s
+                  AND vb.category_code IS NOT NULL
+                GROUP BY vb.category_code, ec.name_th, DATE_TRUNC('month', vb.bill_date)::date
+            """, (branch_code, start_date, end_date))
+            bill_rows = [dict(r) for r in cur.fetchall()]
+
+            # ── manual_entries actuals ──
+            cur.execute("""
+                SELECT
+                    me.category_code,
+                    COALESCE(ec.name_th, me.category_code) AS category_name_th,
+                    DATE_TRUNC('month', me.entry_date)::date AS month_dt,
+                    SUM(me.amount)::numeric AS month_total
+                FROM public.manual_entries me
+                LEFT JOIN public.expense_categories ec ON ec.code = me.category_code
+                WHERE me.branch_code = %s
+                  AND me.direction = 'expense'
+                  AND me.entry_date >= %s
+                  AND me.entry_date < %s
+                  AND me.category_code IS NOT NULL
+                GROUP BY me.category_code, ec.name_th, DATE_TRUNC('month', me.entry_date)::date
+            """, (branch_code, start_date, end_date))
+            manual_rows = [dict(r) for r in cur.fetchall()]
+
+            # ── bank_statement_entries actuals ──
+            cur.execute("""
+                SELECT
+                    bse.category_code,
+                    COALESCE(ec.name_th, bse.category_code) AS category_name_th,
+                    DATE_TRUNC('month', bse.txn_date)::date AS month_dt,
+                    SUM(bse.debit)::numeric AS month_total
+                FROM public.bank_statement_entries bse
+                LEFT JOIN public.expense_categories ec ON ec.code = bse.category_code
+                WHERE bse.branch_code = %s
+                  AND bse.category_code IS NOT NULL
+                  AND bse.debit > 0
+                  AND bse.txn_date >= %s
+                  AND bse.txn_date < %s
+                GROUP BY bse.category_code, ec.name_th, DATE_TRUNC('month', bse.txn_date)::date
+            """, (branch_code, start_date, end_date))
+            bank_rows = [dict(r) for r in cur.fetchall()]
+
+            # ── current budget targets (to show in comparison) ──
+            cur.execute("""
+                SELECT category_code, amount
+                FROM public.budget_targets
+                WHERE month = %s AND branch_code = %s
+            """, (month, branch_code))
+            existing_budget = {r["category_code"]: float(r["amount"] or 0) for r in cur.fetchall()}
+
+    finally:
+        conn.close()
+
+    # ── Merge all rows ─────────────────────────────────────────────────────
+    # group by category_code × month_dt
+    from collections import defaultdict
+    monthly: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    names: dict[str, str] = {}
+
+    for row in bill_rows + manual_rows + bank_rows:
+        cat = row["category_code"]
+        mon = str(row["month_dt"])[:7]   # YYYY-MM
+        monthly[cat][mon] += float(row["month_total"] or 0)
+        if cat not in names and row.get("category_name_th"):
+            names[cat] = row["category_name_th"]
+
+    # ── Build suggestions ─────────────────────────────────────────────────
+    suggestions = []
+    for cat, month_totals in monthly.items():
+        totals = [v for v in month_totals.values() if v > 0]
+        if not totals:
+            continue
+        avg = sum(totals) / len(totals)
+        suggested = round(avg * (1 + buffer_pct / 100) / 100) * 100  # round to nearest 100
+        suggestions.append({
+            "category_code":     cat,
+            "category_name_th":  names.get(cat, cat),
+            "months_with_data":  len(totals),
+            "lookback_months":   lookback,
+            "avg_monthly":       round(avg, 2),
+            "buffer_pct":        buffer_pct,
+            "suggested_amount":  suggested,
+            "current_budget":    existing_budget.get(cat, 0),
+            "diff":              round(suggested - existing_budget.get(cat, 0), 2),
+        })
+
+    suggestions.sort(key=lambda x: x["avg_monthly"], reverse=True)
+    total_suggested = sum(s["suggested_amount"] for s in suggestions)
+
+    return {
+        "month":           month,
+        "lookback_months": lookback,
+        "buffer_pct":      buffer_pct,
+        "branch_code":     branch_code,
+        "data_from":       str(start_date),
+        "data_to":         str(end_date),
+        "total_suggested": total_suggested,
+        "suggestions":     suggestions,
+        "note":            f"คำนวณจากค่าใช้จ่ายจริงย้อนหลัง {lookback} เดือน บวก {buffer_pct:.0f}% เพื่อเป็น buffer",
+    }
