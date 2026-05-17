@@ -151,7 +151,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse as StarletteJSONResponse
 
-PUBLIC_PATHS = {"/", "/health", "/auth/login", "/auth/logout", "/docs", "/openapi.json", "/redoc", "/ap/due-reminder"}
+PUBLIC_PATHS = {"/", "/health", "/auth/login", "/auth/logout", "/docs", "/openapi.json", "/redoc", "/ap/due-reminder", "/stock/alert"}
 
 class JWTAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: StarletteRequest, call_next):
