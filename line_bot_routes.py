@@ -832,24 +832,65 @@ _CATEGORY_NAME_FALLBACK: dict[str, list[str]] = {
 
 
 def _query_inventory_by_keywords(keywords: list[str]) -> tuple[list[dict], str]:
-    """Run _query_inventory for each keyword and merge unique items by name."""
-    from stock_routes import _query_inventory
-    seen: set[str] = set()
-    merged: list[dict] = []
-    snap = ""
-    for kw in keywords:
-        try:
-            items, sa = _query_inventory(keyword=kw, low_only=False)
-            if sa:
-                snap = sa
-            for it in items:
-                name = it.get("item_name") or ""
-                if name and name not in seen:
-                    seen.add(name)
-                    merged.append(it)
-        except Exception as e:
-            log.warning("inventory keyword query failed (%s): %s", kw, e)
-    return merged, snap
+    """
+    Run ONE SQL query with OR-joined ILIKE patterns for all keywords.
+
+    Session 15 perf fix (2026-05-17): previous version looped through 24
+    keywords, opening a new DB connection for each → ~60s response time
+    because reply_token expired before the loop finished. Single query
+    brings it down to ~1-2 seconds.
+    """
+    from stock_routes import _get_latest_snapshot_id, get_db_conn
+    snapshot_id, snapshot_at = _get_latest_snapshot_id()
+    if not snapshot_id:
+        return [], ""
+
+    if not keywords:
+        return [], snapshot_at or ""
+
+    like_clauses = " OR ".join(["i.item_name ILIKE %s"] * len(keywords))
+    params: list = [snapshot_id]
+    params.extend([f"%{kw}%" for kw in keywords])
+    # also exclude promo SKUs (same Pro filter as _query_inventory)
+    params.extend(["pro(%", "(pro%"])
+
+    sql = f"""
+        SELECT
+            i.item_name,
+            i.material_code,
+            i.tag,
+            COALESCE(i.qty_in_stock, 0)  AS qty_current,
+            COALESCE(i.qty_max, 0)        AS qty_max,
+            COALESCE(i.qty_diff, 0)       AS qty_diff,
+            i.unit,
+            COALESCE(i.unit_price, 0)     AS price_per_unit,
+            COALESCE(i.stock_value, 0)    AS stock_value
+        FROM public.pos_inventory_items i
+        WHERE i.snapshot_id = %s
+          AND ({like_clauses})
+          AND LOWER(i.item_name) NOT LIKE %s
+          AND LOWER(i.item_name) NOT LIKE %s
+        ORDER BY i.tag NULLS LAST, i.qty_in_stock ASC, i.item_name
+    """
+
+    conn = get_db_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        cols = ["item_name","material_code","tag","qty_current","qty_max",
+                "qty_diff","unit","price_per_unit","stock_value"]
+        items = []
+        for r in cur.fetchall():
+            d = dict(zip(cols, r))
+            for k in ("qty_current","qty_max","qty_diff","price_per_unit","stock_value"):
+                d[k] = float(d[k] or 0)
+            items.append(d)
+        return items, snapshot_at or ""
+    except Exception as e:
+        log.error("inventory_by_keywords query failed: %s", e)
+        return [], snapshot_at or ""
+    finally:
+        conn.close()
 
 
 def _list_available_tags() -> list[str]:
