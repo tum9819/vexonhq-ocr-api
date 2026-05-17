@@ -801,8 +801,70 @@ def _handle_stock_summary() -> str:
         return f"❌ เกิดข้อผิดพลาดในการเช็ค stock: {str(e)[:80]}"
 
 
+# Session 15 fix (2026-05-17): when FoodStory tag is missing/different from
+# user query, fall back to keyword search by item_name. Example: user typed
+# "เช็ค stock เครื่องดื่ม" but DB has no tag="เครื่องดื่ม" → search items
+# whose name contains common drink keywords (เบียร์, น้ำ, โซดา, ...).
+_CATEGORY_NAME_FALLBACK: dict[str, list[str]] = {
+    "เครื่องดื่ม": ["เบียร์", "โซดา", "น้ำดื่ม", "น้ำเปล่า", "น้ำแร่",
+                    "เป๊ปซี่", "มิรินด้า", "วิสกี้", "โซจู", "แสงโสม",
+                    "หงษ์ทอง", "รีเจนซี่", "แกรนด์", "ไฮเนเกน", "อาซาฮี",
+                    "ลีโอ", "สิงห์", "ช้าง", "เฟดเดอร์บราว"],
+    "หม่าล่า":     ["ไส้กรอก", "หมูสามชั้น", "สันคอ", "เนื้อ", "ปีกไก่",
+                    "หัวใจไก่", "เห็ด", "ปลาหมึก", "กุ้ง", "ปูอัด",
+                    "เต้าหู้", "ลูกชิ้น"],
+    "ผัก":         ["บล็อคโคลี่", "กระเจี๊ยบ", "ข้าวโพด", "เห็ด",
+                    "พริก", "ผักกาด", "ผักบุ้ง", "คะน้า"],
+    "ของทอด":      ["เฟรนช์ฟราย", "นักเก็ต", "ไส้กรอก", "ปีกไก่"],
+}
+
+
+def _query_inventory_by_keywords(keywords: list[str]) -> tuple[list[dict], str]:
+    """Run _query_inventory for each keyword and merge unique items by name."""
+    from stock_routes import _query_inventory
+    seen: set[str] = set()
+    merged: list[dict] = []
+    snap = ""
+    for kw in keywords:
+        try:
+            items, sa = _query_inventory(keyword=kw, low_only=False)
+            if sa:
+                snap = sa
+            for it in items:
+                name = it.get("item_name") or ""
+                if name and name not in seen:
+                    seen.add(name)
+                    merged.append(it)
+        except Exception as e:
+            log.warning("inventory keyword query failed (%s): %s", kw, e)
+    return merged, snap
+
+
+def _list_available_tags() -> list[str]:
+    """Return distinct non-null tags from latest snapshot for hints."""
+    try:
+        from stock_routes import _get_latest_snapshot_id
+        snapshot_id, _ = _get_latest_snapshot_id()
+        if not snapshot_id:
+            return []
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT DISTINCT tag FROM public.pos_inventory_items
+                    WHERE snapshot_id = %s AND tag IS NOT NULL AND tag <> ''
+                    ORDER BY tag
+                """, (snapshot_id,))
+                return [r[0] for r in cur.fetchall()]
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning("list_available_tags failed: %s", e)
+        return []
+
+
 def _handle_stock_category(query: str) -> str:
-    """Return LINE-friendly stock filtered by tag or keyword — [Bug1-fix]"""
+    """Return LINE-friendly stock filtered by tag with smart name-keyword fallback."""
     lower = query.lower()
     tag = None
     keyword = None
@@ -812,18 +874,34 @@ def _handle_stock_category(query: str) -> str:
             label = cat_kw
             if isinstance(filter_val, dict):
                 keyword = filter_val.get("keyword")
-                tag = filter_val.get("tag")          # [Bug-fix] supports both keyword+tag
+                tag = filter_val.get("tag")
             else:
                 tag = filter_val
             break
     try:
         from stock_routes import _query_inventory, format_stock_for_line
         items, snapshot_at = _query_inventory(tag=tag, keyword=keyword, low_only=False)
+
+        # Session 15 fix: if tag filter returned 0 items, try name-keyword fallback
+        if not items and label and label in _CATEGORY_NAME_FALLBACK:
+            log.info("stock_category '%s' tag returned 0, falling back to name keywords", label)
+            items, snapshot_at = _query_inventory_by_keywords(_CATEGORY_NAME_FALLBACK[label])
+
         title = f"📦 Stock {label or tag or keyword or 'ทั้งหมด'}"
         if not items:
             sep22 = "─" * 22
-            return (f"{title}\n{sep22}\nไม่พบข้อมูลหมวดนี้ครับ\n"
-                    "ลอง: เช็ค stock ทั้งหมด")
+            tags = _list_available_tags()
+            hint_lines = [f"{title}", sep22, "ไม่พบข้อมูลหมวดนี้ครับ"]
+            if tags:
+                hint_lines.append("")
+                hint_lines.append("💡 หมวดที่มีในระบบ:")
+                for t in tags[:10]:
+                    hint_lines.append(f"  • {t}")
+                hint_lines.append("")
+                hint_lines.append("ลอง: เช็ค stock <ชื่อหมวด>")
+            else:
+                hint_lines.append("ลอง: เช็ค stock ทั้งหมด")
+            return "\n".join(hint_lines)
         return format_stock_for_line(items, snapshot_at, title)
     except Exception as e:
         log.error("Stock category failed: %s", e)
@@ -1031,7 +1109,6 @@ def _format_search_for_line(query: str, count: int, total_income: float,
     if count > 8:
         lines.append(f"... และอีก {count - 8} รายการ")
     return "\n".join(lines)
-
 
 # ─────────────────────────────────────────────
 # Webhook — main handler
