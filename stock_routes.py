@@ -116,6 +116,12 @@ def _query_inventory(
     conditions = ["i.snapshot_id = %s"]
     params: list = [snapshot_id]
 
+    # Session 15 fix (2026-05-17): exclude promo/bundle SKUs from all stock
+    # queries. These are FoodStory promo packs (e.g. "Pro(3) เบียร์...",
+    # "(pro) ช้าง...") that should not appear in inventory views.
+    conditions.append("LOWER(i.item_name) NOT LIKE 'pro(%'")
+    conditions.append("LOWER(i.item_name) NOT LIKE '(pro%'")
+
     if keyword:
         conditions.append("i.item_name ILIKE %s")
         params.append(f"%{keyword}%")
@@ -301,6 +307,8 @@ def stock_summary():
                 SUM(COALESCE(stock_value, 0)) AS total_value
             FROM public.pos_inventory_items
             WHERE snapshot_id = %s
+              AND LOWER(item_name) NOT LIKE 'pro(%%'
+              AND LOWER(item_name) NOT LIKE '(pro%%'
             GROUP BY COALESCE(tag, 'ไม่ระบุ')
             ORDER BY tag
         """, (snapshot_id,))
@@ -362,6 +370,8 @@ async def stock_alert_beer():
                 FROM public.pos_inventory_items
                 WHERE snapshot_id = %s
                   AND item_name ILIKE %s
+                  AND LOWER(item_name) NOT LIKE 'pro(%%'
+                  AND LOWER(item_name) NOT LIKE '(pro%%'
                 ORDER BY qty_in_stock ASC
             """, [snapshot_id, "%เบียร์%"])
             rows = cur.fetchall()
