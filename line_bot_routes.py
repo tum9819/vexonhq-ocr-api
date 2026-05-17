@@ -569,15 +569,6 @@ _scheduler.add_job(
     id="daily_budget_alert",
     replace_existing=True,
 )
-# Phase 67 (Session 16, 2026-05-17): daily reorder digest 07:00 BKK
-_scheduler.add_job(
-    _scheduled_daily_stock_digest,
-    trigger="cron",
-    hour=7,
-    minute=0,
-    id="daily_stock_digest",
-    replace_existing=True,
-)
 _scheduler.start()
 log.info("LINE digest scheduler started — fires daily at 06:00 Asia/Bangkok")
 log.info("AP due reminder scheduler started — fires daily at 09:00 Asia/Bangkok")
@@ -1222,6 +1213,23 @@ def _scheduled_daily_stock_digest():
         log.info("Daily stock digest sent OK")
     except Exception as e:
         log.error("Daily stock digest FAILED: %s", e)
+
+
+# Phase 67 (Session 16): register the 07:00 BKK job — must be AFTER the
+# function definition above (Python resolves names at module-load top→bottom).
+# add_job on a started scheduler is supported.
+try:
+    _scheduler.add_job(
+        _scheduled_daily_stock_digest,
+        trigger="cron",
+        hour=7,
+        minute=0,
+        id="daily_stock_digest",
+        replace_existing=True,
+    )
+    log.info("Daily stock digest scheduler started — fires daily at 07:00 Asia/Bangkok")
+except Exception as e:
+    log.error("Failed to register daily_stock_digest job: %s", e)
 
 
 
