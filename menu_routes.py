@@ -3889,3 +3889,120 @@ def pos_voids(
         "monthly":   [{"month": r["month"], "voids": int(r["voids"]), "amount": round(float(r["amount"]), 0)} for r in monthly],
         "top_items": [{"item": r["item_name"], "count": int(r["void_count"]), "qty": float(r["void_qty"]), "value": round(float(r["void_value"]), 0)} for r in top_items],
     }
+
+
+# ── Phase 64: Food Cost & Gross Profit Estimator (/pos/food-cost) ─────────────
+@router.get("/pos/food-cost")
+def pos_food_cost(
+    months: int = Query(1),
+    branch: str = Query(""),
+):
+    from datetime import date, timedelta
+    today = date.today()
+    start = today.replace(day=1)
+    for _ in range(months - 1):
+        start = (start - timedelta(days=1)).replace(day=1)
+    start_str = str(start)
+
+    branch_filter = "AND b.branch = %(branch)s" if branch else ""
+    params: dict = {"start": start_str, "branch": branch}
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # Check if any ingredient has price set
+            cur.execute("SELECT COUNT(*) AS cnt FROM ingredients WHERE price_per_unit > 0")
+            priced_count = int((_rows_to_dicts(cur)[0])["cnt"] or 0)
+
+            # Recipe cost per menu item (SUM of ingredient qty × price)
+            cur.execute("""
+                SELECT r.menu_name,
+                       COALESCE(SUM(ri.quantity * COALESCE(i.price_per_unit, 0)), 0) AS cost_per_unit
+                FROM recipes r
+                JOIN recipe_ingredients ri ON ri.recipe_id = r.id
+                JOIN ingredients i ON i.id = ri.ingredient_id
+                GROUP BY r.menu_name
+            """)
+            recipe_costs = {row["menu_name"]: float(row["cost_per_unit"]) for row in _rows_to_dicts(cur)}
+
+            # Sales by item
+            cur.execute(f"""
+                SELECT si.item_name,
+                       SUM(si.qty)::float                              AS qty_sold,
+                       COALESCE(SUM(si.qty * si.unit_price), 0)::float AS revenue,
+                       AVG(si.unit_price)::float                       AS avg_price
+                FROM pos_sales_items si
+                JOIN pos_bills b ON b.id = si.bill_id
+                WHERE b.sales_date >= %(start)s
+                  AND si.unit_price > 0
+                  AND LOWER(COALESCE(b.status,'')) NOT IN ('void','cancelled')
+                  {branch_filter}
+                GROUP BY si.item_name
+                ORDER BY revenue DESC
+                LIMIT 60
+            """, params)
+            sales_rows = _rows_to_dicts(cur)
+
+            # Total revenue for the period (for summary)
+            cur.execute(f"""
+                SELECT COALESCE(SUM(net_price), 0) AS total_rev
+                FROM pos_bills b
+                WHERE b.sales_date >= %(start)s
+                  AND LOWER(COALESCE(b.status,'')) NOT IN ('void','cancelled')
+                  {branch_filter}
+            """, params)
+            total_rev = float((_rows_to_dicts(cur)[0])["total_rev"] or 0)
+
+    finally:
+        conn.close()
+
+    # Enrich each item with recipe cost
+    items = []
+    total_est_cost = 0.0
+    total_item_rev = 0.0
+    matched = 0
+    for r in sales_rows:
+        name      = r["item_name"]
+        qty       = float(r["qty_sold"] or 0)
+        revenue   = float(r["revenue"] or 0)
+        cost_unit = recipe_costs.get(name, 0.0)
+        est_cost  = round(qty * cost_unit, 2)
+        gross     = round(revenue - est_cost, 2)
+        fc_pct    = round(est_cost / revenue * 100, 1) if revenue > 0 else 0.0
+        has_recipe = name in recipe_costs
+        if has_recipe and cost_unit > 0:
+            matched += 1
+        total_est_cost += est_cost
+        total_item_rev += revenue
+        items.append({
+            "item":       name,
+            "qty_sold":   round(qty, 1),
+            "revenue":    round(revenue, 0),
+            "avg_price":  round(float(r["avg_price"] or 0), 0),
+            "cost_unit":  round(cost_unit, 2),
+            "est_cost":   round(est_cost, 0),
+            "gross":      round(gross, 0),
+            "fc_pct":     fc_pct,
+            "has_recipe": has_recipe,
+        })
+
+    overall_fc   = round(total_est_cost / total_item_rev * 100, 1) if total_item_rev > 0 else 0.0
+    overall_gp   = round(total_item_rev - total_est_cost, 0)
+    coverage_pct = round(matched / len(items) * 100, 1) if items else 0.0
+
+    return {
+        "months":       months,
+        "start":        start_str,
+        "priced_ingredients": priced_count,
+        "summary": {
+            "total_revenue":  round(total_rev, 0),
+            "item_revenue":   round(total_item_rev, 0),
+            "total_est_cost": round(total_est_cost, 0),
+            "gross_profit":   overall_gp,
+            "food_cost_pct":  overall_fc,
+            "items_with_recipe": matched,
+            "total_items":    len(items),
+            "coverage_pct":   coverage_pct,
+        },
+        "items": items,
+    }
