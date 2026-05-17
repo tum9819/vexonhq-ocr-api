@@ -1075,3 +1075,122 @@ def get_pos_overview(
         }
     finally:
         conn.close()
+
+
+# ============================================================
+# Phase 45 — Delivery Platform Analytics
+# ============================================================
+
+@router.get("/delivery/summary")
+def delivery_summary(months: int = 6, branch: str = "thawi_watthana"):
+    """
+    Delivery platform comparison: Grab vs Lineman.
+    Returns per-platform KPIs + monthly trend + totals.
+    """
+    conn = get_db_conn()
+    try:
+        since = date.today().replace(day=1) - relativedelta(months=months - 1)
+
+        # ── Per-platform KPIs ──
+        platform_sql = """
+            SELECT
+                platform,
+                COUNT(*)                                  AS months_active,
+                SUM(gross_sales)                          AS gross_total,
+                SUM(ABS(gp_amount))                       AS commission_total,
+                SUM(COALESCE(promo_store, 0))             AS promo_total,
+                SUM(net_payout)                           AS net_total,
+                SUM(order_count)                          AS order_total,
+                ROUND(AVG(gross_sales / NULLIF(order_count, 0))::numeric, 2) AS avg_basket,
+                BOOL_OR(gp_is_estimated)                  AS gp_estimated
+            FROM public.rider_deliveries
+            WHERE delivery_date >= %s
+              AND (%s = '' OR branch_code = %s)
+            GROUP BY platform
+            ORDER BY gross_total DESC
+        """
+        platform_rows = _rows_to_dicts(
+            conn, platform_sql, (since, branch, branch)
+        )
+
+        platforms = []
+        for r in platform_rows:
+            gross = float(r["gross_total"] or 0)
+            comm  = float(r["commission_total"] or 0)
+            net   = float(r["net_total"] or 0)
+            orders = int(r["order_total"] or 0)
+            platforms.append({
+                "platform":          r["platform"],
+                "gross_total":       gross,
+                "commission_total":  comm,
+                "commission_pct":    round(comm / gross * 100, 1) if gross else 0,
+                "promo_total":       float(r["promo_total"] or 0),
+                "net_total":         net,
+                "order_total":       orders,
+                "avg_basket":        float(r["avg_basket"] or 0),
+                "avg_net_per_order": round(net / orders, 2) if orders else 0,
+                "gp_estimated":      bool(r["gp_estimated"]),
+            })
+
+        # ── Monthly trend by platform ──
+        trend_sql = """
+            SELECT
+                TO_CHAR(DATE_TRUNC('month', delivery_date), 'YYYY-MM') AS month,
+                platform,
+                SUM(gross_sales)          AS gross,
+                SUM(ABS(gp_amount))       AS commission,
+                SUM(net_payout)           AS net,
+                SUM(order_count)          AS orders
+            FROM public.rider_deliveries
+            WHERE delivery_date >= %s
+              AND (%s = '' OR branch_code = %s)
+            GROUP BY 1, 2
+            ORDER BY 1, 2
+        """
+        trend_rows = _rows_to_dicts(conn, trend_sql, (since, branch, branch))
+
+        # Build month × platform matrix
+        months_set: dict = {}
+        platforms_seen: set = set()
+        for r in trend_rows:
+            m = r["month"]
+            p = r["platform"]
+            platforms_seen.add(p)
+            if m not in months_set:
+                months_set[m] = {}
+            months_set[m][p] = {
+                "gross":      float(r["gross"] or 0),
+                "commission": float(r["commission"] or 0),
+                "net":        float(r["net"] or 0),
+                "orders":     int(r["orders"] or 0),
+            }
+
+        trend = []
+        for m in sorted(months_set.keys()):
+            entry = {"month": m}
+            for p in sorted(platforms_seen):
+                d = months_set[m].get(p, {})
+                entry[f"{p}_gross"]  = d.get("gross", 0)
+                entry[f"{p}_net"]    = d.get("net", 0)
+                entry[f"{p}_orders"] = d.get("orders", 0)
+            trend.append(entry)
+
+        # ── Grand totals ──
+        total_gross = sum(p["gross_total"] for p in platforms)
+        total_net   = sum(p["net_total"]   for p in platforms)
+        total_comm  = sum(p["commission_total"] for p in platforms)
+        total_orders = sum(p["order_total"] for p in platforms)
+
+        return {
+            "platforms":            platforms,
+            "platforms_list":       sorted(platforms_seen),
+            "trend":                trend,
+            "total_gross":          total_gross,
+            "total_net":            total_net,
+            "total_commission":     total_comm,
+            "total_commission_pct": round(total_comm / total_gross * 100, 1) if total_gross else 0,
+            "total_orders":         total_orders,
+            "period_months":        months,
+        }
+    finally:
+        conn.close()
