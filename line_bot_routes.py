@@ -663,8 +663,8 @@ _STOCK_CATEGORY_MAP: dict[str, str | dict] = {
     "ไส้เสียบ":    "หม่าล่า",
     "วัตถุดิบ":    "วัตถุดิบ",
     # keyword-based (ILIKE ชื่อสินค้า) — เพิ่มได้ไม่จำกัด
-    "น้ำ":         {"keyword": "น้ำ"},      # น้ำเปล่า, น้ำแร่, น้ำแข็ง
-    "น้ำดื่ม":     {"keyword": "น้ำ"},
+    "น้ำ":         {"keyword": "น้ำ", "tag": "เครื่องดื่ม"},   # เฉพาะน้ำในหมวดเครื่องดื่ม
+    "น้ำดื่ม":     {"keyword": "น้ำ", "tag": "เครื่องดื่ม"},
     "เบียร์":      {"keyword": "เบียร์"},   # เบียร์ทุกยี่ห้อ
     "โซจู":        {"keyword": "โซจู"},
     "วิสกี้":      {"keyword": "วิสกี้"},
@@ -812,6 +812,7 @@ def _handle_stock_category(query: str) -> str:
             label = cat_kw
             if isinstance(filter_val, dict):
                 keyword = filter_val.get("keyword")
+                tag = filter_val.get("tag")          # [Bug-fix] supports both keyword+tag
             else:
                 tag = filter_val
             break

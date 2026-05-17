@@ -119,48 +119,68 @@ def _query_inventory(
 # LINE-friendly formatters
 # ─────────────────────────────────────────────
 
+def _fmt_qty(item_name: str, qty: float, unit: str) -> str:
+    """Format quantity — add (X ลัง) for beer items (1 ลัง = 12 ขวด)."""
+    unit = unit or ""
+    if "เบียร์" in item_name and unit in ("ขวด", "btl") and qty >= 12:
+        lang = int(qty) // 12
+        return f"{qty:g} ขวด ({lang} ลัง)"
+    return f"{qty:g} {unit}".strip()
+
+
 def format_stock_for_line(items: list[dict], snapshot_at: str, title: str = "📦 เช็ค Stock") -> str:
-    sep = "─" * 24
-    # Format date from snapshot_at (ISO string)
+    """Format stock items for LINE message.
+    Thresholds: qty <= 0 = หมด, 0 < qty <= 10 = เหลือน้อย, > 10 = มีของพอ
+    Shows ALL items in every section (no hidden counts).
+    Beer items show (X ลัง) suffix.
+    """
+    sep = "\u2500" * 24
     date_str = snapshot_at[:10] if snapshot_at else "-"
 
     if not items:
         return (
             f"{title}\n{sep}\n"
             "ไม่พบข้อมูล stock ครับ\n"
-            "💡 Upload ไฟล์ผ่าน Dashboard ก่อน"
+            "\U0001f4a1 Upload ไฟล์ผ่าน Dashboard ก่อน"
         )
 
-    lines = [title, f"📅 ข้อมูล: {date_str}", sep]
+    # Sort each bucket น้อย→มาก (urgent first)
+    out_of_stock = sorted([i for i in items if i["qty_current"] <= 0],
+                          key=lambda x: x["qty_current"])
+    low_stock    = sorted([i for i in items if 0 < i["qty_current"] <= 10],
+                          key=lambda x: x["qty_current"])
+    ok_stock     = sorted([i for i in items if i["qty_current"] > 10],
+                          key=lambda x: x["qty_current"])
 
-    out_of_stock = [i for i in items if i["qty_current"] <= 0]
-    low_stock    = [i for i in items if 0 < i["qty_current"] <= 5]
-    ok_stock     = [i for i in items if i["qty_current"] > 5]
+    lines = [title, f"\U0001f4c5 ข้อมูล: {date_str}", sep]
 
+    # Section: หมด/ติดลบ
     if out_of_stock:
-        lines.append(f"🔴 หมด/ติดลบ ({len(out_of_stock)} รายการ):")
-        for i in out_of_stock[:10]:
-            lines.append(f"  ❌ {i['item_name']}: {i['qty_current']:g} {i['unit'] or ''}")
-        if len(out_of_stock) > 10:
-            lines.append(f"  ... และอีก {len(out_of_stock)-10} รายการ")
+        lines.append(f"\U0001f534 หมด/ติดลบ ({len(out_of_stock)} รายการ):")
+        for i in out_of_stock:
+            qty_str = _fmt_qty(i["item_name"], i["qty_current"], i["unit"] or "")
+            lines.append(f"  \u274c {i['item_name']}: {qty_str}")
 
+    # Section: เหลือน้อย (1–10)
     if low_stock:
-        lines.append(f"🟡 เหลือน้อย ({len(low_stock)} รายการ):")
-        for i in low_stock[:8]:
-            lines.append(f"  ⚠️ {i['item_name']}: {i['qty_current']:g} {i['unit'] or ''}")
+        lines.append(f"\U0001f7e1 เหลือน้อย ({len(low_stock)} รายการ):")
+        for i in low_stock:
+            qty_str = _fmt_qty(i["item_name"], i["qty_current"], i["unit"] or "")
+            lines.append(f"  \u26a0\ufe0f {i['item_name']}: {qty_str}")
 
-    if ok_stock and not out_of_stock and not low_stock:
-        for i in ok_stock[:12]:
-            lines.append(f"  🟢 {i['item_name']}: {i['qty_current']:g} {i['unit'] or ''}")
-        if len(ok_stock) > 12:
-            lines.append(f"  ... และอีก {len(ok_stock)-12} รายการ")
-    elif ok_stock:
-        lines.append(f"🟢 มีของพอ: {len(ok_stock)} รายการ")
+    # Section: มีของพอ (>10) — แสดงทุกรายการ
+    if ok_stock:
+        lines.append(f"\U0001f7e2 มีของพอ ({len(ok_stock)} รายการ):")
+        for i in ok_stock[:30]:
+            qty_str = _fmt_qty(i["item_name"], i["qty_current"], i["unit"] or "")
+            lines.append(f"  \u2705 {i['item_name']}: {qty_str}")
+        if len(ok_stock) > 30:
+            lines.append(f"  ... และอีก {len(ok_stock)-30} รายการ")
 
     lines.append(sep)
     total_value = sum(i["stock_value"] for i in items)
     if total_value > 0:
-        lines.append(f"💰 มูลค่าสต็อกรวม: ฿{total_value:,.0f}")
+        lines.append(f"\U0001f4b0 มูลค่าสต็อกรวม: \u0e3f{total_value:,.0f}")
 
     return "\n".join(lines)
 
