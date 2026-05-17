@@ -3032,3 +3032,160 @@ def pos_compare(
         }
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 58 — Daily Flash Report
+# GET /pos/flash?date=YYYY-MM-DD&branch=
+# ---------------------------------------------------------------------------
+@router.get("/pos/flash")
+def pos_flash(date: str = Query(None), branch: str = Query("")):
+    from datetime import date as date_type, timedelta
+    import calendar as cal_mod
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # Resolve target date
+            if date:
+                try:
+                    target = date_type.fromisoformat(date)
+                except Exception:
+                    target = date_type.today()
+            else:
+                target = date_type.today()
+
+            last_week  = target - timedelta(days=7)
+            last_month = target.replace(day=1) - timedelta(days=1)
+            last_month = last_month.replace(day=min(target.day,
+                         cal_mod.monthrange(last_month.year, last_month.month)[1]))
+
+            branch_filter = "AND branch_code = %(branch)s" if branch else ""
+            params = {"branch": branch}
+
+            def fetch_day_kpi(d):
+                cur.execute(f"""
+                    SELECT
+                        COALESCE(SUM(net_total), 0)        AS revenue,
+                        COUNT(*)                            AS bills,
+                        COALESCE(AVG(net_total), 0)        AS avg_bill,
+                        COALESCE(MAX(net_total), 0)        AS max_bill
+                    FROM pos_bills
+                    WHERE sales_date = %(d)s
+                    {branch_filter}
+                """, {**params, "d": d})
+                row = cur.fetchone()
+                if row:
+                    return {
+                        "revenue":  float(row[0]),
+                        "bills":    int(row[1]),
+                        "avg_bill": round(float(row[2]), 2),
+                        "max_bill": float(row[3]),
+                    }
+                return {"revenue": 0, "bills": 0, "avg_bill": 0, "max_bill": 0}
+
+            kpi_today      = fetch_day_kpi(target)
+            kpi_last_week  = fetch_day_kpi(last_week)
+            kpi_last_month = fetch_day_kpi(last_month)
+
+            def delta(a, b):
+                if b == 0:
+                    return None
+                return round((a - b) / b * 100, 1)
+
+            deltas = {
+                "vs_last_week": {
+                    "revenue":  delta(kpi_today["revenue"],  kpi_last_week["revenue"]),
+                    "bills":    delta(kpi_today["bills"],    kpi_last_week["bills"]),
+                    "avg_bill": delta(kpi_today["avg_bill"], kpi_last_week["avg_bill"]),
+                },
+                "vs_last_month": {
+                    "revenue":  delta(kpi_today["revenue"],  kpi_last_month["revenue"]),
+                    "bills":    delta(kpi_today["bills"],    kpi_last_month["bills"]),
+                    "avg_bill": delta(kpi_today["avg_bill"], kpi_last_month["avg_bill"]),
+                },
+            }
+
+            # Hourly breakdown today
+            cur.execute(f"""
+                SELECT
+                    EXTRACT(HOUR FROM sales_time::time)::int AS hr,
+                    COALESCE(SUM(net_total), 0)              AS revenue,
+                    COUNT(*)                                  AS bills
+                FROM pos_bills
+                WHERE sales_date = %(d)s
+                {branch_filter}
+                GROUP BY hr
+                ORDER BY hr
+            """, {**params, "d": target})
+            hourly_rows = _rows_to_dicts(cur)
+            hourly = [{"hour": r["hr"], "revenue": float(r["revenue"]), "bills": int(r["bills"])} for r in hourly_rows]
+
+            # Top 10 items today
+            cur.execute(f"""
+                SELECT
+                    si.item_name,
+                    si.category,
+                    SUM(si.qty)        AS qty,
+                    SUM(si.net_amount) AS revenue
+                FROM pos_sales_items si
+                JOIN pos_bills b ON b.id = si.bill_id
+                WHERE b.sales_date = %(d)s
+                {branch_filter.replace('branch_code', 'b.branch_code')}
+                GROUP BY si.item_name, si.category
+                ORDER BY revenue DESC
+                LIMIT 10
+            """, {**params, "d": target})
+            top_items = [
+                {"item": r["item_name"], "category": r["category"],
+                 "qty": int(r["qty"]), "revenue": float(r["revenue"])}
+                for r in _rows_to_dicts(cur)
+            ]
+
+            # Order type split today
+            cur.execute(f"""
+                SELECT order_type, COUNT(*) AS bills, SUM(net_total) AS revenue
+                FROM pos_bills
+                WHERE sales_date = %(d)s
+                {branch_filter}
+                GROUP BY order_type
+                ORDER BY revenue DESC
+            """, {**params, "d": target})
+            order_types = [
+                {"type": r["order_type"] or "ไม่ระบุ",
+                 "bills": int(r["bills"]),
+                 "revenue": float(r["revenue"])}
+                for r in _rows_to_dicts(cur)
+            ]
+
+            # MTD summary (month-to-date)
+            month_start = target.replace(day=1)
+            cur.execute(f"""
+                SELECT
+                    COALESCE(SUM(net_total), 0) AS mtd_revenue,
+                    COUNT(*)                     AS mtd_bills,
+                    COUNT(DISTINCT sales_date)   AS active_days
+                FROM pos_bills
+                WHERE sales_date BETWEEN %(ms)s AND %(t)s
+                {branch_filter}
+            """, {**params, "ms": month_start, "t": target})
+            mtd_row = cur.fetchone()
+            mtd = {
+                "revenue":     float(mtd_row[0]) if mtd_row else 0,
+                "bills":       int(mtd_row[1]) if mtd_row else 0,
+                "active_days": int(mtd_row[2]) if mtd_row else 0,
+            }
+
+        return {
+            "date":       str(target),
+            "kpi":        kpi_today,
+            "last_week":  kpi_last_week,
+            "last_month": kpi_last_month,
+            "deltas":     deltas,
+            "hourly":     hourly,
+            "top_items":  top_items,
+            "order_types": order_types,
+            "mtd":        mtd,
+        }
+    finally:
+        conn.close()
