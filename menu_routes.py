@@ -3189,3 +3189,159 @@ def pos_flash(date: str = Query(None), branch: str = Query("")):
         }
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 59 — Discount Analytics
+# GET /pos/discounts?months=3&branch=
+# ---------------------------------------------------------------------------
+@router.get("/pos/discounts")
+def pos_discounts(months: int = Query(3), branch: str = Query("")):
+    from datetime import date as date_type
+    from dateutil.relativedelta import relativedelta
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            end_date   = date_type.today()
+            start_date = (end_date.replace(day=1) - relativedelta(months=months - 1))
+            branch_filter = "AND branch_code = %(branch)s" if branch else ""
+            params = {"start": start_date, "end": end_date, "branch": branch}
+
+            # Overall summary
+            cur.execute(f"""
+                SELECT
+                    COUNT(*)                                                        AS total_bills,
+                    COALESCE(SUM(net_total), 0)                                    AS total_net,
+                    COALESCE(SUM(item_discount + bill_discount), 0)                AS total_discount,
+                    COALESCE(SUM(item_discount), 0)                                AS total_item_disc,
+                    COALESCE(SUM(bill_discount), 0)                                AS total_bill_disc,
+                    COUNT(*) FILTER (WHERE (item_discount + bill_discount) > 0)    AS discounted_bills,
+                    COALESCE(AVG(item_discount + bill_discount)
+                        FILTER (WHERE (item_discount + bill_discount) > 0), 0)     AS avg_discount_per_bill
+                FROM pos_bills
+                WHERE sales_date BETWEEN %(start)s AND %(end)s
+                {branch_filter}
+            """, params)
+            row = cur.fetchone()
+            total_net      = float(row[1] or 0)
+            total_discount = float(row[2] or 0)
+            gross_revenue  = total_net + total_discount
+            summary = {
+                "total_bills":         int(row[0] or 0),
+                "total_net":           round(total_net, 2),
+                "total_discount":      round(total_discount, 2),
+                "total_item_disc":     round(float(row[3] or 0), 2),
+                "total_bill_disc":     round(float(row[4] or 0), 2),
+                "discounted_bills":    int(row[5] or 0),
+                "avg_discount_per_bill": round(float(row[6] or 0), 2),
+                "discount_rate_pct":   round(total_discount / gross_revenue * 100, 2) if gross_revenue else 0,
+                "pct_bills_discounted": round(int(row[5] or 0) / max(int(row[0] or 1), 1) * 100, 1),
+            }
+
+            # By staff (top 15 staff with most discount given)
+            cur.execute(f"""
+                SELECT
+                    COALESCE(staff_name, 'ไม่ระบุ')              AS staff,
+                    COUNT(*)                                       AS bills,
+                    COUNT(*) FILTER (WHERE (item_discount + bill_discount) > 0) AS disc_bills,
+                    COALESCE(SUM(item_discount + bill_discount), 0) AS total_disc,
+                    COALESCE(SUM(net_total), 0)                    AS net_rev
+                FROM pos_bills
+                WHERE sales_date BETWEEN %(start)s AND %(end)s
+                {branch_filter}
+                GROUP BY staff
+                HAVING SUM(item_discount + bill_discount) > 0
+                ORDER BY total_disc DESC
+                LIMIT 15
+            """, params)
+            by_staff = [
+                {
+                    "staff":      r["staff"],
+                    "bills":      int(r["bills"]),
+                    "disc_bills": int(r["disc_bills"]),
+                    "total_disc": round(float(r["total_disc"]), 2),
+                    "net_rev":    round(float(r["net_rev"]), 2),
+                    "disc_pct":   round(float(r["total_disc"]) /
+                                  (float(r["net_rev"]) + float(r["total_disc"])) * 100, 1)
+                                  if (float(r["net_rev"]) + float(r["total_disc"])) > 0 else 0,
+                }
+                for r in _rows_to_dicts(cur)
+            ]
+
+            # By hour of day
+            cur.execute(f"""
+                SELECT
+                    EXTRACT(HOUR FROM sales_time::time)::int       AS hr,
+                    COUNT(*) FILTER (WHERE (item_discount + bill_discount) > 0) AS disc_bills,
+                    COALESCE(SUM(item_discount + bill_discount), 0) AS total_disc
+                FROM pos_bills
+                WHERE sales_date BETWEEN %(start)s AND %(end)s
+                {branch_filter}
+                GROUP BY hr
+                ORDER BY hr
+            """, params)
+            by_hour = [
+                {"hour": r["hr"], "disc_bills": int(r["disc_bills"]),
+                 "total_disc": round(float(r["total_disc"]), 2)}
+                for r in _rows_to_dicts(cur)
+            ]
+
+            # Monthly trend
+            cur.execute(f"""
+                SELECT
+                    TO_CHAR(sales_date, 'YYYY-MM')                 AS month,
+                    COALESCE(SUM(net_total), 0)                    AS net_rev,
+                    COALESCE(SUM(item_discount + bill_discount), 0) AS total_disc,
+                    COUNT(*) FILTER (WHERE (item_discount + bill_discount) > 0) AS disc_bills,
+                    COUNT(*)                                        AS total_bills
+                FROM pos_bills
+                WHERE sales_date BETWEEN %(start)s AND %(end)s
+                {branch_filter}
+                GROUP BY month
+                ORDER BY month
+            """, params)
+            monthly = [
+                {
+                    "month":       r["month"],
+                    "net_rev":     round(float(r["net_rev"]), 2),
+                    "total_disc":  round(float(r["total_disc"]), 2),
+                    "disc_bills":  int(r["disc_bills"]),
+                    "total_bills": int(r["total_bills"]),
+                    "disc_rate":   round(float(r["total_disc"]) /
+                                   (float(r["net_rev"]) + float(r["total_disc"])) * 100, 2)
+                                   if (float(r["net_rev"]) + float(r["total_disc"])) > 0 else 0,
+                }
+                for r in _rows_to_dicts(cur)
+            ]
+
+            # By order type
+            cur.execute(f"""
+                SELECT
+                    COALESCE(order_type, 'ไม่ระบุ')               AS otype,
+                    COUNT(*)                                        AS bills,
+                    COALESCE(SUM(item_discount + bill_discount), 0) AS total_disc,
+                    COALESCE(SUM(net_total), 0)                    AS net_rev
+                FROM pos_bills
+                WHERE sales_date BETWEEN %(start)s AND %(end)s
+                {branch_filter}
+                GROUP BY otype
+                ORDER BY total_disc DESC
+            """, params)
+            by_order_type = [
+                {"type": r["otype"], "bills": int(r["bills"]),
+                 "total_disc": round(float(r["total_disc"]), 2),
+                 "net_rev":    round(float(r["net_rev"]), 2)}
+                for r in _rows_to_dicts(cur)
+            ]
+
+        return {
+            "summary":       summary,
+            "by_staff":      by_staff,
+            "by_hour":       by_hour,
+            "monthly":       monthly,
+            "by_order_type": by_order_type,
+            "period":        {"start": str(start_date), "end": str(end_date), "months": months},
+        }
+    finally:
+        conn.close()
