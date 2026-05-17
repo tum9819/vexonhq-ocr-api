@@ -651,9 +651,10 @@ _STOCK_SUMMARY_KEYWORDS = (
     "เหลือเท่าไร", "มีของไหม", "ของหมดไหม", "รายงานสินค้า",
 )
 
-# [Bug1-fix] category modifier → ส่ง tag= ให้ _query_inventory แทนดึงทั้งหมด
-# key = คำที่ user พิมพ์,  value = ค่า tag ใน pos_inventory_items.tag
-_STOCK_CATEGORY_MAP: dict[str, str] = {
+# [Bug1-fix] category modifier → ส่ง tag= หรือ keyword= ให้ _query_inventory
+# value = str  → filter by tag (exact ILIKE)
+# value = dict → {"keyword": "..."} filter by item_name ILIKE
+_STOCK_CATEGORY_MAP: dict[str, str | dict] = {
     "เครื่องดื่ม": "เครื่องดื่ม",
     "หม่าล่า":     "หม่าล่า",
     "ผัก":         "ผัก",
@@ -661,6 +662,13 @@ _STOCK_CATEGORY_MAP: dict[str, str] = {
     "อาหาร":       "อาหาร",
     "ไส้เสียบ":    "หม่าล่า",
     "วัตถุดิบ":    "วัตถุดิบ",
+    # keyword-based (ILIKE ชื่อสินค้า) — เพิ่มได้ไม่จำกัด
+    "น้ำ":         {"keyword": "น้ำ"},      # น้ำเปล่า, น้ำแร่, น้ำแข็ง
+    "น้ำดื่ม":     {"keyword": "น้ำ"},
+    "เบียร์":      {"keyword": "เบียร์"},   # เบียร์ทุกยี่ห้อ
+    "โซจู":        {"keyword": "โซจู"},
+    "วิสกี้":      {"keyword": "วิสกี้"},
+    "ไส้กรอก":     {"keyword": "ไส้กรอก"},
 }
 
 # ชื่อสินค้าที่ค้นหาใน stock (ไม่ใช่การเงิน)
@@ -794,21 +802,27 @@ def _handle_stock_summary() -> str:
 
 
 def _handle_stock_category(query: str) -> str:
-    """Return LINE-friendly stock filtered by tag (เครื่องดื่ม, หม่าล่า, ...) — [Bug1-fix]"""
+    """Return LINE-friendly stock filtered by tag or keyword — [Bug1-fix]"""
     lower = query.lower()
     tag = None
-    for cat_kw, tag_val in _STOCK_CATEGORY_MAP.items():
+    keyword = None
+    label = None
+    for cat_kw, filter_val in _STOCK_CATEGORY_MAP.items():
         if cat_kw in lower:
-            tag = tag_val
+            label = cat_kw
+            if isinstance(filter_val, dict):
+                keyword = filter_val.get("keyword")
+            else:
+                tag = filter_val
             break
     try:
         from stock_routes import _query_inventory, format_stock_for_line
-        items, snapshot_at = _query_inventory(tag=tag, low_only=False)
-        title = f"📦 Stock {tag}" if tag else "📦 Stock ทั้งหมด"
+        items, snapshot_at = _query_inventory(tag=tag, keyword=keyword, low_only=False)
+        title = f"📦 Stock {label or tag or keyword or 'ทั้งหมด'}"
         if not items:
-            hint = f" (tag={tag})" if tag else ""
             sep22 = "─" * 22
-            return f"{title}\n{sep22}\nไม่พบข้อมูลหมวด{hint} ครับ\nลอง: เช็ค stock ทั้งหมด"
+            return (f"{title}\n{sep22}\nไม่พบข้อมูลหมวดนี้ครับ\n"
+                    "ลอง: เช็ค stock ทั้งหมด")
         return format_stock_for_line(items, snapshot_at, title)
     except Exception as e:
         log.error("Stock category failed: %s", e)
