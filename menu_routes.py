@@ -4006,3 +4006,119 @@ def pos_food_cost(
         },
         "items": items,
     }
+
+
+# ── Phase 65: Shift Performance Analytics (/pos/shifts) ──────────────────────
+_SHIFT_MAP = {
+    0:"กลางคืน",1:"กลางคืน",2:"กลางคืน",3:"กลางคืน",4:"กลางคืน",5:"กลางคืน",
+    6:"เช้า",7:"เช้า",8:"เช้า",9:"เช้า",10:"เช้า",
+    11:"กลางวัน",12:"กลางวัน",13:"กลางวัน",14:"กลางวัน",
+    15:"บ่าย",16:"บ่าย",
+    17:"เย็น",18:"เย็น",19:"เย็น",20:"เย็น",21:"เย็น",
+    22:"กลางคืน",23:"กลางคืน",
+}
+_SHIFT_ORDER = ["เช้า","กลางวัน","บ่าย","เย็น","กลางคืน"]
+_SHIFT_HOURS = {"เช้า":"06–10","กลางวัน":"11–14","บ่าย":"15–16","เย็น":"17–21","กลางคืน":"22–05"}
+_DOW_TH = {0:"อา",1:"จ",2:"อ",3:"พ",4:"พฤ",5:"ศ",6:"ส"}
+
+@router.get("/pos/shifts")
+def pos_shifts(
+    months: int = Query(3),
+    branch: str = Query(""),
+):
+    from datetime import date, timedelta
+    today = date.today()
+    start = today.replace(day=1)
+    for _ in range(months - 1):
+        start = (start - timedelta(days=1)).replace(day=1)
+    start_str = str(start)
+
+    branch_filter = "AND branch = %(branch)s" if branch else ""
+    params: dict = {"start": start_str, "branch": branch}
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # Hour-level aggregation
+            cur.execute(f"""
+                SELECT EXTRACT(HOUR FROM sales_time::time)::int AS hour,
+                       EXTRACT(DOW  FROM sales_date)::int        AS dow,
+                       TO_CHAR(sales_date,'YYYY-MM')             AS month,
+                       COUNT(*)                                   AS bills,
+                       COALESCE(SUM(net_price),0)                 AS revenue
+                FROM pos_bills
+                WHERE sales_date >= %(start)s
+                  AND sales_time IS NOT NULL
+                  AND LOWER(COALESCE(status,'')) NOT IN ('void','cancelled')
+                  {branch_filter}
+                GROUP BY hour, dow, month
+                ORDER BY hour
+            """, params)
+            rows = _rows_to_dicts(cur)
+    finally:
+        conn.close()
+
+    # Aggregate into shift buckets
+    shift_rev   = {s: 0.0 for s in _SHIFT_ORDER}
+    shift_bills = {s: 0   for s in _SHIFT_ORDER}
+    # DOW × Shift matrix  [dow][shift] = revenue
+    dow_shift: dict = {d: {s: 0.0 for s in _SHIFT_ORDER} for d in range(7)}
+    # Monthly × Shift    [month][shift] = revenue
+    month_shift: dict = {}
+
+    for r in rows:
+        h = int(r["hour"] or 0)
+        d = int(r["dow"]  or 0)
+        mo = r["month"]
+        rev  = float(r["revenue"] or 0)
+        bills = int(r["bills"] or 0)
+        sh = _SHIFT_MAP.get(h, "กลางคืน")
+        shift_rev[sh]   += rev
+        shift_bills[sh] += bills
+        dow_shift[d][sh] += rev
+        if mo not in month_shift:
+            month_shift[mo] = {s: 0.0 for s in _SHIFT_ORDER}
+        month_shift[mo][sh] += rev
+
+    total_rev = sum(shift_rev.values()) or 1.0
+
+    summary = []
+    for sh in _SHIFT_ORDER:
+        rev   = shift_rev[sh]
+        bills = shift_bills[sh]
+        summary.append({
+            "shift":    sh,
+            "hours":    _SHIFT_HOURS[sh],
+            "revenue":  round(rev, 0),
+            "bills":    bills,
+            "avg_bill": round(rev / bills, 0) if bills > 0 else 0,
+            "pct":      round(rev / total_rev * 100, 1),
+        })
+
+    # DOW × Shift table
+    dow_table = []
+    for d in range(7):
+        row_rev = sum(dow_shift[d].values())
+        dow_table.append({
+            "dow": _DOW_TH[d],
+            "shifts": {sh: round(dow_shift[d][sh], 0) for sh in _SHIFT_ORDER},
+            "total": round(row_rev, 0),
+        })
+
+    # Monthly trend list
+    monthly = []
+    for mo in sorted(month_shift.keys()):
+        entry = {"month": mo}
+        for sh in _SHIFT_ORDER:
+            entry[sh] = round(month_shift[mo].get(sh, 0), 0)
+        monthly.append(entry)
+
+    best = max(summary, key=lambda x: x["revenue"]) if summary else {}
+
+    return {
+        "months":  months,
+        "summary": summary,
+        "best_shift": best.get("shift", ""),
+        "dow_table":  dow_table,
+        "monthly":    monthly,
+    }
