@@ -249,3 +249,166 @@ def purchase_history(
         "total_bills": len(bills),
         "total_spend": sum(float(b.get("amount") or 0) for b in bills),
     }
+
+
+# ─────────────────────────────────────────────────────────
+# GET /inventory/ai-order-advice  (Phase 32)
+# วิเคราะห์รูปแบบขายตามวันในสัปดาห์ (Day-of-Week)
+# → แนะนำวันที่ควรสั่งของเข้าและปริมาณ
+# ─────────────────────────────────────────────────────────
+
+_DOW_TH = ["อาทิตย์", "จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์"]
+_DOW_EN = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+
+@router.get("/inventory/ai-order-advice")
+def ai_order_advice(
+    branch: str = Query(DEFAULT_BRANCH),
+    lookback_weeks: int = Query(12, ge=4, le=52, description="จำนวนสัปดาห์ย้อนหลัง"),
+):
+    """
+    Phase 32 — AI Day-of-Week Order Advice
+
+    วิเคราะห์ยอดขาย POS ย้อนหลัง N สัปดาห์ แล้วแนะนำ:
+    1. วันไหนขายดีที่สุด/น้อยที่สุด
+    2. ช่วงไหนควรสั่งของเข้า (ก่อนวันขายดี 1-2 วัน)
+    3. ปริมาณสั่งแนะนำเทียบกับ baseline (avg weekday)
+    """
+    from datetime import timedelta as _td
+
+    today = date.today()
+    cutoff = today - _td(weeks=lookback_weeks)
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # ── 1. POS Sales by day-of-week ──────────────────────────────
+            cur.execute(
+                """SELECT
+                       EXTRACT(DOW FROM entry_date)::int AS dow,
+                       COUNT(DISTINCT entry_date)::int   AS day_count,
+                       COALESCE(SUM(amount), 0)::numeric AS total_sales,
+                       COALESCE(AVG(amount), 0)::numeric AS avg_daily_sales,
+                       COALESCE(COUNT(*), 0)::int         AS txn_count
+                   FROM public.v_daybook
+                   WHERE direction = 'income'
+                     AND source IN ('pos_sale','rider_income_grab','rider_income_lineman')
+                     AND branch_code = %s
+                     AND entry_date >= %s
+                   GROUP BY EXTRACT(DOW FROM entry_date)
+                   ORDER BY dow""",
+                (branch, cutoff),
+            )
+            dow_rows = _rows_to_dicts(cur)
+
+            # ── 2. Total days in analysis ─────────────────────────────────
+            total_days = (today - cutoff).days or 1
+
+            # ── 3. Weekly purchase spend (vendor_bills) ───────────────────
+            cur.execute(
+                """SELECT
+                       EXTRACT(DOW FROM bill_date)::int AS dow,
+                       COALESCE(AVG(amount), 0)::numeric AS avg_purchase
+                   FROM public.vendor_bills
+                   WHERE review_status = 'confirmed'
+                     AND COALESCE(branch_code, %s) = %s
+                     AND bill_date >= %s
+                   GROUP BY EXTRACT(DOW FROM bill_date)
+                   ORDER BY dow""",
+                (branch, branch, cutoff),
+            )
+            purchase_rows = _rows_to_dicts(cur)
+    finally:
+        conn.close()
+
+    # ── Build DOW stats ──────────────────────────────────────────────
+    dow_stats: list[dict] = []
+    all_avg = [float(r.get("avg_daily_sales") or 0) for r in dow_rows]
+    grand_avg = sum(all_avg) / len(all_avg) if all_avg else 1.0
+
+    purchase_by_dow: dict[int, float] = {}
+    for pr in purchase_rows:
+        purchase_by_dow[int(pr.get("dow") or 0)] = float(pr.get("avg_purchase") or 0)
+
+    for r in dow_rows:
+        dow = int(r.get("dow") or 0)
+        avg_sales = float(r.get("avg_daily_sales") or 0)
+        index = round(avg_sales / grand_avg * 100, 1) if grand_avg > 0 else 100.0
+
+        dow_stats.append({
+            "dow":            dow,
+            "day_th":         _DOW_TH[dow],
+            "day_en":         _DOW_EN[dow],
+            "avg_sales":      round(avg_sales, 2),
+            "sales_index":    index,           # 100 = avg, >100 above avg
+            "day_count":      int(r.get("day_count") or 0),
+            "total_sales":    round(float(r.get("total_sales") or 0), 2),
+            "avg_purchase_on_day": round(purchase_by_dow.get(dow, 0), 2),
+        })
+
+    # Sort by avg_sales desc to rank days
+    dow_ranked = sorted(dow_stats, key=lambda x: x["avg_sales"], reverse=True)
+
+    # ── Generate advice ──────────────────────────────────────────────
+    advice = []
+    if dow_ranked:
+        best_days   = [d for d in dow_ranked if d["sales_index"] >= 110]
+        worst_days  = [d for d in dow_ranked if d["sales_index"] <= 80]
+        top2        = dow_ranked[:2]
+
+        # Best days label
+        best_labels = " / ".join(f"วัน{d['day_th']}" for d in best_days[:3]) if best_days else "ยังไม่ชัดเจน"
+        worst_labels = " / ".join(f"วัน{d['day_th']}" for d in worst_days[:2]) if worst_days else "ยังไม่ชัดเจน"
+
+        # Recommend ordering 1-2 days before the best days
+        order_days_suggestion = []
+        for d in best_days[:2]:
+            order_dow = (d["dow"] - 2) % 7  # 2 days before
+            order_days_suggestion.append(_DOW_TH[order_dow])
+        order_suggest = " / ".join(f"วัน{x}" for x in order_days_suggestion) if order_days_suggestion else "วันจันทร์"
+
+        advice = [
+            {
+                "type":    "best_sales_days",
+                "icon":    "🔥",
+                "title":   "วันขายดีที่สุด",
+                "detail":  best_labels,
+                "note":    f"ยอดขายสูงกว่าค่าเฉลี่ย ควรมีของเตรียมพร้อม",
+            },
+            {
+                "type":    "order_schedule",
+                "icon":    "🛒",
+                "title":   "แนะนำสั่งของเข้า",
+                "detail":  order_suggest,
+                "note":    f"สั่งของ 1-2 วันก่อนวันขายดี เพื่อให้มี stock พร้อม",
+            },
+            {
+                "type":    "slow_days",
+                "icon":    "📦",
+                "title":   "วันขายช้า / รับสินค้าได้",
+                "detail":  worst_labels,
+                "note":    "เหมาะนับ stock และเช็คของหมดอายุ",
+            },
+        ]
+
+        # Stock multiplier recommendation
+        if top2:
+            top_index = top2[0]["sales_index"]
+            multiplier = round(top_index / 100, 2)
+            advice.append({
+                "type":    "stock_level",
+                "icon":    "📊",
+                "title":   "ปริมาณสต็อกแนะนำ (วันขายดี)",
+                "detail":  f"เตรียม {multiplier}x เทียบกับวันปกติ",
+                "note":    f"วัน{top2[0]['day_th']} ขายเฉลี่ย ฿{top2[0]['avg_sales']:,.0f} (index {top_index:.0f})",
+            })
+
+    return {
+        "as_of":             today.isoformat(),
+        "lookback_weeks":    lookback_weeks,
+        "branch_code":       branch,
+        "grand_avg_daily":   round(grand_avg, 2),
+        "dow_stats":         dow_stats,       # sorted by DOW (Sun=0..Sat=6)
+        "dow_ranked":        dow_ranked,      # sorted best→worst
+        "advice":            advice,
+    }

@@ -16,6 +16,8 @@ In main.py add:
 
 from __future__ import annotations
 
+import base64
+import io
 import logging
 import os
 from datetime import date, datetime, timedelta
@@ -23,7 +25,7 @@ from typing import Any, Optional
 from uuid import UUID
 
 import psycopg2
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
 try:
@@ -311,3 +313,142 @@ def bills_payment_line_alert():
 
     _push_text(message)
     return {"sent": True, "count": len(rows)}
+
+
+# ─────────────────────────────────────────────────────────
+# POST /bills/payment/slip-match  (Phase 32)
+# Upload a payment slip → GPT Vision reads amount →
+# find matching unpaid vendor_bills
+# ─────────────────────────────────────────────────────────
+
+def _call_gpt_vision_for_slip(image_bytes: bytes, mime: str) -> dict:
+    """Send slip image to GPT Vision and return extracted fields."""
+    import urllib.request, urllib.error, json as _json
+
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    if not openai_key:
+        raise RuntimeError("OPENAI_API_KEY not set")
+
+    b64 = base64.b64encode(image_bytes).decode()
+    data_url = f"data:{mime};base64,{b64}"
+
+    prompt = (
+        "คุณคือผู้ช่วยอ่านสลิปโอนเงิน/ใบเสร็จการชำระเงิน\n"
+        "กรุณาอ่านข้อมูลจากภาพสลิปนี้แล้วตอบ JSON เท่านั้น ไม่มีคำอธิบายเพิ่มเติม\n"
+        "Format: {\"amount\": <จำนวนเงิน ตัวเลขทศนิยม>, "
+        "\"bank\": \"<ชื่อธนาคาร>\", "
+        "\"ref\": \"<เลขอ้างอิง/Ref No>\", "
+        "\"txn_date\": \"<YYYY-MM-DD หรือ null>\", "
+        "\"note\": \"<หมายเหตุถ้ามี หรือ null>\"}\n"
+        "ถ้าไม่แน่ใจค่าไหนให้ใส่ null"
+    )
+
+    body = {
+        "model": os.environ.get("OPENAI_VISION_MODEL", "gpt-4o"),
+        "max_tokens": 300,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url, "detail": "high"}},
+                ],
+            }
+        ],
+    }
+
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=_json.dumps(body).encode(),
+        headers={
+            "Authorization": f"Bearer {openai_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = _json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"OpenAI API error: {e.code} {e.read()[:200]}")
+
+    raw_text = result["choices"][0]["message"]["content"].strip()
+    # Strip markdown code fences if present
+    if raw_text.startswith("```"):
+        raw_text = raw_text.split("```")[1]
+        if raw_text.startswith("json"):
+            raw_text = raw_text[4:]
+    return _json.loads(raw_text)
+
+
+@router.post("/bills/payment/slip-match")
+async def slip_match(file: UploadFile = File(...)):
+    """
+    Phase 32 — อัพโหลดสลิปโอนเงิน → GPT Vision อ่านยอด →
+    จับคู่กับ vendor_bills ที่ค้างชำระยอดใกล้เคียง
+
+    Returns:
+        extracted: {amount, bank, ref, txn_date}
+        candidates: [{bill_id, vendor_name, invoice_no, bill_date, amount, diff}]
+    """
+    # Read file bytes
+    image_bytes = await file.read()
+    if len(image_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(400, "ไฟล์ใหญ่เกิน 10 MB")
+
+    # Detect MIME
+    fname = (file.filename or "").lower()
+    if fname.endswith(".pdf"):
+        raise HTTPException(400, "กรุณาอัพโหลดรูปภาพสลิป (JPG/PNG) ไม่ใช่ PDF")
+    mime = "image/jpeg" if fname.endswith((".jpg", ".jpeg")) else "image/png"
+
+    # Call GPT Vision
+    try:
+        extracted = _call_gpt_vision_for_slip(image_bytes, mime)
+    except Exception as e:
+        log.error("slip_match: vision failed: %s", e)
+        raise HTTPException(500, f"ไม่สามารถอ่านสลิปได้: {e}")
+
+    slip_amount = extracted.get("amount")
+    if slip_amount is None:
+        raise HTTPException(422, "ไม่พบยอดเงินในสลิป — กรุณาลองใหม่ด้วยรูปที่ชัดขึ้น")
+
+    try:
+        slip_amount = float(slip_amount)
+    except (TypeError, ValueError):
+        raise HTTPException(422, f"ยอดเงินไม่ถูกต้อง: {slip_amount!r}")
+
+    # Find unpaid vendor_bills within ±10 baht of slip amount
+    tolerance = 10.0
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, vendor_name, invoice_no, bill_date, due_date,
+                          amount, category_code, payment_status
+                   FROM public.vendor_bills
+                   WHERE review_status = 'confirmed'
+                     AND payment_status = 'unpaid'
+                     AND ABS(amount - %s) <= %s
+                   ORDER BY ABS(amount - %s) ASC, bill_date DESC
+                   LIMIT 10""",
+                (slip_amount, tolerance, slip_amount),
+            )
+            rows = _rows_to_dicts(cur)
+    finally:
+        conn.close()
+
+    candidates = []
+    for r in rows:
+        bill_amount = float(r.get("amount") or 0)
+        candidates.append({
+            **r,
+            "diff": round(slip_amount - bill_amount, 2),
+        })
+
+    return {
+        "extracted": extracted,
+        "slip_amount": slip_amount,
+        "candidates": candidates,
+        "matched_count": len(candidates),
+    }

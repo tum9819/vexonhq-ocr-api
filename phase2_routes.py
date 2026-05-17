@@ -444,6 +444,31 @@ def dashboard_overview(
             except Exception as e:
                 logger.error("dashboard_overview: platform_breakdown query failed: %s", e)
 
+            # ── Food Cost % (วัตถุดิบ / COGS categories) ─────────────────────
+            food_cost_amt = 0.0
+            food_cost_pct = 0.0
+            try:
+                pe_fc = _next_month(month_start)
+                cur.execute(
+                    """SELECT COALESCE(SUM(vb.amount), 0)::numeric
+                       FROM public.vendor_bills vb
+                       WHERE vb.review_status = 'confirmed'
+                         AND COALESCE(vb.branch_code, %s) = %s
+                         AND vb.bill_date >= %s AND vb.bill_date < %s
+                         AND vb.category_code IN (
+                             'food_cost','raw_meat','raw_veggies',
+                             'raw_seasoning','raw_oil_gas','raw_beverage'
+                         )""",
+                    (branch, branch, month_start, pe_fc),
+                )
+                food_cost_amt = float(cur.fetchone()[0] or 0)
+                sales_net_cur = current.get("sales_net", 0)
+                if sales_net_cur > 0:
+                    food_cost_pct = round(food_cost_amt / sales_net_cur * 100, 1)
+            except Exception as e:
+                logger.error("dashboard_overview: food_cost_pct failed: %s", e)
+                conn.rollback()
+
         return {
             "month": month_start.strftime("%Y-%m"),
             "branch_code": branch,
@@ -458,6 +483,10 @@ def dashboard_overview(
             "top_categories": top_categories,
             "budget_status": budget_alerts,
             "platform_breakdown": platform_breakdown,
+            "food_cost": {
+                "amount": food_cost_amt,
+                "pct": food_cost_pct,
+            },
         }
     finally:
         conn.close()
