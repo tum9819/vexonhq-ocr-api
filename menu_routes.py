@@ -2878,3 +2878,157 @@ def pos_combos(
         }
     finally:
         conn.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 57 — Period Comparison  GET /pos/compare
+# ──────────────────────────────────────────────────────────────────────────────
+@router.get("/pos/compare")
+def pos_compare(
+    period_a: str = Query(...),   # YYYY-MM
+    period_b: str = Query(...),   # YYYY-MM
+    branch:   str = Query(""),
+):
+    """Compare two calendar months side-by-side."""
+    import calendar
+    from datetime import date
+
+    def parse_period(p: str):
+        """Return (start, end) for a YYYY-MM string."""
+        try:
+            y, m = int(p[:4]), int(p[5:7])
+        except Exception:
+            raise ValueError(f"Invalid period: {p}")
+        _, last = calendar.monthrange(y, m)
+        return date(y, m, 1), date(y, m, last)
+
+    start_a, end_a = parse_period(period_a)
+    start_b, end_b = parse_period(period_b)
+
+    branch_sql = "AND b.branch_code = %(branch)s" if branch else ""
+
+    def fetch_period(conn, start, end, branch_sql, branch):
+        params = {"start": start, "end": end, "branch": branch or ""}
+        with conn.cursor() as cur:
+            # KPIs
+            cur.execute(f"""
+                SELECT
+                    COUNT(*)            AS total_bills,
+                    SUM(net_total)      AS total_revenue,
+                    AVG(net_total)      AS avg_bill,
+                    MAX(net_total)      AS max_bill,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY net_total) AS median_bill,
+                    COUNT(DISTINCT sales_date) AS active_days
+                FROM pos_bills b
+                WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  {branch_sql}
+            """, params)
+            kpi = _rows_to_dicts(cur)[0]
+
+            # Top 10 items
+            cur.execute(f"""
+                SELECT si.item_name, SUM(si.qty) AS qty, SUM(si.net_amount) AS revenue
+                FROM pos_sales_items si
+                JOIN pos_bills b ON b.id = si.bill_id
+                WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  {branch_sql}
+                GROUP BY si.item_name
+                ORDER BY revenue DESC
+                LIMIT 10
+            """, params)
+            top_items = _rows_to_dicts(cur)
+
+            # Category mix
+            cur.execute(f"""
+                SELECT COALESCE(NULLIF(TRIM(si.category),''),'ไม่ระบุ') AS category,
+                       SUM(si.net_amount) AS revenue
+                FROM pos_sales_items si
+                JOIN pos_bills b ON b.id = si.bill_id
+                WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  {branch_sql}
+                GROUP BY 1
+                ORDER BY revenue DESC
+                LIMIT 8
+            """, params)
+            cats = _rows_to_dicts(cur)
+
+            # DOW avg revenue
+            cur.execute(f"""
+                SELECT EXTRACT(DOW FROM b.sales_date)::int AS dow,
+                       AVG(b.net_total) AS avg_bill,
+                       COUNT(*) AS bill_count
+                FROM pos_bills b
+                WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  {branch_sql}
+                GROUP BY 1
+                ORDER BY 1
+            """, params)
+            dow = _rows_to_dicts(cur)
+
+            # Order type
+            cur.execute(f"""
+                SELECT COALESCE(NULLIF(TRIM(order_type),''),'ไม่ระบุ') AS order_type,
+                       COUNT(*) AS bill_count, SUM(net_total) AS revenue
+                FROM pos_bills b
+                WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  {branch_sql}
+                GROUP BY 1
+                ORDER BY revenue DESC
+            """, params)
+            otypes = _rows_to_dicts(cur)
+
+        total_rev = float(kpi.get("total_revenue") or 0)
+        active = int(kpi.get("active_days") or 1) or 1
+        return {
+            "kpi": {
+                "total_bills":   int(kpi.get("total_bills") or 0),
+                "total_revenue": round(total_rev, 2),
+                "avg_bill":      round(float(kpi.get("avg_bill") or 0), 2),
+                "max_bill":      round(float(kpi.get("max_bill") or 0), 2),
+                "median_bill":   round(float(kpi.get("median_bill") or 0), 2),
+                "active_days":   active,
+                "daily_avg_rev": round(total_rev / active, 2),
+            },
+            "top_items": [
+                {"item_name": r["item_name"], "qty": int(r["qty"] or 0),
+                 "revenue": round(float(r["revenue"] or 0), 2)}
+                for r in top_items
+            ],
+            "categories": [
+                {"category": r["category"], "revenue": round(float(r["revenue"] or 0), 2)}
+                for r in cats
+            ],
+            "dow": [
+                {"dow": r["dow"], "avg_bill": round(float(r["avg_bill"] or 0), 2),
+                 "bill_count": int(r["bill_count"] or 0)}
+                for r in dow
+            ],
+            "order_types": [
+                {"order_type": r["order_type"], "bill_count": int(r["bill_count"] or 0),
+                 "revenue": round(float(r["revenue"] or 0), 2)}
+                for r in otypes
+            ],
+        }
+
+    conn = get_db_conn()
+    try:
+        data_a = fetch_period(conn, start_a, end_a, branch_sql, branch)
+        data_b = fetch_period(conn, start_b, end_b, branch_sql, branch)
+
+        def delta(a, b):
+            if a == 0: return None
+            return round((b - a) / a * 100, 1)
+
+        kpi_a, kpi_b = data_a["kpi"], data_b["kpi"]
+        deltas = {
+            k: delta(kpi_a[k], kpi_b[k])
+            for k in ["total_revenue","total_bills","avg_bill","daily_avg_rev","median_bill"]
+        }
+
+        return {
+            "period_a": {"label": period_a, "start": str(start_a), "end": str(end_a), **data_a},
+            "period_b": {"label": period_b, "start": str(start_b), "end": str(end_b), **data_b},
+            "deltas": deltas,
+        }
+    finally:
+        conn.close()
