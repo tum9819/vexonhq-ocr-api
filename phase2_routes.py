@@ -998,3 +998,149 @@ def inventory_snapshots(limit: int = Query(10, ge=1, le=50)):
 # All export endpoints have been moved to export_routes.py (Phase 9).
 # Do NOT add export routes here — they will conflict.
 # ============================================================
+
+
+# ── GET /dashboard/category-trends ───────────────────────────────────────────
+# Phase 36: Expense Category 6-Month Trend
+
+@router.get("/dashboard/category-trends")
+def category_trends(
+    months: int = Query(6, ge=2, le=12),
+    branch: str = Query(DEFAULT_BRANCH),
+):
+    """
+    Per-category expense totals across the last N months.
+    Sources: vendor_bills (confirmed, expense) + manual_entries (expense) +
+             bank_statement_entries (debit > 0, categorised).
+    Returns month labels + per-category monthly arrays + trend indicators.
+    """
+    from datetime import date as _date
+    from collections import defaultdict
+
+    today = _date.today()
+    # end = first day of next month (exclusive)
+    end = (_date(today.year, today.month, 1).replace(day=28) +
+           __import__('datetime').timedelta(days=4)).replace(day=1)
+
+    # build month list: last `months` calendar months before end
+    month_starts = []
+    cur_m = end
+    for _ in range(months):
+        prev = cur_m - __import__('datetime').timedelta(days=1)
+        cur_m = _date(prev.year, prev.month, 1)
+        month_starts.insert(0, cur_m)
+
+    start = month_starts[0]
+    month_keys = [m.strftime("%Y-%m") for m in month_starts]
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # vendor_bills
+            cur.execute("""
+                SELECT
+                    vb.category_code,
+                    COALESCE(ec.name_th, vb.category_code) AS name_th,
+                    DATE_TRUNC('month', vb.bill_date)::date AS m,
+                    SUM(vb.amount)::numeric AS total
+                FROM public.vendor_bills vb
+                LEFT JOIN public.expense_categories ec ON ec.code = vb.category_code
+                WHERE vb.review_status = 'confirmed'
+                  AND vb.direction = 'expense'
+                  AND vb.bill_date >= %s AND vb.bill_date < %s
+                  AND vb.category_code IS NOT NULL
+                GROUP BY 1, 2, 3
+            """, (start, end))
+            bill_rows = cur.fetchall()
+
+            # manual_entries
+            cur.execute("""
+                SELECT
+                    me.category_code,
+                    COALESCE(ec.name_th, me.category_code) AS name_th,
+                    DATE_TRUNC('month', me.entry_date)::date AS m,
+                    SUM(me.amount)::numeric AS total
+                FROM public.manual_entries me
+                LEFT JOIN public.expense_categories ec ON ec.code = me.category_code
+                WHERE me.direction = 'expense'
+                  AND me.entry_date >= %s AND me.entry_date < %s
+                  AND me.category_code IS NOT NULL
+                GROUP BY 1, 2, 3
+            """, (start, end))
+            manual_rows = cur.fetchall()
+
+            # bank_statement_entries
+            cur.execute("""
+                SELECT
+                    bse.category_code,
+                    COALESCE(ec.name_th, bse.category_code) AS name_th,
+                    DATE_TRUNC('month', bse.txn_date)::date AS m,
+                    SUM(bse.debit)::numeric AS total
+                FROM public.bank_statement_entries bse
+                LEFT JOIN public.expense_categories ec ON ec.code = bse.category_code
+                WHERE bse.branch_code = %s
+                  AND bse.debit > 0
+                  AND bse.category_code IS NOT NULL
+                  AND bse.txn_date >= %s AND bse.txn_date < %s
+                GROUP BY 1, 2, 3
+            """, (branch, start, end))
+            bank_rows = cur.fetchall()
+
+    finally:
+        conn.close()
+
+    # ── Merge all sources ─────────────────────────────────────────────────
+    monthly: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    names: dict[str, str] = {}
+
+    for code, name, m, total in list(bill_rows) + list(manual_rows) + list(bank_rows):
+        mk = m.strftime("%Y-%m")
+        monthly[code][mk] += float(total or 0)
+        if code not in names and name:
+            names[code] = name
+
+    # ── Build per-category series ─────────────────────────────────────────
+    categories = []
+    for code, month_map in monthly.items():
+        series = [round(month_map.get(mk, 0.0), 2) for mk in month_keys]
+        total_all = sum(series)
+        if total_all == 0:
+            continue
+        non_zero = [v for v in series if v > 0]
+        avg = total_all / len(non_zero) if non_zero else 0
+
+        # Trend: compare last 2 months
+        last = series[-1] if series else 0
+        prev = series[-2] if len(series) >= 2 else 0
+        if prev > 0:
+            change_pct = (last - prev) / prev * 100
+        else:
+            change_pct = 0
+        if change_pct > 10:
+            trend = "rising"
+        elif change_pct < -10:
+            trend = "falling"
+        else:
+            trend = "stable"
+
+        categories.append({
+            "category_code": code,
+            "name_th":       names.get(code, code),
+            "series":        series,        # aligned to month_keys
+            "total":         round(total_all, 2),
+            "avg_monthly":   round(avg, 2),
+            "last_month":    round(last, 2),
+            "prev_month":    round(prev, 2),
+            "change_pct":    round(change_pct, 1),
+            "trend":         trend,
+        })
+
+    # Sort by total spend descending
+    categories.sort(key=lambda x: x["total"], reverse=True)
+
+    return {
+        "months":     month_keys,
+        "categories": categories,
+        "branch":     branch,
+        "note":       f"ข้อมูลค่าใช้จ่ายย้อนหลัง {months} เดือน (vendor_bills + manual_entries + bank_statement)"
+    }

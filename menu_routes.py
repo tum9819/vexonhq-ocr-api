@@ -2511,3 +2511,123 @@ def pos_bill_analysis(
         }
     finally:
         conn.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 54 — Category Sales Mix & Trend  GET /pos/categories
+# ──────────────────────────────────────────────────────────────────────────────
+@router.get("/pos/categories")
+def pos_categories(
+    months: int = Query(3),
+    branch: str = Query(""),
+):
+    from datetime import date
+    from dateutil.relativedelta import relativedelta
+
+    conn = get_db_conn()
+    try:
+        end   = date.today()
+        start = end - relativedelta(months=months)
+
+        branch_sql = "AND b.branch_code = %(branch)s" if branch else ""
+        params = {"start": start, "end": end, "branch": branch or ""}
+
+        with conn.cursor() as cur:
+            # ── 1. Category totals ──────────────────────────────────────────
+            cur.execute(f"""
+                SELECT
+                    COALESCE(NULLIF(TRIM(si.category), ''), 'ไม่ระบุ') AS category,
+                    SUM(si.net_amount)   AS total_revenue,
+                    SUM(si.qty)          AS total_qty,
+                    COUNT(DISTINCT si.bill_id) AS bill_count,
+                    COUNT(*)             AS item_lines
+                FROM pos_sales_items si
+                JOIN pos_bills b ON b.id = si.bill_id
+                WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  {branch_sql}
+                GROUP BY 1
+                ORDER BY total_revenue DESC
+            """, params)
+            cat_rows = _rows_to_dicts(cur)
+
+            total_rev = sum(float(r["total_revenue"] or 0) for r in cat_rows) or 1
+
+            # ── 2. Monthly trend per category (last N months) ───────────────
+            cur.execute(f"""
+                SELECT
+                    TO_CHAR(b.sales_date, 'YYYY-MM') AS month,
+                    COALESCE(NULLIF(TRIM(si.category), ''), 'ไม่ระบุ') AS category,
+                    SUM(si.net_amount)  AS revenue,
+                    SUM(si.qty)         AS qty
+                FROM pos_sales_items si
+                JOIN pos_bills b ON b.id = si.bill_id
+                WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  {branch_sql}
+                GROUP BY 1, 2
+                ORDER BY 1, revenue DESC
+            """, params)
+            trend_rows = _rows_to_dicts(cur)
+
+            # ── 3. Top 5 items per category ─────────────────────────────────
+            cur.execute(f"""
+                SELECT
+                    COALESCE(NULLIF(TRIM(si.category), ''), 'ไม่ระบุ') AS category,
+                    si.item_name,
+                    SUM(si.net_amount) AS revenue,
+                    SUM(si.qty)        AS qty
+                FROM pos_sales_items si
+                JOIN pos_bills b ON b.id = si.bill_id
+                WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  {branch_sql}
+                GROUP BY 1, 2
+                ORDER BY 1, revenue DESC
+            """, params)
+            item_rows = _rows_to_dicts(cur)
+
+        # Build categories list
+        categories = []
+        for r in cat_rows:
+            rev = float(r["total_revenue"] or 0)
+            categories.append({
+                "category":     r["category"],
+                "total_revenue": round(rev, 2),
+                "total_qty":    int(r["total_qty"] or 0),
+                "bill_count":   int(r["bill_count"] or 0),
+                "item_lines":   int(r["item_lines"] or 0),
+                "revenue_pct":  round(rev / total_rev * 100, 1),
+            })
+
+        # Build monthly trend: {month: {cat: revenue}}
+        months_set = sorted({r["month"] for r in trend_rows})
+        cat_set    = [c["category"] for c in categories]  # ordered by revenue
+
+        trend_by_month = []
+        for m in months_set:
+            row = {"month": m}
+            for cat in cat_set:
+                match = next((r for r in trend_rows if r["month"] == m and r["category"] == cat), None)
+                row[cat] = round(float(match["revenue"]) if match else 0, 2)
+            trend_by_month.append(row)
+
+        # Build top items per category (top 5)
+        top_items: dict = {}
+        for r in item_rows:
+            cat = r["category"]
+            if cat not in top_items:
+                top_items[cat] = []
+            if len(top_items[cat]) < 5:
+                top_items[cat].append({
+                    "item_name": r["item_name"],
+                    "revenue":   round(float(r["revenue"] or 0), 2),
+                    "qty":       int(r["qty"] or 0),
+                })
+
+        return {
+            "categories":    categories,
+            "trend":         trend_by_month,
+            "top_items":     top_items,
+            "category_names": cat_set,
+            "period": {"months": months, "start": str(start), "end": str(end)},
+        }
+    finally:
+        conn.close()
