@@ -1306,3 +1306,190 @@ def revenue_breakdown(months: int = 6, branch: str = "thawi_watthana"):
             "group_totals":   group_totals,
             "period_months":  months,
         }
+
+
+# ============================================================
+# Phase 47 — Alert Center
+# ============================================================
+
+@router.get("/alerts/summary")
+def alerts_summary(branch: str = "thawi_watthana"):
+    """
+    Unified alert feed: anomaly bills, budget overruns, AP overdue/due-soon, low stock.
+    Returns grouped alerts with severity (danger/warning/info).
+    """
+    conn = get_db_conn()
+    try:
+        today = date.today()
+        this_month = today.strftime("%Y-%m")
+        alerts: list[dict] = []
+
+        # ── 1. Bill Anomalies (pending review) ──────────────────
+        try:
+            anom_sql = """
+                SELECT a.id, a.severity, a.anomaly_type, a.message,
+                       a.bill_amount, a.mean_amount, a.created_at,
+                       vb.vendor_name, vb.bill_date, vb.category_code
+                FROM public.bill_anomalies a
+                JOIN public.vendor_bills vb ON vb.id = a.bill_id
+                WHERE a.user_action IS NULL
+                ORDER BY
+                    CASE a.severity WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+                    a.created_at DESC
+                LIMIT 20
+            """
+            anom_rows = _rows_to_dicts(conn, anom_sql, ())
+            for r in anom_rows:
+                sev = "danger" if r["severity"] == "high" else "warning"
+                alerts.append({
+                    "id":       f"anom_{r['id']}",
+                    "type":     "anomaly",
+                    "severity": sev,
+                    "title":    f"บิลผิดปกติ — {r['vendor_name'] or 'ไม่ระบุ'}",
+                    "message":  r["message"] or f"{r['anomaly_type']} ฿{r['bill_amount']:,.0f}",
+                    "amount":   float(r["bill_amount"] or 0),
+                    "date":     str(r["bill_date"] or ""),
+                    "link":     "/ai-review",
+                    "link_label": "ตรวจสอบ",
+                })
+        except Exception:
+            pass
+
+        # ── 2. Budget Overruns this month ────────────────────────
+        try:
+            budget_sql = """
+                SELECT bt.category_code, bt.amount AS target,
+                       COALESCE(act.actual, 0) AS actual
+                FROM public.budget_targets bt
+                LEFT JOIN (
+                    SELECT
+                        COALESCE(vb.category_code, 'other') AS category_code,
+                        SUM(vb.amount) AS actual
+                    FROM public.vendor_bills vb
+                    WHERE TO_CHAR(vb.bill_date, 'YYYY-MM') = %s
+                      AND vb.review_status = 'confirmed'
+                      AND (%s = '' OR vb.branch_code = %s)
+                    GROUP BY 1
+                ) act USING (category_code)
+                WHERE bt.month = %s
+                  AND (%s = '' OR bt.branch_code = %s)
+                  AND bt.amount > 0
+                  AND COALESCE(act.actual, 0) >= bt.amount * 0.8
+                ORDER BY (COALESCE(act.actual, 0) / bt.amount) DESC
+            """
+            budget_rows = _rows_to_dicts(
+                conn, budget_sql,
+                (this_month, branch, branch, this_month, branch, branch)
+            )
+            for r in budget_rows:
+                target = float(r["target"] or 0)
+                actual = float(r["actual"] or 0)
+                pct = (actual / target * 100) if target else 0
+                sev = "danger" if pct >= 100 else "warning"
+                label = "เกินงบ" if pct >= 100 else f"ใกล้ถึงงบ ({pct:.0f}%)"
+                alerts.append({
+                    "id":       f"budget_{r['category_code']}",
+                    "type":     "budget",
+                    "severity": sev,
+                    "title":    f"{label} — {r['category_code']}",
+                    "message":  f"ใช้จริง ฿{actual:,.0f} / งบ ฿{target:,.0f} ({pct:.1f}%)",
+                    "amount":   actual,
+                    "date":     this_month,
+                    "link":     "/budget",
+                    "link_label": "ดูงบประมาณ",
+                })
+        except Exception:
+            pass
+
+        # ── 3. AP Overdue + Due Soon ─────────────────────────────
+        try:
+            ap_sql = """
+                SELECT id, vendor_name, amount, due_date, payment_status,
+                       (due_date - %s::date) AS days_until_due
+                FROM public.vendor_bills
+                WHERE payment_status = 'unpaid'
+                  AND review_status = 'confirmed'
+                  AND due_date IS NOT NULL
+                  AND due_date <= (%s::date + INTERVAL '7 days')
+                  AND (%s = '' OR branch_code = %s)
+                ORDER BY due_date ASC
+                LIMIT 20
+            """
+            ap_rows = _rows_to_dicts(conn, ap_sql, (today, today, branch, branch))
+            for r in ap_rows:
+                days = int(r["days_until_due"] or 0)
+                if days < 0:
+                    sev, label = "danger", f"เกินกำหนด {abs(days)} วัน"
+                elif days == 0:
+                    sev, label = "danger", "ครบกำหนดวันนี้"
+                elif days <= 3:
+                    sev, label = "warning", f"ครบกำหนดใน {days} วัน"
+                else:
+                    sev, label = "info", f"ครบกำหนดใน {days} วัน"
+                alerts.append({
+                    "id":       f"ap_{r['id']}",
+                    "type":     "ap_due",
+                    "severity": sev,
+                    "title":    f"บิลค้างจ่าย — {r['vendor_name'] or 'ไม่ระบุ'}",
+                    "message":  f"{label} | ฿{float(r['amount'] or 0):,.0f} | due {r['due_date']}",
+                    "amount":   float(r["amount"] or 0),
+                    "date":     str(r["due_date"] or ""),
+                    "link":     "/bills/payment",
+                    "link_label": "จ่ายบิล",
+                })
+        except Exception:
+            pass
+
+        # ── 4. Low Stock ─────────────────────────────────────────
+        try:
+            stock_sql = """
+                SELECT i.item_name, i.qty_in_stock, i.unit,
+                       s.snapshot_at
+                FROM public.pos_inventory_items i
+                JOIN public.pos_inventory_snapshots s ON s.id = i.snapshot_id
+                WHERE s.id = (
+                    SELECT id FROM public.pos_inventory_snapshots
+                    ORDER BY snapshot_at DESC LIMIT 1
+                )
+                  AND (%s = '' OR s.branch_code = %s)
+                  AND i.qty_in_stock <= 5
+                ORDER BY i.qty_in_stock ASC
+                LIMIT 15
+            """
+            stock_rows = _rows_to_dicts(conn, stock_sql, (branch, branch))
+            for r in stock_rows:
+                qty = float(r["qty_in_stock"] or 0)
+                sev = "danger" if qty <= 0 else "warning"
+                label = "หมดสต็อก" if qty <= 0 else f"เหลือ {qty} {r['unit'] or 'หน่วย'}"
+                alerts.append({
+                    "id":       f"stock_{r['item_name']}",
+                    "type":     "low_stock",
+                    "severity": sev,
+                    "title":    f"Stock ต่ำ — {r['item_name']}",
+                    "message":  label,
+                    "amount":   qty,
+                    "date":     str(r["snapshot_at"] or ""),
+                    "link":     "/inventory",
+                    "link_label": "ดู Inventory",
+                })
+        except Exception:
+            pass
+
+        # ── Sort: danger first, then warning, then info ──────────
+        sev_order = {"danger": 0, "warning": 1, "info": 2}
+        alerts.sort(key=lambda a: sev_order.get(a["severity"], 9))
+
+        counts = {
+            "danger":  sum(1 for a in alerts if a["severity"] == "danger"),
+            "warning": sum(1 for a in alerts if a["severity"] == "warning"),
+            "info":    sum(1 for a in alerts if a["severity"] == "info"),
+            "total":   len(alerts),
+        }
+
+        return {
+            "alerts":  alerts,
+            "counts":  counts,
+            "as_of":   str(today),
+        }
+    finally:
+        conn.close()
