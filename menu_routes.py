@@ -1219,93 +1219,96 @@ def revenue_breakdown(months: int = 6, branch: str = "thawi_watthana"):
     """
     conn = get_db_conn()
     try:
-        since = date.today().replace(day=1) - relativedelta(months=months - 1)
+        with conn.cursor() as cur:
+            since = date.today().replace(day=1) - relativedelta(months=months - 1)
 
-        # ── Per-source totals ──
-        source_sql = """
-            SELECT
-                source,
-                COUNT(*)           AS tx_count,
-                SUM(amount)        AS total
-            FROM public.v_daybook
-            WHERE direction = 'income'
-              AND entry_date >= %s
-              AND (%s = '' OR branch_code = %s)
-            GROUP BY source
-            ORDER BY total DESC
-        """
-        source_rows = _rows_to_dicts(conn, source_sql, (since, branch, branch))
+            # ── Per-source totals ──
+            cur.execute(
+                """SELECT
+                       source,
+                       COUNT(*)    AS tx_count,
+                       SUM(amount) AS total
+                   FROM public.v_daybook
+                   WHERE direction = 'income'
+                     AND entry_date >= %s
+                     AND (%s = '' OR branch_code = %s)
+                   GROUP BY source
+                   ORDER BY total DESC""",
+                (since, branch, branch),
+            )
+            source_rows = _rows_to_dicts(cur)
 
-        grand_total = sum(float(r["total"] or 0) for r in source_rows)
+            grand_total = sum(float(r["total"] or 0) for r in source_rows)
 
-        sources = []
-        for r in source_rows:
-            src = r["source"]
-            meta = _REVENUE_SOURCE_META.get(src, {"label": src, "color": "#64748b", "group": "other"})
-            total = float(r["total"] or 0)
-            sources.append({
-                "source":    src,
-                "label":     meta["label"],
-                "color":     meta["color"],
-                "group":     meta["group"],
-                "total":     total,
-                "pct":       round(total / grand_total * 100, 1) if grand_total else 0,
-                "tx_count":  int(r["tx_count"] or 0),
-            })
+            sources = []
+            for r in source_rows:
+                src = r["source"]
+                meta = _REVENUE_SOURCE_META.get(src, {"label": src, "color": "#64748b", "group": "other"})
+                total = float(r["total"] or 0)
+                sources.append({
+                    "source":    src,
+                    "label":     meta["label"],
+                    "color":     meta["color"],
+                    "group":     meta["group"],
+                    "total":     total,
+                    "pct":       round(total / grand_total * 100, 1) if grand_total else 0,
+                    "tx_count":  int(r["tx_count"] or 0),
+                })
 
-        # ── Monthly trend per source ──
-        trend_sql = """
-            SELECT
-                TO_CHAR(DATE_TRUNC('month', entry_date), 'YYYY-MM') AS month,
-                source,
-                SUM(amount) AS total
-            FROM public.v_daybook
-            WHERE direction = 'income'
-              AND entry_date >= %s
-              AND (%s = '' OR branch_code = %s)
-            GROUP BY 1, 2
-            ORDER BY 1, 2
-        """
-        trend_rows = _rows_to_dicts(conn, trend_sql, (since, branch, branch))
+            # ── Monthly trend per source ──
+            cur.execute(
+                """SELECT
+                       TO_CHAR(DATE_TRUNC('month', entry_date), 'YYYY-MM') AS month,
+                       source,
+                       SUM(amount) AS total
+                   FROM public.v_daybook
+                   WHERE direction = 'income'
+                     AND entry_date >= %s
+                     AND (%s = '' OR branch_code = %s)
+                   GROUP BY 1, 2
+                   ORDER BY 1, 2""",
+                (since, branch, branch),
+            )
+            trend_rows = _rows_to_dicts(cur)
 
-        sources_seen: set = set()
-        months_map: dict = {}
-        for r in trend_rows:
-            m = r["month"]
-            s = r["source"]
-            sources_seen.add(s)
-            if m not in months_map:
-                months_map[m] = {}
-            months_map[m][s] = float(r["total"] or 0)
+            sources_seen: set = set()
+            months_map: dict = {}
+            for r in trend_rows:
+                m = r["month"]
+                s = r["source"]
+                sources_seen.add(s)
+                if m not in months_map:
+                    months_map[m] = {}
+                months_map[m][s] = float(r["total"] or 0)
 
-        # Order sources by grand total desc
-        sources_order = [s["source"] for s in sources if s["source"] in sources_seen]
+            sources_order = [s["source"] for s in sources if s["source"] in sources_seen]
 
-        trend = []
-        for m in sorted(months_map.keys()):
-            entry: dict = {"month": m}
-            month_total = 0.0
-            for s in sources_order:
-                v = months_map[m].get(s, 0)
-                entry[s] = round(v, 2)
-                month_total += v
-            entry["total"] = round(month_total, 2)
-            trend.append(entry)
+            trend = []
+            for m in sorted(months_map.keys()):
+                entry: dict = {"month": m}
+                month_total = 0.0
+                for s in sources_order:
+                    v = months_map[m].get(s, 0)
+                    entry[s] = round(v, 2)
+                    month_total += v
+                entry["total"] = round(month_total, 2)
+                trend.append(entry)
 
-        # ── Group totals (POS / Delivery / Other) ──
-        group_totals: dict = {}
-        for s in sources:
-            g = s["group"]
-            group_totals[g] = group_totals.get(g, 0) + s["total"]
+            group_totals: dict = {}
+            for s in sources:
+                g = s["group"]
+                group_totals[g] = group_totals.get(g, 0) + s["total"]
 
-        return {
-            "sources":        sources,
-            "sources_order":  sources_order,
-            "trend":          trend,
-            "grand_total":    grand_total,
-            "group_totals":   group_totals,
-            "period_months":  months,
-        }
+            return {
+                "sources":        sources,
+                "sources_order":  sources_order,
+                "trend":          trend,
+                "grand_total":    grand_total,
+                "group_totals":   group_totals,
+                "period_months":  months,
+            }
+    finally:
+        conn.close()
 
 
 # ============================================================
