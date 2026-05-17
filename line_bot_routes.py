@@ -651,6 +651,18 @@ _STOCK_SUMMARY_KEYWORDS = (
     "เหลือเท่าไร", "มีของไหม", "ของหมดไหม", "รายงานสินค้า",
 )
 
+# [Bug1-fix] category modifier → ส่ง tag= ให้ _query_inventory แทนดึงทั้งหมด
+# key = คำที่ user พิมพ์,  value = ค่า tag ใน pos_inventory_items.tag
+_STOCK_CATEGORY_MAP: dict[str, str] = {
+    "เครื่องดื่ม": "เครื่องดื่ม",
+    "หม่าล่า":     "หม่าล่า",
+    "ผัก":         "ผัก",
+    "ของทอด":      "ของทอด",
+    "อาหาร":       "อาหาร",
+    "ไส้เสียบ":    "หม่าล่า",
+    "วัตถุดิบ":    "วัตถุดิบ",
+}
+
 # ชื่อสินค้าที่ค้นหาใน stock (ไม่ใช่การเงิน)
 _STOCK_PRODUCT_KEYWORDS = (
     "เบียร์", "สิงห์", "ไฮเนเกน", "อาซาฮี", "ลีโอ", "เฟดเดอร์บราว",
@@ -661,13 +673,32 @@ _STOCK_PRODUCT_KEYWORDS = (
     "ใส้กรอก", "ไส้กรอก", "เบคอน", "ปีกไก่", "หัวใจไก่", "สันในไก่",
     "เห็ดออรินจิ", "บล็อคโคลี่", "กระเจี๊ยบ", "ข้าวโพดอ่อน",
     "เต้าหู้", "พริกหยวก", "ปลาไข่",
+    # [Bug4-fix] สินค้าที่ขาดอยู่
+    "น้ำแข็ง", "นักเก็ต", "ซูปเปอร์", "ยำ", "ใส้ทอด",
+    "หมูมะนาว", "เอ็นข้อไก่", "ไส้กรอกแดง", "ไส้กรอกอีสาน",
+    "เฟรนช์ฟรายส์", "เฟรนฟราย", "ข้าวเปล่า",
 )
 
 # คำที่บ่งบอกว่าถามเรื่องการเงิน (ถ้ามีคำนี้ → financial search แม้จะมีชื่อสินค้า)
 _FINANCIAL_OVERRIDE_KEYWORDS = (
     "ยอดโอน", "รายจ่าย", "รายรับ", "โอนไป", "บิล",
     "ใบแจ้งหนี้", "invoice", "ค่าใช้จ่าย", "จ่ายเงิน",
+    # [Bug3-fix] คำที่บอกการฝาก/โอนเงินเข้า
+    "ฝากเข้า", "ฝาก", "โอนเข้า", "รับโอน", "รับเงิน",
+    "เงินเดือน", "ค่าเช่า", "ค่าน้ำ", "ค่าไฟ",
 )
+
+# [Bug2-hint] แผนที่ชื่อสินค้า → ชื่อผู้รับในบัญชีธนาคาร
+# ใช้แสดง hint เมื่อค้นหาด้วยชื่อสินค้าแล้วไม่เจอ
+_VENDOR_HINT_MAP: dict[str, str] = {
+    "เบียร์ช้าง": "วัฒนา",
+    "เบียร์ข้าง": "วัฒนา",
+    "ช้าง": "วัฒนา",
+    "ค่าเช่า": "กาญจนา",
+    "เงินเดือน": "มยุรฉัตร",
+    "เงินคืน": "นุศรา",
+    "นักดนตรี": "600 หรือ 700 หรือ 2100 หรือ 2800",
+}
 
 # คำที่บ่งบอกว่าต้องการให้ AI แนะนำเมนู
 _RECIPE_SUGGEST_KEYWORDS = (
@@ -705,8 +736,11 @@ def _classify_intent(text: str) -> str:
     if any(kw in lower for kw in _RECIPE_COST_KEYWORDS):
         return "recipe_cost"
 
-    # Check stock summary keywords
+    # Check stock summary keywords — but first check for category modifier
     if any(kw in lower for kw in _STOCK_SUMMARY_KEYWORDS):
+        # [Bug1-fix] "เช็ค stock เครื่องดื่ม" → stock_category (filtered)
+        if any(cat_kw in lower for cat_kw in _STOCK_CATEGORY_MAP):
+            return "stock_category"
         return "stock_summary"
 
     # Check product name keywords (without financial context)
@@ -734,6 +768,28 @@ def _handle_stock_summary() -> str:
     except Exception as e:
         log.error("Stock summary failed: %s", e)
         return f"❌ เกิดข้อผิดพลาดในการเช็ค stock: {str(e)[:80]}"
+
+
+def _handle_stock_category(query: str) -> str:
+    """Return LINE-friendly stock filtered by tag (เครื่องดื่ม, หม่าล่า, ...) — [Bug1-fix]"""
+    lower = query.lower()
+    tag = None
+    for cat_kw, tag_val in _STOCK_CATEGORY_MAP.items():
+        if cat_kw in lower:
+            tag = tag_val
+            break
+    try:
+        from stock_routes import _query_inventory, format_stock_for_line
+        items, snapshot_at = _query_inventory(tag=tag, low_only=False)
+        title = f"📦 Stock {tag}" if tag else "📦 Stock ทั้งหมด"
+        if not items:
+            hint = f" (tag={tag})" if tag else ""
+            sep22 = "─" * 22
+            return f"{title}\n{sep22}\nไม่พบข้อมูลหมวด{hint} ครับ\nลอง: เช็ค stock ทั้งหมด"
+        return format_stock_for_line(items, snapshot_at, title)
+    except Exception as e:
+        log.error("Stock category failed: %s", e)
+        return f"❌ เกิดข้อผิดพลาด: {str(e)[:80]}"
 
 
 def _handle_stock_product(query: str) -> str:
@@ -911,7 +967,16 @@ def _format_search_for_line(query: str, count: int, total_income: float,
                               total_expense: float, results: list) -> str:
     sep = "─" * 24
     if count == 0:
-        return f'🔍 "{query}"\n{sep}\nไม่พบรายการที่ตรงกันครับ'
+        # [Bug2-fix] suggest vendor alias when user searched by product name
+        q_lower = query.lower()
+        hint_lines = []
+        for product, vendor in _VENDOR_HINT_MAP.items():
+            if product in q_lower:
+                hint_lines.append(f"  '{product}' บันทึกในบัญชีว่า '{vendor}'")
+        hint = ""
+        if hint_lines:
+            hint = "\n\n💡 ข้อมูลธนาคารบันทึกตามชื่อผู้รับ:\n" + "\n".join(hint_lines)
+        return f'🔍 "{query}"\n{sep}\nไม่พบรายการที่ตรงกันครับ{hint}'
 
     lines = [f'🔍 "{query}"', sep, f"พบ {count} รายการ"]
     if total_income > 0:
@@ -1059,6 +1124,10 @@ async def line_webhook(
 
             if intent == "stock_product":
                 _reply_line(reply_token, _handle_stock_product(text))
+                continue
+
+            if intent == "stock_category":  # [Bug1-fix]
+                _reply_line(reply_token, _handle_stock_category(text))
                 continue
 
             if intent == "recipe_suggest":
