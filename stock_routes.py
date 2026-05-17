@@ -119,8 +119,12 @@ def _query_inventory(
     # Session 15 fix (2026-05-17): exclude promo/bundle SKUs from all stock
     # queries. These are FoodStory promo packs (e.g. "Pro(3) เบียร์...",
     # "(pro) ช้าง...") that should not appear in inventory views.
-    conditions.append("LOWER(i.item_name) NOT LIKE 'pro(%'")
-    conditions.append("LOWER(i.item_name) NOT LIKE '(pro%'")
+    # NOTE: pass patterns as parameters, NOT inlined — otherwise psycopg2
+    # treats the '%' as a placeholder and raises "list index out of range".
+    conditions.append("LOWER(i.item_name) NOT LIKE %s")
+    params.append("pro(%")
+    conditions.append("LOWER(i.item_name) NOT LIKE %s")
+    params.append("(pro%")
 
     if keyword:
         conditions.append("i.item_name ILIKE %s")
