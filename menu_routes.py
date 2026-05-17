@@ -2755,3 +2755,126 @@ def pos_calendar(
         }
     finally:
         conn.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 56 — Item Combo Analysis  GET /pos/combos
+# ──────────────────────────────────────────────────────────────────────────────
+@router.get("/pos/combos")
+def pos_combos(
+    months: int = Query(3),
+    branch: str = Query(""),
+    item:   str = Query(""),    # filter: show combos for this specific item
+    limit:  int = Query(30),
+):
+    from datetime import date
+    from dateutil.relativedelta import relativedelta
+
+    conn = get_db_conn()
+    try:
+        end   = date.today()
+        start = end - relativedelta(months=months)
+
+        branch_sql_b = "AND b.branch_code = %(branch)s" if branch else ""
+        params = {"start": start, "end": end, "branch": branch or "",
+                  "limit": limit, "item": f"%{item}%"}
+
+        with conn.cursor() as cur:
+            # ── Total bills in period (for support calculation) ─────────────
+            cur.execute(f"""
+                SELECT COUNT(DISTINCT id) AS total_bills
+                FROM pos_bills
+                WHERE sales_date BETWEEN %(start)s AND %(end)s
+                  {branch_sql_b}
+            """, params)
+            total_row = _rows_to_dicts(cur)
+            total_bills = int(total_row[0]["total_bills"]) if total_row else 1
+
+            # ── Individual item counts (for lift calculation) ───────────────
+            cur.execute(f"""
+                SELECT si.item_name, COUNT(DISTINCT si.bill_id) AS item_bills
+                FROM pos_sales_items si
+                JOIN pos_bills b ON b.id = si.bill_id
+                WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  {branch_sql_b}
+                GROUP BY si.item_name
+            """, params)
+            item_counts = {r["item_name"]: int(r["item_bills"]) for r in _rows_to_dicts(cur)}
+
+            # ── Pair co-occurrence (self-join) ──────────────────────────────
+            item_filter = "AND (a.item_name ILIKE %(item)s OR b.item_name ILIKE %(item)s)" if item else ""
+            cur.execute(f"""
+                SELECT
+                    a.item_name   AS item_a,
+                    b.item_name   AS item_b,
+                    COUNT(DISTINCT a.bill_id) AS co_count
+                FROM pos_sales_items a
+                JOIN pos_sales_items b
+                  ON  a.bill_id = b.bill_id
+                  AND a.item_name < b.item_name
+                JOIN pos_bills bl ON bl.id = a.bill_id
+                WHERE bl.sales_date BETWEEN %(start)s AND %(end)s
+                  {branch_sql_b.replace('b.branch_code', 'bl.branch_code')}
+                  {item_filter}
+                GROUP BY 1, 2
+                HAVING COUNT(DISTINCT a.bill_id) >= 2
+                ORDER BY co_count DESC
+                LIMIT %(limit)s
+            """, params)
+            pair_rows = _rows_to_dicts(cur)
+
+            # ── Top solo items (for context) ────────────────────────────────
+            cur.execute(f"""
+                SELECT si.item_name, COUNT(DISTINCT si.bill_id) AS bill_count,
+                       SUM(si.net_amount) AS revenue
+                FROM pos_sales_items si
+                JOIN pos_bills b ON b.id = si.bill_id
+                WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  {branch_sql_b}
+                GROUP BY si.item_name
+                ORDER BY bill_count DESC
+                LIMIT 20
+            """, params)
+            top_items = _rows_to_dicts(cur)
+
+        # Compute support & lift for each pair
+        pairs_out = []
+        for r in pair_rows:
+            a, b_name = r["item_a"], r["item_b"]
+            co = int(r["co_count"])
+            cnt_a = item_counts.get(a, 1) or 1
+            cnt_b = item_counts.get(b_name, 1) or 1
+            support   = round(co / total_bills * 100, 1)
+            # lift = P(A∩B) / (P(A) * P(B))
+            lift = round((co / total_bills) / ((cnt_a / total_bills) * (cnt_b / total_bills)), 2)
+            confidence_a = round(co / cnt_a * 100, 1)  # P(B|A)
+            confidence_b = round(co / cnt_b * 100, 1)  # P(A|B)
+            pairs_out.append({
+                "item_a":        a,
+                "item_b":        b_name,
+                "co_count":      co,
+                "support_pct":   support,
+                "lift":          lift,
+                "conf_a_to_b":   confidence_a,
+                "conf_b_to_a":   confidence_b,
+                "bills_a":       cnt_a,
+                "bills_b":       cnt_b,
+            })
+
+        top_items_out = [
+            {
+                "item_name":  r["item_name"],
+                "bill_count": int(r["bill_count"] or 0),
+                "revenue":    round(float(r["revenue"] or 0), 2),
+            }
+            for r in top_items
+        ]
+
+        return {
+            "pairs":       pairs_out,
+            "top_items":   top_items_out,
+            "total_bills": total_bills,
+            "period":      {"months": months, "start": str(start), "end": str(end)},
+        }
+    finally:
+        conn.close()
