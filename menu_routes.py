@@ -3758,3 +3758,134 @@ def pos_goals(
         "daily": all_days,
         "weekly": weekly,
     }
+
+
+# ── Phase 63: Void & Cancelled Orders Analytics (/pos/voids) ─────────────────
+@router.get("/pos/voids")
+def pos_voids(
+    months: int = Query(3),
+    branch: str = Query(""),
+):
+    from datetime import date, timedelta
+    today = date.today()
+    start = (today.replace(day=1) - timedelta(days=1)).replace(day=1)
+    # go back `months` months from start of current month
+    for _ in range(months - 1):
+        start = (start - timedelta(days=1)).replace(day=1)
+    start_str = str(start)
+
+    branch_filter = "AND branch = %(branch)s" if branch else ""
+    params: dict = {"start": start_str, "branch": branch}
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # Total bills & revenue (all statuses)
+            cur.execute(f"""
+                SELECT COUNT(*) AS total_bills,
+                       COALESCE(SUM(net_price), 0) AS total_rev
+                FROM pos_bills
+                WHERE sales_date >= %(start)s {branch_filter}
+            """, params)
+            totals = _rows_to_dicts(cur)[0]
+
+            # Void summary
+            cur.execute(f"""
+                SELECT COUNT(*) AS void_count,
+                       COALESCE(SUM(net_price), 0) AS void_amount,
+                       COALESCE(AVG(net_price), 0) AS avg_void
+                FROM pos_bills
+                WHERE sales_date >= %(start)s
+                  AND LOWER(COALESCE(status,'')) IN ('void','cancelled')
+                  {branch_filter}
+            """, params)
+            void_sum = _rows_to_dicts(cur)[0]
+
+            # By staff
+            cur.execute(f"""
+                SELECT COALESCE(staff, '(ไม่ระบุ)') AS staff,
+                       COUNT(*) AS voids,
+                       COALESCE(SUM(net_price), 0) AS amount
+                FROM pos_bills
+                WHERE sales_date >= %(start)s
+                  AND LOWER(COALESCE(status,'')) IN ('void','cancelled')
+                  {branch_filter}
+                GROUP BY staff
+                ORDER BY voids DESC
+                LIMIT 15
+            """, params)
+            by_staff = _rows_to_dicts(cur)
+
+            # By hour
+            cur.execute(f"""
+                SELECT EXTRACT(HOUR FROM sales_time::time)::int AS hour,
+                       COUNT(*) AS voids,
+                       COALESCE(SUM(net_price), 0) AS amount
+                FROM pos_bills
+                WHERE sales_date >= %(start)s
+                  AND LOWER(COALESCE(status,'')) IN ('void','cancelled')
+                  AND sales_time IS NOT NULL
+                  {branch_filter}
+                GROUP BY hour
+                ORDER BY hour
+            """, params)
+            by_hour = _rows_to_dicts(cur)
+
+            # Monthly trend
+            cur.execute(f"""
+                SELECT TO_CHAR(sales_date,'YYYY-MM') AS month,
+                       COUNT(*) AS voids,
+                       COALESCE(SUM(net_price), 0) AS amount
+                FROM pos_bills
+                WHERE sales_date >= %(start)s
+                  AND LOWER(COALESCE(status,'')) IN ('void','cancelled')
+                  {branch_filter}
+                GROUP BY month
+                ORDER BY month
+            """, params)
+            monthly = _rows_to_dicts(cur)
+
+            # Top voided items (via sales_items join)
+            cur.execute(f"""
+                SELECT si.item_name,
+                       COUNT(*) AS void_count,
+                       COALESCE(SUM(si.qty), 0) AS void_qty,
+                       COALESCE(SUM(si.qty * si.unit_price), 0) AS void_value
+                FROM pos_sales_items si
+                JOIN pos_bills b ON b.id = si.bill_id
+                WHERE b.sales_date >= %(start)s
+                  AND LOWER(COALESCE(b.status,'')) IN ('void','cancelled')
+                  {branch_filter}
+                GROUP BY si.item_name
+                ORDER BY void_count DESC
+                LIMIT 15
+            """, params)
+            top_items = _rows_to_dicts(cur)
+
+    finally:
+        conn.close()
+
+    total_bills = int(totals["total_bills"] or 0)
+    total_rev   = float(totals["total_rev"] or 0)
+    void_count  = int(void_sum["void_count"] or 0)
+    void_amount = float(void_sum["void_amount"] or 0)
+    avg_void    = float(void_sum["avg_void"] or 0)
+
+    void_rate_pct = round(void_count / total_bills * 100, 2) if total_bills > 0 else 0.0
+    rev_loss_pct  = round(void_amount / (total_rev + void_amount) * 100, 2) if (total_rev + void_amount) > 0 else 0.0
+
+    return {
+        "months": months,
+        "summary": {
+            "void_count":    void_count,
+            "void_amount":   round(void_amount, 0),
+            "avg_void":      round(avg_void, 0),
+            "void_rate_pct": void_rate_pct,
+            "rev_loss_pct":  rev_loss_pct,
+            "total_bills":   total_bills,
+        },
+        "by_staff":  [{"staff": r["staff"], "voids": int(r["voids"]), "amount": round(float(r["amount"]), 0)} for r in by_staff],
+        "by_hour":   [{"hour": r["hour"],   "voids": int(r["voids"]), "amount": round(float(r["amount"]), 0)} for r in by_hour],
+        "monthly":   [{"month": r["month"], "voids": int(r["voids"]), "amount": round(float(r["amount"]), 0)} for r in monthly],
+        "top_items": [{"item": r["item_name"], "count": int(r["void_count"]), "qty": float(r["void_qty"]), "value": round(float(r["void_value"]), 0)} for r in top_items],
+    }
