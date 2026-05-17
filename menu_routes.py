@@ -3500,3 +3500,138 @@ def pos_predict(weeks: int = Query(8), branch: str = Query("")):
             }
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 61 — Menu Price History
+# GET /pos/prices?months=6&branch=&item=
+# ---------------------------------------------------------------------------
+@router.get("/pos/prices")
+def pos_prices(months: int = Query(6), branch: str = Query(""), item: str = Query("")):
+    """
+    Track unit_price changes per menu item over time from pos_sales_items.
+    Returns: summary per item (current, min, max, change%) + monthly avg price trend.
+    """
+    from datetime import date as date_type
+    from dateutil.relativedelta import relativedelta
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            end_date   = date_type.today()
+            start_date = (end_date.replace(day=1) - relativedelta(months=months - 1))
+            branch_filter = "AND b.branch_code = %(branch)s" if branch else ""
+            item_filter   = "AND si.item_name ILIKE %(item)s" if item else ""
+            params = {"start": start_date, "end": end_date, "branch": branch, "item": f"%{item}%"}
+
+            # Per-item summary: first price, latest price, min, max, # distinct prices
+            cur.execute(f"""
+                WITH monthly AS (
+                    SELECT
+                        si.item_name,
+                        TO_CHAR(b.sales_date, 'YYYY-MM')              AS month,
+                        ROUND(AVG(si.unit_price)::numeric, 2)          AS avg_price,
+                        MIN(si.unit_price)                             AS min_price,
+                        MAX(si.unit_price)                             AS max_price,
+                        COUNT(DISTINCT si.unit_price)                  AS distinct_prices,
+                        SUM(si.qty)                                    AS total_qty
+                    FROM pos_sales_items si
+                    JOIN pos_bills b ON b.id = si.bill_id
+                    WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                      AND si.unit_price > 0
+                      {branch_filter}
+                      {item_filter}
+                    GROUP BY si.item_name, month
+                ),
+                first_last AS (
+                    SELECT
+                        item_name,
+                        FIRST_VALUE(avg_price) OVER (
+                            PARTITION BY item_name ORDER BY month ASC
+                        ) AS first_price,
+                        LAST_VALUE(avg_price) OVER (
+                            PARTITION BY item_name ORDER BY month ASC
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                        ) AS last_price,
+                        MIN(min_price) OVER (PARTITION BY item_name) AS overall_min,
+                        MAX(max_price) OVER (PARTITION BY item_name) AS overall_max,
+                        SUM(distinct_prices) OVER (PARTITION BY item_name) AS price_events,
+                        SUM(total_qty) OVER (PARTITION BY item_name) AS total_qty
+                    FROM monthly
+                )
+                SELECT DISTINCT
+                    item_name,
+                    ROUND(first_price::numeric, 2)   AS first_price,
+                    ROUND(last_price::numeric, 2)    AS current_price,
+                    ROUND(overall_min::numeric, 2)   AS min_price,
+                    ROUND(overall_max::numeric, 2)   AS max_price,
+                    price_events,
+                    total_qty
+                FROM first_last
+                ORDER BY ABS(last_price - first_price) DESC, total_qty DESC
+                LIMIT 100
+            """, params)
+            items_raw = _rows_to_dicts(cur)
+
+            items_summary = []
+            for r in items_raw:
+                first = float(r["first_price"] or 0)
+                current = float(r["current_price"] or 0)
+                change_pct = round((current - first) / first * 100, 1) if first > 0 else 0
+                direction = "up" if change_pct > 1 else "down" if change_pct < -1 else "stable"
+                items_summary.append({
+                    "item":          r["item_name"],
+                    "first_price":   first,
+                    "current_price": current,
+                    "min_price":     float(r["min_price"] or 0),
+                    "max_price":     float(r["max_price"] or 0),
+                    "change_pct":    change_pct,
+                    "direction":     direction,
+                    "price_events":  int(r["price_events"] or 0),
+                    "total_qty":     int(r["total_qty"] or 0),
+                })
+
+            # Monthly price trend per item (for top 10 changed items)
+            changed_items = [r["item"] for r in items_summary if r["direction"] != "stable"][:10]
+            all_items_for_trend = changed_items if changed_items else [r["item"] for r in items_summary[:10]]
+
+            trend_data = {}
+            if all_items_for_trend:
+                cur.execute(f"""
+                    SELECT
+                        si.item_name,
+                        TO_CHAR(b.sales_date, 'YYYY-MM') AS month,
+                        ROUND(AVG(si.unit_price)::numeric, 2) AS avg_price
+                    FROM pos_sales_items si
+                    JOIN pos_bills b ON b.id = si.bill_id
+                    WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                      AND si.unit_price > 0
+                      AND si.item_name = ANY(%(items)s)
+                      {branch_filter}
+                    GROUP BY si.item_name, month
+                    ORDER BY si.item_name, month
+                """, {**params, "items": all_items_for_trend})
+                for r in _rows_to_dicts(cur):
+                    name = r["item_name"]
+                    if name not in trend_data:
+                        trend_data[name] = []
+                    trend_data[name].append({"month": r["month"], "price": float(r["avg_price"])})
+
+            # Overall stats
+            changed_up   = sum(1 for r in items_summary if r["direction"] == "up")
+            changed_down = sum(1 for r in items_summary if r["direction"] == "down")
+            stable_count = sum(1 for r in items_summary if r["direction"] == "stable")
+
+            return {
+                "items":        items_summary,
+                "trends":       trend_data,
+                "stats": {
+                    "total_items":   len(items_summary),
+                    "changed_up":    changed_up,
+                    "changed_down":  changed_down,
+                    "stable":        stable_count,
+                },
+                "period": {"start": str(start_date), "end": str(end_date), "months": months},
+            }
+    finally:
+        conn.close()
