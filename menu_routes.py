@@ -2350,3 +2350,164 @@ def pos_item_trend(
         }
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 53 — Bill Size Analysis  GET /pos/bill-analysis
+# Avg check, histogram buckets, DOW avg, order-type avg, monthly trend
+# ---------------------------------------------------------------------------
+@router.get("/pos/bill-analysis")
+def pos_bill_analysis(
+    months: int = Query(3, ge=1, le=24),
+    branch: str = Query(""),
+):
+    conn = get_db_conn()
+    try:
+        end   = date.today()
+        start = (end.replace(day=1) - relativedelta(months=months - 1))
+
+        branch_filter = "AND branch_code = %(branch)s" if branch else ""
+        params: dict  = {"start": start, "end": end}
+        if branch:
+            params["branch"] = branch
+
+        # Overall KPIs
+        kpi_sql = f"""
+            SELECT
+                COUNT(*)::int                        AS total_bills,
+                AVG(net_total)::numeric              AS avg_bill,
+                MIN(net_total)::numeric              AS min_bill,
+                MAX(net_total)::numeric              AS max_bill,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY net_total)::numeric AS median_bill,
+                SUM(net_total)::numeric              AS total_revenue
+            FROM pos_bills
+            WHERE sales_date BETWEEN %(start)s AND %(end)s
+              AND net_total > 0
+              {branch_filter}
+        """
+
+        # Histogram — 10 buckets (0-99, 100-199, ..., 900+)
+        hist_sql = f"""
+            SELECT
+                FLOOR(net_total / 100) * 100 AS bucket_start,
+                COUNT(*)::int                AS bill_count
+            FROM pos_bills
+            WHERE sales_date BETWEEN %(start)s AND %(end)s
+              AND net_total >= 0 AND net_total < 10000
+              {branch_filter}
+            GROUP BY bucket_start
+            ORDER BY bucket_start
+        """
+
+        # DOW avg
+        dow_sql = f"""
+            SELECT
+                EXTRACT(DOW FROM sales_date)::int AS dow,
+                AVG(net_total)::numeric           AS avg_bill,
+                COUNT(*)::int                     AS bill_count
+            FROM pos_bills
+            WHERE sales_date BETWEEN %(start)s AND %(end)s
+              AND net_total > 0
+              {branch_filter}
+            GROUP BY dow
+            ORDER BY dow
+        """
+
+        # Order type avg
+        otype_sql = f"""
+            SELECT
+                COALESCE(NULLIF(TRIM(order_type), ''), 'ไม่ระบุ') AS order_type,
+                AVG(net_total)::numeric  AS avg_bill,
+                COUNT(*)::int            AS bill_count,
+                SUM(net_total)::numeric  AS total_revenue
+            FROM pos_bills
+            WHERE sales_date BETWEEN %(start)s AND %(end)s
+              AND net_total > 0
+              {branch_filter}
+            GROUP BY order_type
+            ORDER BY total_revenue DESC
+        """
+
+        # Monthly trend — avg + bill_count
+        trend_sql = f"""
+            SELECT
+                TO_CHAR(DATE_TRUNC('month', sales_date), 'YYYY-MM') AS month,
+                AVG(net_total)::numeric  AS avg_bill,
+                COUNT(*)::int            AS bill_count,
+                SUM(net_total)::numeric  AS total_revenue
+            FROM pos_bills
+            WHERE sales_date BETWEEN %(start)s AND %(end)s
+              AND net_total > 0
+              {branch_filter}
+            GROUP BY month
+            ORDER BY month
+        """
+
+        with conn.cursor() as cur:
+            cur.execute(kpi_sql,   params); kpi_rows   = _rows_to_dicts(cur)
+            cur.execute(hist_sql,  params); hist_rows  = _rows_to_dicts(cur)
+            cur.execute(dow_sql,   params); dow_rows   = _rows_to_dicts(cur)
+            cur.execute(otype_sql, params); otype_rows = _rows_to_dicts(cur)
+            cur.execute(trend_sql, params); trend_rows = _rows_to_dicts(cur)
+
+        kpi = kpi_rows[0] if kpi_rows else {}
+
+        # Fill histogram with zero buckets for readability (0–1900)
+        hist_map = {int(r["bucket_start"]): int(r["bill_count"]) for r in hist_rows}
+        max_bucket = max(hist_map.keys(), default=0)
+        histogram = []
+        b = 0
+        while b <= max(max_bucket, 900):
+            histogram.append({
+                "label":      f"{b}–{b+99}",
+                "bucket":     b,
+                "bill_count": hist_map.get(b, 0),
+            })
+            b += 100
+
+        dow_list = [
+            {
+                "dow":        int(r["dow"]),
+                "avg_bill":   round(float(r["avg_bill"] or 0), 2),
+                "bill_count": int(r["bill_count"] or 0),
+            }
+            for r in dow_rows
+        ]
+
+        otype_list = [
+            {
+                "order_type":    r["order_type"],
+                "avg_bill":      round(float(r["avg_bill"] or 0), 2),
+                "bill_count":    int(r["bill_count"] or 0),
+                "total_revenue": round(float(r["total_revenue"] or 0), 2),
+            }
+            for r in otype_rows
+        ]
+
+        trend_list = [
+            {
+                "month":         r["month"],
+                "avg_bill":      round(float(r["avg_bill"] or 0), 2),
+                "bill_count":    int(r["bill_count"] or 0),
+                "total_revenue": round(float(r["total_revenue"] or 0), 2),
+            }
+            for r in trend_rows
+        ]
+
+        return {
+            "kpi": {
+                "total_bills":   int(kpi.get("total_bills") or 0),
+                "avg_bill":      round(float(kpi.get("avg_bill") or 0), 2),
+                "median_bill":   round(float(kpi.get("median_bill") or 0), 2),
+                "min_bill":      round(float(kpi.get("min_bill") or 0), 2),
+                "max_bill":      round(float(kpi.get("max_bill") or 0), 2),
+                "total_revenue": round(float(kpi.get("total_revenue") or 0), 2),
+            },
+            "histogram":  histogram,
+            "dow_avg":    dow_list,
+            "order_types": otype_list,
+            "trend":      trend_list,
+            "period":     {"months": months, "start": str(start), "end": str(end)},
+        }
+    finally:
+        conn.close()
