@@ -273,7 +273,9 @@ def _summarize_month(cur, period_month: date, branch_code: str) -> dict:
     expense_bill_count = int(row[3] or 0)
 
     gross_profit = sales_net - expense_total
-    margin_pct = round(gross_profit / sales_net * 100, 2) if sales_net else None
+    # Session 15 fix: return 0.0 instead of None when sales_net = 0
+    # — prevents frontend "NaN%" display bug (was: margin_pct = None)
+    margin_pct = round(gross_profit / sales_net * 100, 2) if sales_net else 0.0
     return {
         "sales_net": sales_net,
         "sales_bill_count": sales_bill_count,

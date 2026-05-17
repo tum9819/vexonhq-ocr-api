@@ -34,7 +34,7 @@ from typing import Optional
 
 import psycopg2
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
 from budget_routes import run_budget_alert_check as _budget_alert_check
 
 log = logging.getLogger("vexonhq-line")
@@ -1035,21 +1035,204 @@ def _format_search_for_line(query: str, count: int, total_income: float,
 
 # ─────────────────────────────────────────────
 # Webhook — main handler
+#
+# Session 15 Fix (2026-05-17):
+#   - LINE webhook ต้อง return 200 ภายใน ~1-2 วินาที
+#   - reply_token หมดอายุใน 30 วินาที
+#   - Claude API / GPT Vision ใช้เวลา 10-30s → ทำใน sync handler ไม่ทัน
+#   → ใช้ BackgroundTasks: parse + verify ทันที, return 200, process หลังบ้าน
+#   → ถ้า processing >25s ใช้ _push_text แทน _reply_line ป้องกัน token expired
 # ─────────────────────────────────────────────
+
+def _process_one_event(event: dict) -> None:
+    """Handle a single LINE event in the background (called after webhook returned 200)."""
+    if event.get("type") != "message":
+        return
+
+    msg = event.get("message", {})
+    msg_type = msg.get("type")
+    reply_token = event.get("replyToken", "")
+    if not reply_token:
+        return
+
+    # ────────────────────────────────────────
+    # 📷 IMAGE MESSAGE — Phase 13 OCR Bot
+    # ────────────────────────────────────────
+    if msg_type == "image":
+        message_id = msg.get("id", "")
+        log.info("LINE webhook image: message_id=%s", message_id)
+
+        try:
+            # 1. Acknowledge IMMEDIATELY (reply_token expires in 30s)
+            _reply_line(reply_token, "⏳ กำลัง OCR ใบกำกับ... รอสักครู่นะครับ")
+
+            # 2. Download image from LINE
+            image_bytes = _download_line_image(message_id)
+
+            # 3. OCR via GPT Vision (slow — 10-30s)
+            parsed = _ocr_invoice_image(image_bytes)
+
+            # 4. Save to vendor_bills
+            invoice_id = _save_invoice_from_line(parsed, image_bytes)
+
+            # 5. Push result (reply_token already used above; use push)
+            reply = _format_ocr_reply(parsed, invoice_id)
+            _push_text(reply)
+
+        except Exception as e:
+            log.error("LINE OCR flow failed: %s", e)
+            try:
+                _push_text(f"❌ OCR ล้มเหลว กรุณาลองใหม่\n({str(e)[:80]})")
+            except Exception:
+                pass
+        return
+
+    # ────────────────────────────────────────
+    # 💬 TEXT MESSAGE
+    # ────────────────────────────────────────
+    if msg_type != "text":
+        return
+
+    text = msg.get("text", "").strip()
+    if not text:
+        return
+
+    log.info("LINE webhook text: %r", text)
+
+    # Help
+    if text.lower() in ("help", "ช่วยเหลือ", "?", "วิธีใช้"):
+        try:
+            _reply_line(reply_token,
+                "🤖 VEXONHQ LINE Bot\n"
+                "─────────────────────────\n"
+                "📷 ส่งรูปใบกำกับ/บิล → OCR อัตโนมัติ\n\n"
+                "💬 บันทึกค่าใช้จ่ายด่วน:\n"
+                "  ค่าน้ำมัน 450\n"
+                "  ค่าแก๊ส 350 บาท\n"
+                "  ซื้อผัก 200\n\n"
+                "📦 เช็ค stock / วัตถุดิบ:\n"
+                "  เช็ค stock\n"
+                "  สต็อกเหลือเท่าไร\n"
+                "  มีของไหม\n\n"
+                "🔍 ค้นหาข้อมูล:\n"
+                "  เงินเดือนเดือนเมษา\n"
+                "  เบียร์ช้าง / เบียร์สิงห์\n"
+                "  วันไหนขายดีสุดเดือนเมษา\n"
+                "  รายรับ Grab เดือนเมษา\n"
+                "  ค่าเช่าเดือนนี้\n"
+                "  บิล Makro ทั้งหมด\n"
+                "  รายจ่ายเกิน 5000 บาท"
+            )
+        except Exception as e:
+            log.error("Help reply failed: %s", e)
+        return
+
+    # Quick expense entry — fast (< 1s)
+    quick = _parse_quick_expense(text)
+    if quick:
+        try:
+            entry_id = _save_quick_expense(quick["description"], quick["amount"])
+            amt_str = f"฿{quick['amount']:,.0f}"
+            _reply_line(reply_token,
+                f"✅ บันทึกรายจ่ายแล้ว!\n"
+                f"─────────────────────────\n"
+                f"📝 {quick['description']}: {amt_str}\n"
+                f"📅 {date.today().strftime('%d/%m/%Y')}\n"
+                f"🔑 ID: {entry_id[:8]}..."
+            )
+        except Exception as e:
+            log.error("Quick expense save failed: %s", e)
+            try:
+                _reply_line(reply_token, f"❌ บันทึกไม่สำเร็จ: {str(e)[:80]}")
+            except Exception:
+                _push_text(f"❌ บันทึกไม่สำเร็จ: {str(e)[:80]}")
+        return
+
+    # ── Intent classification (Phase 27 + 31) ──
+    intent = _classify_intent(text)
+    log.info("LINE intent: %r → %s", text, intent)
+
+    # Fast intents (DB query only) — use reply_line
+    if intent in ("stock_summary", "stock_product", "stock_category", "recipe_cost"):
+        try:
+            if intent == "stock_summary":
+                reply_text = _handle_stock_summary()
+            elif intent == "stock_product":
+                reply_text = _handle_stock_product(text)
+            elif intent == "stock_category":
+                reply_text = _handle_stock_category(text)
+            else:
+                reply_text = _handle_recipe_cost(text)
+            _reply_line(reply_token, reply_text)
+        except Exception as e:
+            log.error("Fast intent handler failed (%s): %s", intent, e)
+            try:
+                _push_text(f"❌ เกิดข้อผิดพลาด: {str(e)[:80]}")
+            except Exception:
+                pass
+        return
+
+    # Slow intents (AI call) — ack with reply_line, push result later
+    if intent == "recipe_suggest":
+        try:
+            _reply_line(reply_token, "🍳 กำลังคิดเมนูให้... รอสักครู่นะครับ")
+            reply_text = _handle_recipe_suggest()
+            _push_text(reply_text)
+        except Exception as e:
+            log.error("recipe_suggest failed: %s", e)
+            try:
+                _push_text(f"❌ เกิดข้อผิดพลาด: {str(e)[:80]}")
+            except Exception:
+                pass
+        return
+
+    # intent == "financial" or "other" → AI Search (Phase 11) — also slow
+    try:
+        _reply_line(reply_token, "🔍 กำลังค้นหา... รอสักครู่นะครับ")
+        from phase11_search_routes import _call_claude_filter, _build_and_run_query
+        search_filter = _call_claude_filter(text)
+        results = _build_and_run_query(search_filter, 20)
+        total_income  = sum(r["amount"] for r in results if r["direction"] == "income")
+        total_expense = sum(r["amount"] for r in results if r["direction"] == "expense")
+        reply = _format_search_for_line(text, len(results), total_income, total_expense, results)
+        _push_text(reply)
+    except Exception as e:
+        log.error("Search for LINE failed: %s", e)
+        try:
+            _push_text(f"❌ เกิดข้อผิดพลาด กรุณาลองใหม่\n({str(e)[:80]})")
+        except Exception:
+            pass
+
+
+def _process_line_events(data: dict) -> None:
+    """Process all events in a webhook payload (called in BackgroundTask)."""
+    for event in data.get("events", []):
+        try:
+            _process_one_event(event)
+        except Exception as e:
+            log.error("LINE event handler crashed: %s", e)
+
 
 @router.post("/webhook")
 async def line_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     x_line_signature: str = Header(None, alias="x-line-signature"),
 ):
     """
     LINE Messaging API webhook
 
-    Routes:
+    Returns 200 immediately and processes events in the background.
+    This is REQUIRED because LINE expects acknowledgement within ~1-2s
+    and reply_token expires after 30s — synchronous handlers that call
+    Claude/GPT (10-30s) would miss both deadlines.
+
+    Routes (processed in background):
       📷 image message  → OCR (GPT Vision) → vendor_bills
       💬 text message:
           - "ค่าXXX 999"  → quick expense → manual_entries
           - "help"        → usage help
+          - stock query   → stock_routes
           - anything else → AI Search (Phase 11)
 
     ตั้งค่า Webhook URL ใน LINE Developers Console:
@@ -1061,135 +1244,12 @@ async def line_webhook(
         log.warning("LINE webhook: invalid signature")
         return {"status": "invalid signature"}
 
-    data = json.loads(body)
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as e:
+        log.error("LINE webhook: invalid JSON body: %s", e)
+        return {"status": "invalid body"}
 
-    for event in data.get("events", []):
-        if event.get("type") != "message":
-            continue
-
-        msg = event.get("message", {})
-        msg_type = msg.get("type")
-        reply_token = event.get("replyToken", "")
-        if not reply_token:
-            continue
-
-        # ────────────────────────────────────────
-        # 📷 IMAGE MESSAGE — Phase 13 OCR Bot
-        # ────────────────────────────────────────
-        if msg_type == "image":
-            message_id = msg.get("id", "")
-            log.info("LINE webhook image: message_id=%s", message_id)
-
-            try:
-                # 1. Download image from LINE
-                image_bytes = _download_line_image(message_id)
-
-                # 2. OCR via GPT Vision
-                _reply_line(reply_token, "⏳ กำลัง OCR ใบกำกับ... รอสักครู่นะครับ")
-                parsed = _ocr_invoice_image(image_bytes)
-
-                # 3. Save to vendor_bills
-                invoice_id = _save_invoice_from_line(parsed, image_bytes)
-
-                # 4. Reply result
-                reply = _format_ocr_reply(parsed, invoice_id)
-                _push_text(reply)
-
-            except Exception as e:
-                log.error("LINE OCR flow failed: %s", e)
-                _push_text(f"❌ OCR ล้มเหลว กรุณาลองใหม่\n({str(e)[:80]})")
-
-        # ────────────────────────────────────────
-        # 💬 TEXT MESSAGE
-        # ────────────────────────────────────────
-        elif msg_type == "text":
-            text = msg.get("text", "").strip()
-            if not text:
-                continue
-
-            log.info("LINE webhook text: %r", text)
-
-            # Help
-            if text.lower() in ("help", "ช่วยเหลือ", "?", "วิธีใช้"):
-                _reply_line(reply_token,
-                    "🤖 VEXONHQ LINE Bot\n"
-                    "─────────────────────────\n"
-                    "📷 ส่งรูปใบกำกับ/บิล → OCR อัตโนมัติ\n\n"
-                    "💬 บันทึกค่าใช้จ่ายด่วน:\n"
-                    "  ค่าน้ำมัน 450\n"
-                    "  ค่าแก๊ส 350 บาท\n"
-                    "  ซื้อผัก 200\n\n"
-                    "📦 เช็ค stock / วัตถุดิบ:\n"
-                    "  เช็ค stock\n"
-                    "  สต็อกเหลือเท่าไร\n"
-                    "  มีของไหม\n\n"
-                    "🔍 ค้นหาข้อมูล:\n"
-                    "  เงินเดือนเดือนเมษา\n"
-                    "  เบียร์ช้าง / เบียร์สิงห์\n"
-                    "  วันไหนขายดีสุดเดือนเมษา\n"
-                    "  รายรับ Grab เดือนเมษา\n"
-                    "  ค่าเช่าเดือนนี้\n"
-                    "  บิล Makro ทั้งหมด\n"
-                    "  รายจ่ายเกิน 5000 บาท"
-                )
-                continue
-
-            # Quick expense entry
-            quick = _parse_quick_expense(text)
-            if quick:
-                try:
-                    entry_id = _save_quick_expense(quick["description"], quick["amount"])
-                    amt_str = f"฿{quick['amount']:,.0f}"
-                    _reply_line(reply_token,
-                        f"✅ บันทึกรายจ่ายแล้ว!\n"
-                        f"─────────────────────────\n"
-                        f"📝 {quick['description']}: {amt_str}\n"
-                        f"📅 {date.today().strftime('%d/%m/%Y')}\n"
-                        f"🔑 ID: {entry_id[:8]}..."
-                    )
-                except Exception as e:
-                    log.error("Quick expense save failed: %s", e)
-                    _reply_line(reply_token, f"❌ บันทึกไม่สำเร็จ: {str(e)[:80]}")
-                continue
-
-            # ── Intent classification (Phase 27 + 31) ──
-            intent = _classify_intent(text)
-            log.info("LINE intent: %r → %s", text, intent)
-
-            if intent == "stock_summary":
-                _reply_line(reply_token, _handle_stock_summary())
-                continue
-
-            if intent == "stock_product":
-                _reply_line(reply_token, _handle_stock_product(text))
-                continue
-
-            if intent == "stock_category":  # [Bug1-fix]
-                _reply_line(reply_token, _handle_stock_category(text))
-                continue
-
-            if intent == "recipe_suggest":
-                _reply_line(reply_token, _handle_recipe_suggest())
-                continue
-
-            if intent == "recipe_cost":
-                _reply_line(reply_token, _handle_recipe_cost(text))
-                continue
-
-            # intent == "financial" or "other" → AI Search (Phase 11)
-            try:
-                from phase11_search_routes import _call_claude_filter, _build_and_run_query
-                search_filter = _call_claude_filter(text)
-                results = _build_and_run_query(search_filter, 20)
-                total_income  = sum(r["amount"] for r in results if r["direction"] == "income")
-                total_expense = sum(r["amount"] for r in results if r["direction"] == "expense")
-                reply = _format_search_for_line(text, len(results), total_income, total_expense, results)
-            except Exception as e:
-                log.error("Search for LINE failed: %s", e)
-                reply = f"❌ เกิดข้อผิดพลาด กรุณาลองใหม่\n({str(e)[:80]})"
-
-            _reply_line(reply_token, reply)
-
+    # Schedule processing in background. We return 200 to LINE immediately.
+    background_tasks.add_task(_process_line_events, data)
     return {"status": "ok"}
-
-
