@@ -3345,3 +3345,158 @@ def pos_discounts(months: int = Query(3), branch: str = Query("")):
         }
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 60 — 7-Day Revenue Forecast
+# GET /pos/predict?weeks=8&branch=
+# ---------------------------------------------------------------------------
+@router.get("/pos/predict")
+def pos_predict(weeks: int = Query(8), branch: str = Query("")):
+    """
+    Forecast next 7 days using DOW averages from last N weeks.
+    Also shows last-30-day actuals for context.
+    """
+    from datetime import date as date_type, timedelta
+    import math
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            today      = date_type.today()
+            train_start = today - timedelta(weeks=weeks)
+            branch_filter = "AND branch_code = %(branch)s" if branch else ""
+            params = {"branch": branch, "train_start": train_start, "today": today}
+
+            # DOW averages from training window (0=Mon ... 6=Sun in Python)
+            cur.execute(f"""
+                SELECT
+                    EXTRACT(DOW FROM sales_date)::int  AS dow,   -- 0=Sun..6=Sat (postgres)
+                    COUNT(DISTINCT sales_date)          AS day_count,
+                    COALESCE(SUM(net_total), 0)         AS total_rev,
+                    COALESCE(AVG(net_total), 0)         AS avg_daily_rev,
+                    COALESCE(STDDEV(net_total), 0)      AS std_dev,
+                    COUNT(*)                            AS total_bills,
+                    COALESCE(AVG(COUNT(*)) OVER(), 0)   AS overall_avg_bills
+                FROM (
+                    SELECT sales_date,
+                           SUM(net_total)  AS net_total,
+                           COUNT(*)        AS bills
+                    FROM pos_bills
+                    WHERE sales_date BETWEEN %(train_start)s AND %(today)s
+                    {branch_filter}
+                    GROUP BY sales_date
+                ) daily
+                GROUP BY dow
+                ORDER BY dow
+            """, params)
+            dow_rows = _rows_to_dicts(cur)
+
+            # Build DOW lookup {0..6 postgres -> avg_rev, std, bills}
+            DOW_NAMES_TH = {0: 'อาทิตย์', 1: 'จันทร์', 2: 'อังคาร', 3: 'พุธ',
+                            4: 'พฤหัสบดี', 5: 'ศุกร์', 6: 'เสาร์'}
+            dow_map = {}
+            for r in dow_rows:
+                d = int(r["dow"])
+                avg = float(r["avg_daily_rev"] or 0)
+                std = float(r["std_dev"] or 0)
+                dow_map[d] = {
+                    "avg": round(avg, 2),
+                    "std": round(std, 2),
+                    "day_count": int(r["day_count"]),
+                    "avg_bills": round(float(r["total_bills"]) / max(int(r["day_count"]), 1), 1),
+                    "confidence": max(0, round(100 - (std / avg * 100) if avg > 0 else 0, 0)),
+                }
+
+            # Overall trend slope (linear regression on last 8 weeks daily revenue)
+            cur.execute(f"""
+                SELECT
+                    sales_date,
+                    SUM(net_total) AS daily_rev
+                FROM pos_bills
+                WHERE sales_date BETWEEN %(train_start)s AND %(today)s
+                {branch_filter}
+                GROUP BY sales_date
+                ORDER BY sales_date
+            """, params)
+            daily_rows = _rows_to_dicts(cur)
+
+            # Simple linear regression for trend
+            n = len(daily_rows)
+            slope = 0.0
+            if n >= 7:
+                xs = list(range(n))
+                ys = [float(r["daily_rev"]) for r in daily_rows]
+                mean_x = sum(xs) / n
+                mean_y = sum(ys) / n
+                num = sum((xs[i] - mean_x) * (ys[i] - mean_y) for i in range(n))
+                den = sum((xs[i] - mean_x) ** 2 for i in range(n))
+                slope = num / den if den else 0
+
+            # Build 7-day forecast
+            forecast = []
+            for i in range(1, 8):
+                fdate = today + timedelta(days=i)
+                pg_dow = fdate.weekday() % 7  # Python: 0=Mon; Postgres DOW: 0=Sun
+                # Convert: Python weekday 0=Mon,6=Sun → Postgres DOW 0=Sun,1=Mon..6=Sat
+                pg_dow_conv = (fdate.weekday() + 1) % 7  # 0=Sun..6=Sat
+                info = dow_map.get(pg_dow_conv, {"avg": 0, "std": 0, "day_count": 0, "avg_bills": 0, "confidence": 0})
+                trend_adj = slope * (n + i)  # project trend forward
+                base = info["avg"]
+                predicted = max(0, base + trend_adj * 0.3)  # dampen trend
+                low  = max(0, predicted - info["std"])
+                high = predicted + info["std"]
+                forecast.append({
+                    "date":       str(fdate),
+                    "dow_name":   DOW_NAMES_TH[pg_dow_conv],
+                    "weekday":    fdate.strftime('%a'),
+                    "predicted":  round(predicted, 2),
+                    "low":        round(low, 2),
+                    "high":       round(high, 2),
+                    "avg_bills":  info["avg_bills"],
+                    "confidence": info["confidence"],
+                    "day_count":  info["day_count"],
+                })
+
+            # Last 30 actuals for chart context
+            actuals_start = today - timedelta(days=29)
+            cur.execute(f"""
+                SELECT
+                    sales_date,
+                    SUM(net_total) AS revenue,
+                    COUNT(*)       AS bills
+                FROM pos_bills
+                WHERE sales_date BETWEEN %(as)s AND %(today)s
+                {branch_filter}
+                GROUP BY sales_date
+                ORDER BY sales_date
+            """, {**params, "as": actuals_start})
+            actuals = [
+                {"date": str(r["sales_date"]), "revenue": round(float(r["revenue"]), 2),
+                 "bills": int(r["bills"])}
+                for r in _rows_to_dicts(cur)
+            ]
+
+            # DOW summary for display
+            dow_summary = []
+            for pg_dow in range(7):
+                info = dow_map.get(pg_dow, {"avg": 0, "std": 0, "day_count": 0, "avg_bills": 0, "confidence": 0})
+                dow_summary.append({
+                    "dow":      pg_dow,
+                    "name":     DOW_NAMES_TH[pg_dow],
+                    **info,
+                })
+
+            return {
+                "forecast":    forecast,
+                "actuals":     actuals,
+                "dow_summary": dow_summary,
+                "meta": {
+                    "train_weeks": weeks,
+                    "train_days":  n,
+                    "slope_per_day": round(slope, 2),
+                    "today": str(today),
+                },
+            }
+    finally:
+        conn.close()
