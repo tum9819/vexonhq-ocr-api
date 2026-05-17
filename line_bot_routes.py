@@ -689,16 +689,39 @@ _FINANCIAL_OVERRIDE_KEYWORDS = (
 )
 
 # [Bug2-hint] แผนที่ชื่อสินค้า → ชื่อผู้รับในบัญชีธนาคาร
-# ใช้แสดง hint เมื่อค้นหาด้วยชื่อสินค้าแล้วไม่เจอ
-_VENDOR_HINT_MAP: dict[str, str] = {
-    "เบียร์ช้าง": "วัฒนา",
-    "เบียร์ข้าง": "วัฒนา",
-    "ช้าง": "วัฒนา",
-    "ค่าเช่า": "กาญจนา",
-    "เงินเดือน": "มยุรฉัตร",
-    "เงินคืน": "นุศรา",
-    "นักดนตรี": "600 หรือ 700 หรือ 2100 หรือ 2800",
-}
+# โหลดจาก Supabase (ตาราง vendor_aliases) พร้อม cache 5 นาที
+# แก้ได้ผ่าน Supabase Table Editor โดยไม่ต้อง redeploy
+_vendor_hint_cache: dict[str, str] = {}
+_vendor_hint_loaded_at: float = 0.0
+_VENDOR_HINT_TTL: float = 300.0   # 5 นาที
+
+
+def _load_vendor_hints() -> dict[str, str]:
+    """Load vendor_aliases from DB; return cached copy if fresh."""
+    import time as _time
+    global _vendor_hint_cache, _vendor_hint_loaded_at
+
+    if _time.monotonic() - _vendor_hint_loaded_at < _VENDOR_HINT_TTL:
+        return _vendor_hint_cache
+
+    try:
+        conn = _get_db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT product_keyword, vendor_name "
+                "FROM public.vendor_aliases "
+                "WHERE is_active = true "
+                "ORDER BY length(product_keyword) DESC"   # longer match first
+            )
+            rows = cur.fetchall()
+        conn.close()
+        _vendor_hint_cache = {r[0]: r[1] for r in rows}
+        _vendor_hint_loaded_at = _time.monotonic()
+        log.debug("vendor_aliases reloaded: %d entries", len(_vendor_hint_cache))
+    except Exception as e:
+        log.warning("vendor_aliases load failed (using cache): %s", e)
+
+    return _vendor_hint_cache
 
 # คำที่บ่งบอกว่าต้องการให้ AI แนะนำเมนู
 _RECIPE_SUGGEST_KEYWORDS = (
@@ -970,7 +993,7 @@ def _format_search_for_line(query: str, count: int, total_income: float,
         # [Bug2-fix] suggest vendor alias when user searched by product name
         q_lower = query.lower()
         hint_lines = []
-        for product, vendor in _VENDOR_HINT_MAP.items():
+        for product, vendor in _load_vendor_hints().items():
             if product in q_lower:
                 hint_lines.append(f"  '{product}' บันทึกในบัญชีว่า '{vendor}'")
         hint = ""
