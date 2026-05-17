@@ -2183,3 +2183,170 @@ def pos_heatmap(
         }
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 52 — Item Sales Trend  GET /pos/items
+# Per-menu-item: revenue, qty, avg_price, MoM delta, 6-month sparkline
+# ---------------------------------------------------------------------------
+@router.get("/pos/items")
+def pos_item_trend(
+    months:   int   = Query(6,  ge=1, le=24),
+    branch:   str   = Query(""),
+    category: str   = Query(""),
+    limit:    int   = Query(50, ge=1, le=200),
+):
+    conn = get_db_conn()
+    try:
+        end        = date.today()
+        start      = (end.replace(day=1) - relativedelta(months=months - 1))
+        # previous period (same length) for MoM comparison
+        prev_end   = start - timedelta(days=1)
+        prev_start = (prev_end.replace(day=1) - relativedelta(months=months - 1))
+
+        branch_filter   = "AND b.branch_code = %(branch)s"   if branch   else ""
+        category_filter = "AND si.category   = %(category)s" if category else ""
+
+        params: dict = {"start": start, "end": end, "prev_start": prev_start, "prev_end": prev_end, "limit": limit}
+        if branch:   params["branch"]   = branch
+        if category: params["category"] = category
+
+        # Current-period aggregates per item
+        cur_sql = f"""
+            SELECT
+                si.item_name,
+                si.category,
+                SUM(si.qty)::numeric           AS total_qty,
+                SUM(si.net_amount)::numeric    AS total_revenue,
+                AVG(si.unit_price)::numeric    AS avg_price,
+                COUNT(DISTINCT si.bill_id)::int AS bill_count
+            FROM pos_sales_items si
+            JOIN pos_bills b ON b.id = si.bill_id
+            WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+              {branch_filter}
+              {category_filter}
+            GROUP BY si.item_name, si.category
+            ORDER BY total_revenue DESC
+            LIMIT %(limit)s
+        """
+
+        # Previous-period totals (same items only)
+        prev_sql = f"""
+            SELECT
+                si.item_name,
+                SUM(si.net_amount)::numeric AS prev_revenue,
+                SUM(si.qty)::numeric        AS prev_qty
+            FROM pos_sales_items si
+            JOIN pos_bills b ON b.id = si.bill_id
+            WHERE b.sales_date BETWEEN %(prev_start)s AND %(prev_end)s
+              {branch_filter}
+              {category_filter}
+            GROUP BY si.item_name
+        """
+
+        # Monthly sparkline: last 6 months per item (top 50 only — joined after)
+        sparkline_sql = f"""
+            SELECT
+                si.item_name,
+                TO_CHAR(DATE_TRUNC('month', b.sales_date), 'YYYY-MM') AS month,
+                SUM(si.net_amount)::numeric AS revenue
+            FROM pos_sales_items si
+            JOIN pos_bills b ON b.id = si.bill_id
+            WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+              {branch_filter}
+              {category_filter}
+            GROUP BY si.item_name, month
+        """
+
+        # Categories list
+        cat_sql = f"""
+            SELECT DISTINCT si.category
+            FROM pos_sales_items si
+            JOIN pos_bills b ON b.id = si.bill_id
+            WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+              {branch_filter}
+            ORDER BY si.category
+        """
+
+        with conn.cursor() as cur:
+            cur.execute(cur_sql, params)
+            cur_rows = _rows_to_dicts(cur)
+
+            cur.execute(prev_sql, params)
+            prev_rows = _rows_to_dicts(cur)
+
+            cur.execute(sparkline_sql, params)
+            spark_rows = _rows_to_dicts(cur)
+
+            cur.execute(cat_sql, params)
+            cat_rows = _rows_to_dicts(cur)
+
+        # Build prev lookup
+        prev_map: dict = {r["item_name"]: r for r in prev_rows}
+
+        # Build sparkline lookup: item → {month: revenue}
+        spark_map: dict = {}
+        for r in spark_rows:
+            spark_map.setdefault(r["item_name"], {})[r["month"]] = float(r["revenue"] or 0)
+
+        # Build month list (last N months in order)
+        month_labels = []
+        cur_m = start.replace(day=1)
+        while cur_m <= end.replace(day=1):
+            month_labels.append(cur_m.strftime("%Y-%m"))
+            cur_m = (cur_m + relativedelta(months=1)).replace(day=1)
+
+        # Assemble items
+        items = []
+        total_rev = sum(float(r["total_revenue"] or 0) for r in cur_rows)
+        for r in cur_rows:
+            name      = r["item_name"]
+            cur_rev   = float(r["total_revenue"] or 0)
+            prev_rev  = float(prev_map.get(name, {}).get("prev_revenue") or 0)
+            cur_qty   = float(r["total_qty"] or 0)
+            prev_qty  = float(prev_map.get(name, {}).get("prev_qty") or 0)
+
+            if prev_rev > 0:
+                mom_delta = round((cur_rev - prev_rev) / prev_rev * 100, 1)
+            else:
+                mom_delta = None  # new item
+
+            if mom_delta is None:
+                trend = "new"
+            elif mom_delta >= 5:
+                trend = "up"
+            elif mom_delta <= -5:
+                trend = "down"
+            else:
+                trend = "stable"
+
+            sparkline = [
+                {"month": m, "revenue": round(spark_map.get(name, {}).get(m, 0), 2)}
+                for m in month_labels
+            ]
+
+            items.append({
+                "item_name":    name,
+                "category":     r["category"],
+                "total_qty":    round(cur_qty, 1),
+                "total_revenue": round(cur_rev, 2),
+                "avg_price":    round(float(r["avg_price"] or 0), 2),
+                "bill_count":   int(r["bill_count"] or 0),
+                "revenue_pct":  round(cur_rev / total_rev * 100, 2) if total_rev else 0,
+                "prev_revenue": round(prev_rev, 2),
+                "mom_delta":    mom_delta,
+                "trend":        trend,
+                "sparkline":    sparkline,
+            })
+
+        categories = [r["category"] for r in cat_rows if r["category"]]
+
+        return {
+            "items":        items,
+            "categories":   categories,
+            "month_labels": month_labels,
+            "total_revenue": round(total_rev, 2),
+            "period":       {"months": months, "start": str(start), "end": str(end)},
+        }
+    finally:
+        conn.close()
