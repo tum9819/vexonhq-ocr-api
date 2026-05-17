@@ -807,9 +807,10 @@ def _handle_stock_summary() -> str:
 # whose name contains common drink keywords (เบียร์, น้ำ, โซดา, ...).
 _CATEGORY_NAME_FALLBACK: dict[str, list[str]] = {
     "เครื่องดื่ม": ["เบียร์", "โซดา", "น้ำดื่ม", "น้ำเปล่า", "น้ำแร่",
-                    "เป๊ปซี่", "มิรินด้า", "วิสกี้", "โซจู", "แสงโสม",
-                    "หงษ์ทอง", "รีเจนซี่", "แกรนด์", "ไฮเนเกน", "อาซาฮี",
-                    "ลีโอ", "สิงห์", "ช้าง", "เฟดเดอร์บราว"],
+                    "เป๊ปซี่", "เป็ปซี่", "มิรินด้า", "วิสกี้", "โซจู",
+                    "โซจูมีเฮ", "แสงโสม", "หงษ์ทอง", "รีเจนซี่", "แกรนด์",
+                    "ไฮเนเกน", "ไฮนาเกน", "อาซาฮี", "ลีโอ", "สิงห์",
+                    "ช้าง", "เฟดเดอร์บราว", "Federbrau", "(pro)"],
     "หม่าล่า":     ["ไส้กรอก", "หมูสามชั้น", "สันคอ", "เนื้อ", "ปีกไก่",
                     "หัวใจไก่", "เห็ด", "ปลาหมึก", "กุ้ง", "ปูอัด",
                     "เต้าหู้", "ลูกชิ้น"],
@@ -882,10 +883,24 @@ def _handle_stock_category(query: str) -> str:
         from stock_routes import _query_inventory, format_stock_for_line
         items, snapshot_at = _query_inventory(tag=tag, keyword=keyword, low_only=False)
 
-        # Session 15 fix: if tag filter returned 0 items, try name-keyword fallback
-        if not items and label and label in _CATEGORY_NAME_FALLBACK:
-            log.info("stock_category '%s' tag returned 0, falling back to name keywords", label)
-            items, snapshot_at = _query_inventory_by_keywords(_CATEGORY_NAME_FALLBACK[label])
+        # Session 15 fix v2: ALWAYS merge keyword-fallback results for known
+        # categories. The DB often has some items tagged "เครื่องดื่ม" and
+        # many more without that tag — we want both. Previously the fallback
+        # only fired if tag returned 0, so a single tagged item hid all the
+        # untagged drinks.
+        if label and label in _CATEGORY_NAME_FALLBACK:
+            log.info("stock_category '%s' merging keyword fallback (had %d tag items)",
+                     label, len(items))
+            fb_items, fb_snap = _query_inventory_by_keywords(_CATEGORY_NAME_FALLBACK[label])
+            if fb_snap:
+                snapshot_at = snapshot_at or fb_snap
+            seen = {it.get("item_name", "") for it in items if it.get("item_name")}
+            for it in fb_items:
+                name = it.get("item_name") or ""
+                if name and name not in seen:
+                    seen.add(name)
+                    items.append(it)
+            log.info("stock_category '%s' merged total: %d items", label, len(items))
 
         title = f"📦 Stock {label or tag or keyword or 'ทั้งหมด'}"
         if not items:
