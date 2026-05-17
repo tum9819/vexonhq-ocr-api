@@ -869,3 +869,209 @@ def get_table_stats(
         }
     finally:
         conn.close()
+
+
+# ─────────────────────────────────────────────────────────
+# GET /pos/overview
+# Phase 44 — POS Command Center (all KPIs in one call)
+# ─────────────────────────────────────────────────────────
+
+@router.get("/pos/overview")
+def get_pos_overview(
+    branch: str = Query(DEFAULT_BRANCH),
+):
+    """
+    Single-call POS command center:
+    - This month vs last month revenue
+    - Top/worst DOW
+    - Peak hour
+    - Top table + top staff
+    - Order type split (this month)
+    """
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            today      = date.today()
+            this_start = today.replace(day=1)
+            last_end   = this_start
+            last_start = (last_end - timedelta(days=1)).replace(day=1)
+            six_start  = (this_start - timedelta(days=1)).replace(day=1)
+            for _ in range(5):
+                six_start = (six_start - timedelta(days=1)).replace(day=1)
+
+            # ── 1. This month vs last month revenue ──────────────────────
+            cur.execute("""
+                SELECT
+                    SUM(CASE WHEN sales_date >= %s THEN bill_net ELSE 0 END) AS this_rev,
+                    COUNT(CASE WHEN sales_date >= %s THEN 1 END)             AS this_bills,
+                    SUM(CASE WHEN sales_date < %s AND sales_date >= %s THEN bill_net ELSE 0 END) AS last_rev,
+                    COUNT(CASE WHEN sales_date < %s AND sales_date >= %s THEN 1 END)             AS last_bills
+                FROM pos_bills
+                WHERE branch_code = %s
+                  AND sales_date  >= %s
+                  AND bill_net    >  0
+            """, (
+                this_start,
+                this_start,
+                this_start, last_start,
+                this_start, last_start,
+                branch, last_start,
+            ))
+            rev_row = _rows_to_dicts(cur)[0]
+
+            # ── 2. Best DOW (6-month) ────────────────────────────────────
+            cur.execute("""
+                SELECT
+                    EXTRACT(DOW FROM sales_date)::int AS dow,
+                    AVG(daily_total)                  AS avg_rev
+                FROM (
+                    SELECT sales_date, SUM(bill_net) AS daily_total
+                    FROM pos_bills
+                    WHERE branch_code = %s AND sales_date >= %s AND bill_net > 0
+                    GROUP BY sales_date
+                ) sub
+                GROUP BY dow
+                ORDER BY avg_rev DESC
+                LIMIT 1
+            """, (branch, six_start))
+            dow_rows = _rows_to_dicts(cur)
+
+            # ── 3. Peak hour (6-month) ───────────────────────────────────
+            cur.execute("""
+                SELECT
+                    EXTRACT(HOUR FROM sales_time)::int AS hr,
+                    SUM(bill_net)                      AS total_rev,
+                    COUNT(*)                           AS bill_count
+                FROM pos_bills
+                WHERE branch_code = %s AND sales_date >= %s
+                  AND bill_net > 0 AND sales_time IS NOT NULL
+                GROUP BY hr
+                ORDER BY total_rev DESC
+                LIMIT 1
+            """, (branch, six_start))
+            hour_rows = _rows_to_dicts(cur)
+
+            # ── 4. Top table (6-month) ───────────────────────────────────
+            cur.execute("""
+                SELECT TRIM(table_label) AS tbl, SUM(bill_net) AS total_rev, COUNT(*) AS bills
+                FROM pos_bills
+                WHERE branch_code = %s AND sales_date >= %s AND bill_net > 0
+                  AND table_label IS NOT NULL AND TRIM(table_label) <> ''
+                GROUP BY tbl ORDER BY total_rev DESC LIMIT 1
+            """, (branch, six_start))
+            table_rows = _rows_to_dicts(cur)
+
+            # ── 5. Top staff (6-month) ───────────────────────────────────
+            cur.execute("""
+                SELECT COALESCE(NULLIF(TRIM(opened_by),''),'ไม่ระบุ') AS staff,
+                       SUM(bill_net) AS total_rev, COUNT(*) AS bills
+                FROM pos_bills
+                WHERE branch_code = %s AND sales_date >= %s AND bill_net > 0
+                GROUP BY staff ORDER BY total_rev DESC LIMIT 1
+            """, (branch, six_start))
+            staff_rows = _rows_to_dicts(cur)
+
+            # ── 6. Order type split (this month) ────────────────────────
+            cur.execute("""
+                SELECT COALESCE(NULLIF(TRIM(order_type),''),'ไม่ระบุ') AS otype,
+                       SUM(bill_net) AS rev, COUNT(*) AS bills
+                FROM pos_bills
+                WHERE branch_code = %s AND sales_date >= %s AND bill_net > 0
+                GROUP BY otype ORDER BY rev DESC
+            """, (branch, this_start))
+            otype_rows = _rows_to_dicts(cur)
+
+            # ── 7. Daily revenue last 14 days (sparkline) ───────────────
+            cur.execute("""
+                SELECT sales_date, SUM(bill_net) AS daily_rev
+                FROM pos_bills
+                WHERE branch_code = %s
+                  AND sales_date >= %s AND sales_date < %s
+                  AND bill_net > 0
+                GROUP BY sales_date ORDER BY sales_date
+            """, (branch, today - timedelta(days=13), today + timedelta(days=1)))
+            sparkline_raw = _rows_to_dicts(cur)
+
+        # ── Compute MoM delta ────────────────────────────────────────────
+        this_rev  = float(rev_row.get("this_rev")  or 0)
+        last_rev  = float(rev_row.get("last_rev")  or 0)
+        this_bills = int(rev_row.get("this_bills") or 0)
+        mom_delta  = round((this_rev - last_rev) / last_rev * 100, 1) if last_rev > 0 else None
+
+        # DOW labels
+        best_dow = None
+        if dow_rows:
+            d = dow_rows[0]
+            best_dow = {
+                "dow":    int(d["dow"]),
+                "label":  DOW_LABELS_TH[int(d["dow"])],
+                "label_short": DOW_LABELS_SHORT[int(d["dow"])],
+                "avg_rev": round(float(d["avg_rev"] or 0), 2),
+            }
+
+        peak_hour = None
+        if hour_rows:
+            h = hour_rows[0]
+            hr = int(h["hr"])
+            peak_hour = {
+                "hour": hr,
+                "label": f"{hr:02d}:00",
+                "total_rev": round(float(h["total_rev"] or 0), 2),
+                "bill_count": int(h["bill_count"] or 0),
+            }
+
+        top_table = None
+        if table_rows:
+            t = table_rows[0]
+            top_table = {
+                "table":     t["tbl"],
+                "total_rev": round(float(t["total_rev"] or 0), 2),
+                "bills":     int(t["bills"] or 0),
+            }
+
+        top_staff = None
+        if staff_rows:
+            s = staff_rows[0]
+            top_staff = {
+                "staff":     s["staff"],
+                "total_rev": round(float(s["total_rev"] or 0), 2),
+                "bills":     int(s["bills"] or 0),
+            }
+
+        # Order type split with pct
+        otype_total = sum(float(r.get("rev") or 0) for r in otype_rows)
+        order_types = [
+            {
+                "type": r["otype"],
+                "rev":  round(float(r.get("rev") or 0), 2),
+                "bills": int(r.get("bills") or 0),
+                "pct":  round(float(r.get("rev") or 0) / otype_total * 100, 1) if otype_total > 0 else 0,
+            }
+            for r in otype_rows
+        ]
+
+        # Sparkline: fill missing days with 0
+        spark_map = {str(r["sales_date"]): round(float(r["daily_rev"] or 0), 2) for r in sparkline_raw}
+        sparkline = [
+            {"date": str(today - timedelta(days=13-i)), "rev": spark_map.get(str(today - timedelta(days=13-i)), 0)}
+            for i in range(14)
+        ]
+
+        return {
+            "branch":      branch,
+            "as_of":       str(today),
+            "this_month":  str(this_start),
+            "last_month":  str(last_start),
+            "this_rev":    round(this_rev, 2),
+            "last_rev":    round(last_rev, 2),
+            "this_bills":  this_bills,
+            "mom_delta":   mom_delta,
+            "best_dow":    best_dow,
+            "peak_hour":   peak_hour,
+            "top_table":   top_table,
+            "top_staff":   top_staff,
+            "order_types": order_types,
+            "sparkline":   sparkline,
+        }
+    finally:
+        conn.close()
