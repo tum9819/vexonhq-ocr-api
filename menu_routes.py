@@ -2631,3 +2631,127 @@ def pos_categories(
         }
     finally:
         conn.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 55 — Daily Revenue Calendar  GET /pos/calendar
+# ──────────────────────────────────────────────────────────────────────────────
+@router.get("/pos/calendar")
+def pos_calendar(
+    year:   int = Query(None),
+    month:  int = Query(None),
+    branch: str = Query(""),
+):
+    import calendar
+    from datetime import date
+
+    today = date.today()
+    if not year:  year  = today.year
+    if not month: month = today.month
+
+    # clamp month
+    month = max(1, min(12, month))
+
+    _, days_in_month = calendar.monthrange(year, month)
+    start = date(year, month, 1)
+    end   = date(year, month, days_in_month)
+
+    branch_sql = "AND branch_code = %(branch)s" if branch else ""
+    params = {"start": start, "end": end, "branch": branch or ""}
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # ── Daily totals ────────────────────────────────────────────────
+            cur.execute(f"""
+                SELECT
+                    sales_date,
+                    SUM(net_total)   AS revenue,
+                    COUNT(*)         AS bill_count,
+                    AVG(net_total)   AS avg_bill,
+                    MAX(net_total)   AS max_bill
+                FROM pos_bills
+                WHERE sales_date BETWEEN %(start)s AND %(end)s
+                  {branch_sql}
+                GROUP BY sales_date
+                ORDER BY sales_date
+            """, params)
+            day_rows = _rows_to_dicts(cur)
+
+            # ── Month KPIs ──────────────────────────────────────────────────
+            cur.execute(f"""
+                SELECT
+                    SUM(net_total)   AS total_revenue,
+                    COUNT(*)         AS total_bills,
+                    AVG(net_total)   AS avg_bill,
+                    MAX(net_total)   AS max_bill,
+                    MIN(net_total)   AS min_bill,
+                    COUNT(DISTINCT sales_date) AS active_days
+                FROM pos_bills
+                WHERE sales_date BETWEEN %(start)s AND %(end)s
+                  {branch_sql}
+            """, params)
+            kpi = _rows_to_dicts(cur)[0] if cur.rowcount else {}
+
+            # ── Top items for the month ─────────────────────────────────────
+            cur.execute(f"""
+                SELECT
+                    si.item_name,
+                    SUM(si.qty)        AS qty,
+                    SUM(si.net_amount) AS revenue
+                FROM pos_sales_items si
+                JOIN pos_bills b ON b.id = si.bill_id
+                WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  {'AND b.branch_code = %(branch)s' if branch else ''}
+                GROUP BY si.item_name
+                ORDER BY revenue DESC
+                LIMIT 5
+            """, params)
+            top_items = _rows_to_dicts(cur)
+
+        # Build day map
+        day_map = {str(r["sales_date"]): r for r in day_rows}
+
+        days_out = []
+        for d in range(1, days_in_month + 1):
+            ds = str(date(year, month, d))
+            r  = day_map.get(ds)
+            days_out.append({
+                "date":       ds,
+                "day":        d,
+                "weekday":    date(year, month, d).weekday(),  # 0=Mon
+                "revenue":    round(float(r["revenue"]) if r else 0, 2),
+                "bill_count": int(r["bill_count"]) if r else 0,
+                "avg_bill":   round(float(r["avg_bill"]) if r else 0, 2),
+                "max_bill":   round(float(r["max_bill"]) if r else 0, 2),
+                "is_today":   ds == str(today),
+            })
+
+        total_rev = float(kpi.get("total_revenue") or 0)
+        active    = int(kpi.get("active_days") or 1) or 1
+
+        return {
+            "year":   year,
+            "month":  month,
+            "days":   days_out,
+            "kpi": {
+                "total_revenue": round(total_rev, 2),
+                "total_bills":   int(kpi.get("total_bills") or 0),
+                "avg_bill":      round(float(kpi.get("avg_bill") or 0), 2),
+                "max_bill":      round(float(kpi.get("max_bill") or 0), 2),
+                "min_bill":      round(float(kpi.get("min_bill") or 0), 2),
+                "active_days":   active,
+                "daily_avg_rev": round(total_rev / active, 2),
+            },
+            "top_items": [
+                {
+                    "item_name": r["item_name"],
+                    "qty":       int(r["qty"] or 0),
+                    "revenue":   round(float(r["revenue"] or 0), 2),
+                }
+                for r in top_items
+            ],
+            "days_in_month": days_in_month,
+        }
+    finally:
+        conn.close()
