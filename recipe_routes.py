@@ -633,11 +633,17 @@ qty_used คือปริมาณต่อ 1 จาน/เสิร์ฟ ใ
 # ── AI Suggest Endpoint ──────────────────────────────────────
 
 @router.post("/ai-suggest")
-def ai_suggest_menus(body: AISuggestRequest):
+def ai_suggest_menus(body: Optional[AISuggestRequest] = None):
     """
     ดู stock ที่มีในร้าน + วัตถุดิบ + สูตรที่มีอยู่
     → Claude แนะนำเมนูที่ทำได้พร้อม GP% โดยประมาณ
+
+    Session 16 fix (2026-05-17): body now optional — frontend ส่ง POST
+    เปล่าๆ ได้, ระบบจะใช้ default {branch_code: thawi_watthana,
+    num_suggestions: 3}. แก้ HTTP 422 ที่เคยเกิดเพราะ pydantic require body.
     """
+    if body is None:
+        body = AISuggestRequest()
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:

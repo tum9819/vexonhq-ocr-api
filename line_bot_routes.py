@@ -569,6 +569,15 @@ _scheduler.add_job(
     id="daily_budget_alert",
     replace_existing=True,
 )
+# Phase 67 (Session 16, 2026-05-17): daily reorder digest 07:00 BKK
+_scheduler.add_job(
+    _scheduled_daily_stock_digest,
+    trigger="cron",
+    hour=7,
+    minute=0,
+    id="daily_stock_digest",
+    replace_existing=True,
+)
 _scheduler.start()
 log.info("LINE digest scheduler started — fires daily at 06:00 Asia/Bangkok")
 log.info("AP due reminder scheduler started — fires daily at 09:00 Asia/Bangkok")
@@ -742,6 +751,12 @@ _RECIPE_COST_KEYWORDS = (
     "ต้นทุน", "gp", "กำไรต่อจาน", "กำไรเมนู", "costเมนู",
 )
 
+# Phase 66 (Session 16): คำที่บ่งบอกว่าขอรายการของที่ต้องสั่ง
+_REORDER_KEYWORDS = (
+    "สั่งของวันนี้", "สั่งของ", "รายการสั่ง", "ของที่ต้องสั่ง",
+    "เช็คของที่ต้องสั่ง", "วันนี้สั่งอะไร", "shopping list", "reorder",
+)
+
 
 def _classify_intent(text: str) -> str:
     """
@@ -766,6 +781,10 @@ def _classify_intent(text: str) -> str:
     # Check recipe cost keywords
     if any(kw in lower for kw in _RECIPE_COST_KEYWORDS):
         return "recipe_cost"
+
+    # Phase 66 (Session 16): "สั่งของวันนี้" → reorder list
+    if any(kw in lower for kw in _REORDER_KEYWORDS):
+        return "reorder_list"
 
     # Check stock summary keywords — but first check for category modifier
     if any(kw in lower for kw in _STOCK_SUMMARY_KEYWORDS):
@@ -1127,6 +1146,85 @@ def _handle_recipe_cost(query: str) -> str:
 # Webhook helpers
 # ─────────────────────────────────────────────
 
+def _handle_reorder_list() -> str:
+    """
+    Phase 66 (Session 16): Return a LINE-friendly reorder shopping list
+    by calling /inventory/reorder endpoint via internal Python import.
+    """
+    try:
+        from inventory_forecast_routes import inventory_reorder
+        data = inventory_reorder()
+    except Exception as e:
+        log.error("reorder list query failed: %s", e)
+        return f"❌ เกิดข้อผิดพลาด: {str(e)[:80]}"
+
+    items = data.get("items", [])
+    summary = data.get("summary", {}) or {}
+    snap_raw = data.get("snapshot_at") or ""
+    snapshot_at = snap_raw[:10] if snap_raw else "-"
+    sep = "─" * 24
+
+    if not items:
+        msg_lines = [
+            "\U0001f4cb รายการสั่งของวันนี้",
+            f"\U0001f4c5 ข้อมูล: {snapshot_at}",
+            sep,
+            "✅ ไม่มีรายการที่ต้องสั่งครับ",
+        ]
+        return "\n".join(msg_lines)
+
+    by_urg = {"critical": [], "high": [], "medium": [], "low": []}
+    for i in items:
+        by_urg.setdefault(i.get("urgency", "low"), []).append(i)
+
+    lines = [
+        "\U0001f4cb รายการสั่งของวันนี้",
+        f"\U0001f4c5 ข้อมูล: {snapshot_at}",
+        sep,
+    ]
+    urg_meta = [
+        ("critical", "\U0001f534 ด่วน (หมด)", "❌"),
+        ("high",     "\U0001f7e0 สูง",                "⚠️"),
+        ("medium",   "\U0001f7e1 กลาง",              "⚡"),
+        ("low",      "\U0001f7e2 เติม",              "✅"),
+    ]
+    for key, label, mark in urg_meta:
+        rows = by_urg.get(key) or []
+        if not rows:
+            continue
+        lines.append(f"{label} ({len(rows)} รายการ):")
+        for it in rows[:20]:
+            qty = it.get("qty_to_order", 0)
+            unit = it.get("unit") or ""
+            cost = it.get("est_cost") or 0
+            cost_str = f" ~฿{cost:,.0f}" if cost > 0 else ""
+            lines.append(f"  {mark} {it.get('item_name')}: {qty:g} {unit}{cost_str}")
+        if len(rows) > 20:
+            lines.append(f"  ... และอีก {len(rows)-20} รายการ")
+
+    lines.append(sep)
+    total_cost = float(summary.get("est_total_cost") or 0)
+    n = int(summary.get("total_items") or len(items))
+    if total_cost > 0:
+        lines.append(f"\U0001f4b0 รวม {n} รายการ ~฿{total_cost:,.0f}")
+    else:
+        lines.append(f"\U0001f4e6 รวม {n} รายการ")
+    return "\n".join(lines)
+
+
+# Phase 67 (Session 16): Daily comprehensive low-stock digest — 07:00 BKK
+def _scheduled_daily_stock_digest():
+    """APScheduler job: push reorder list to LINE at 07:00 Bangkok time."""
+    log.info("Scheduled daily stock digest running")
+    try:
+        text = _handle_reorder_list()
+        _push_text(text)
+        log.info("Daily stock digest sent OK")
+    except Exception as e:
+        log.error("Daily stock digest FAILED: %s", e)
+
+
+
 def _verify_signature(body: bytes, signature: str) -> bool:
     secret = os.environ.get("LINE_CHANNEL_SECRET", "")
     if not secret:
@@ -1297,7 +1395,8 @@ def _process_one_event(event: dict) -> None:
     log.info("LINE intent: %r → %s", text, intent)
 
     # Fast intents (DB query only) — use reply_line
-    if intent in ("stock_summary", "stock_product", "stock_category", "recipe_cost"):
+    if intent in ("stock_summary", "stock_product", "stock_category",
+                  "recipe_cost", "reorder_list"):
         try:
             if intent == "stock_summary":
                 reply_text = _handle_stock_summary()
@@ -1305,6 +1404,8 @@ def _process_one_event(event: dict) -> None:
                 reply_text = _handle_stock_product(text)
             elif intent == "stock_category":
                 reply_text = _handle_stock_category(text)
+            elif intent == "reorder_list":
+                reply_text = _handle_reorder_list()
             else:
                 reply_text = _handle_recipe_cost(text)
             _reply_line(reply_token, reply_text)
@@ -1354,46 +1455,4 @@ def _process_line_events(data: dict) -> None:
         try:
             _process_one_event(event)
         except Exception as e:
-            log.error("LINE event handler crashed: %s", e)
-
-
-@router.post("/webhook")
-async def line_webhook(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    x_line_signature: str = Header(None, alias="x-line-signature"),
-):
-    """
-    LINE Messaging API webhook
-
-    Returns 200 immediately and processes events in the background.
-    This is REQUIRED because LINE expects acknowledgement within ~1-2s
-    and reply_token expires after 30s — synchronous handlers that call
-    Claude/GPT (10-30s) would miss both deadlines.
-
-    Routes (processed in background):
-      📷 image message  → OCR (GPT Vision) → vendor_bills
-      💬 text message:
-          - "ค่าXXX 999"  → quick expense → manual_entries
-          - "help"        → usage help
-          - stock query   → stock_routes
-          - anything else → AI Search (Phase 11)
-
-    ตั้งค่า Webhook URL ใน LINE Developers Console:
-      https://<your-domain>/line/webhook
-    """
-    body = await request.body()
-
-    if not _verify_signature(body, x_line_signature or ""):
-        log.warning("LINE webhook: invalid signature")
-        return {"status": "invalid signature"}
-
-    try:
-        data = json.loads(body)
-    except json.JSONDecodeError as e:
-        log.error("LINE webhook: invalid JSON body: %s", e)
-        return {"status": "invalid body"}
-
-    # Schedule processing in background. We return 200 to LINE immediately.
-    background_tasks.add_task(_process_line_events, data)
-    return {"status": "ok"}
+            log

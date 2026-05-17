@@ -251,164 +251,113 @@ def purchase_history(
     }
 
 
-# ─────────────────────────────────────────────────────────
-# GET /inventory/ai-order-advice  (Phase 32)
-# วิเคราะห์รูปแบบขายตามวันในสัปดาห์ (Day-of-Week)
-# → แนะนำวันที่ควรสั่งของเข้าและปริมาณ
-# ─────────────────────────────────────────────────────────
+# ============================================================
+# Phase 66 — Inventory Reorder Suggestion (Session 16, 2026-05-17)
+# ============================================================
+# Returns items that should be re-stocked: any item where
+# qty_in_stock < qty_max (i.e. qty_diff > 0). Includes urgency
+# band and excludes Pro/(pro) promo SKUs.
 
-_DOW_TH = ["อาทิตย์", "จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์"]
-_DOW_EN = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-
-
-@router.get("/inventory/ai-order-advice")
-def ai_order_advice(
-    branch: str = Query(DEFAULT_BRANCH),
-    lookback_weeks: int = Query(12, ge=4, le=52, description="จำนวนสัปดาห์ย้อนหลัง"),
+@router.get("/inventory/reorder")
+def inventory_reorder(
+    branch_code: str = Query(default=DEFAULT_BRANCH),
+    tag: Optional[str] = Query(default=None, description="filter by inventory tag"),
 ):
     """
-    Phase 32 — AI Day-of-Week Order Advice
+    Reorder worksheet — items below max with suggested order qty.
 
-    วิเคราะห์ยอดขาย POS ย้อนหลัง N สัปดาห์ แล้วแนะนำ:
-    1. วันไหนขายดีที่สุด/น้อยที่สุด
-    2. ช่วงไหนควรสั่งของเข้า (ก่อนวันขายดี 1-2 วัน)
-    3. ปริมาณสั่งแนะนำเทียบกับ baseline (avg weekday)
+    Logic:
+      - Use the same "best snapshot" selector that LINE bot uses
+        (skip partial uploads via _get_latest_snapshot_id).
+      - Filter Pro/(pro) promo SKUs.
+      - qty_to_order = max(qty_max - qty_in_stock, 0).
+      - Urgency:
+          critical  — qty_in_stock <= 0  (out of stock)
+          high      — qty_in_stock < qty_max * 0.25
+          medium    — qty_in_stock < qty_max * 0.5
+          low       — anything else with qty_diff > 0
     """
-    from datetime import timedelta as _td
+    try:
+        from stock_routes import _get_latest_snapshot_id
+    except Exception as e:
+        log.error("import _get_latest_snapshot_id failed: %s", e)
+        return {"snapshot_at": None, "items": [], "summary": {}}
 
-    today = date.today()
-    cutoff = today - _td(weeks=lookback_weeks)
+    snapshot_id, snapshot_at = _get_latest_snapshot_id(branch_code)
+    if not snapshot_id:
+        return {"snapshot_at": None, "items": [], "summary": {
+            "total_items": 0, "critical": 0, "high": 0, "medium": 0, "low": 0,
+        }}
+
+    sql = """
+        SELECT
+            item_name,
+            tag,
+            COALESCE(qty_in_stock, 0) AS qty_current,
+            COALESCE(qty_max, 0)       AS qty_max,
+            COALESCE(unit_price, 0)    AS unit_price,
+            unit
+        FROM public.pos_inventory_items
+        WHERE snapshot_id = %s
+          AND COALESCE(qty_max, 0) > COALESCE(qty_in_stock, 0)
+          AND LOWER(item_name) NOT LIKE %s
+          AND LOWER(item_name) NOT LIKE %s
+    """
+    params: list = [snapshot_id, "pro(%", "(pro%"]
+
+    if tag:
+        sql += " AND tag ILIKE %s"
+        params.append(f"%{tag}%")
+
+    sql += " ORDER BY qty_in_stock ASC, item_name"
 
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            # ── 1. POS Sales by day-of-week ──────────────────────────────
-            cur.execute(
-                """SELECT
-                       EXTRACT(DOW FROM entry_date)::int AS dow,
-                       COUNT(DISTINCT entry_date)::int   AS day_count,
-                       COALESCE(SUM(amount), 0)::numeric AS total_sales,
-                       COALESCE(AVG(amount), 0)::numeric AS avg_daily_sales,
-                       COALESCE(COUNT(*), 0)::int         AS txn_count
-                   FROM public.v_daybook
-                   WHERE direction = 'income'
-                     AND source IN ('pos_sale','rider_income_grab','rider_income_lineman')
-                     AND branch_code = %s
-                     AND entry_date >= %s
-                   GROUP BY EXTRACT(DOW FROM entry_date)
-                   ORDER BY dow""",
-                (branch, cutoff),
-            )
-            dow_rows = _rows_to_dicts(cur)
-
-            # ── 2. Total days in analysis ─────────────────────────────────
-            total_days = (today - cutoff).days or 1
-
-            # ── 3. Weekly purchase spend (vendor_bills) ───────────────────
-            cur.execute(
-                """SELECT
-                       EXTRACT(DOW FROM bill_date)::int AS dow,
-                       COALESCE(AVG(amount), 0)::numeric AS avg_purchase
-                   FROM public.vendor_bills
-                   WHERE review_status = 'confirmed'
-                     AND COALESCE(branch_code, %s) = %s
-                     AND bill_date >= %s
-                   GROUP BY EXTRACT(DOW FROM bill_date)
-                   ORDER BY dow""",
-                (branch, branch, cutoff),
-            )
-            purchase_rows = _rows_to_dicts(cur)
+            cur.execute(sql, params)
+            rows = cur.fetchall()
     finally:
         conn.close()
 
-    # ── Build DOW stats ──────────────────────────────────────────────
-    dow_stats: list[dict] = []
-    all_avg = [float(r.get("avg_daily_sales") or 0) for r in dow_rows]
-    grand_avg = sum(all_avg) / len(all_avg) if all_avg else 1.0
+    items: list[dict] = []
+    summary = {"total_items": 0, "critical": 0, "high": 0, "medium": 0, "low": 0,
+               "est_total_cost": 0.0}
 
-    purchase_by_dow: dict[int, float] = {}
-    for pr in purchase_rows:
-        purchase_by_dow[int(pr.get("dow") or 0)] = float(pr.get("avg_purchase") or 0)
+    for name, t, q_cur, q_max, price, unit in rows:
+        q_cur = float(q_cur or 0)
+        q_max = float(q_max or 0)
+        to_order = max(q_max - q_cur, 0)
+        price = float(price or 0)
 
-    for r in dow_rows:
-        dow = int(r.get("dow") or 0)
-        avg_sales = float(r.get("avg_daily_sales") or 0)
-        index = round(avg_sales / grand_avg * 100, 1) if grand_avg > 0 else 100.0
+        if q_cur <= 0:
+            urgency = "critical"
+        elif q_max > 0 and q_cur < q_max * 0.25:
+            urgency = "high"
+        elif q_max > 0 and q_cur < q_max * 0.5:
+            urgency = "medium"
+        else:
+            urgency = "low"
 
-        dow_stats.append({
-            "dow":            dow,
-            "day_th":         _DOW_TH[dow],
-            "day_en":         _DOW_EN[dow],
-            "avg_sales":      round(avg_sales, 2),
-            "sales_index":    index,           # 100 = avg, >100 above avg
-            "day_count":      int(r.get("day_count") or 0),
-            "total_sales":    round(float(r.get("total_sales") or 0), 2),
-            "avg_purchase_on_day": round(purchase_by_dow.get(dow, 0), 2),
+        items.append({
+            "item_name":   name,
+            "tag":         t or "ไม่ระบุ",
+            "qty_current": q_cur,
+            "qty_max":     q_max,
+            "qty_to_order": to_order,
+            "unit":        unit or "",
+            "unit_price":  price,
+            "est_cost":    round(to_order * price, 2),
+            "urgency":     urgency,
         })
+        summary["total_items"] += 1
+        summary[urgency] += 1
+        summary["est_total_cost"] += to_order * price
 
-    # Sort by avg_sales desc to rank days
-    dow_ranked = sorted(dow_stats, key=lambda x: x["avg_sales"], reverse=True)
-
-    # ── Generate advice ──────────────────────────────────────────────
-    advice = []
-    if dow_ranked:
-        best_days   = [d for d in dow_ranked if d["sales_index"] >= 110]
-        worst_days  = [d for d in dow_ranked if d["sales_index"] <= 80]
-        top2        = dow_ranked[:2]
-
-        # Best days label
-        best_labels = " / ".join(f"วัน{d['day_th']}" for d in best_days[:3]) if best_days else "ยังไม่ชัดเจน"
-        worst_labels = " / ".join(f"วัน{d['day_th']}" for d in worst_days[:2]) if worst_days else "ยังไม่ชัดเจน"
-
-        # Recommend ordering 1-2 days before the best days
-        order_days_suggestion = []
-        for d in best_days[:2]:
-            order_dow = (d["dow"] - 2) % 7  # 2 days before
-            order_days_suggestion.append(_DOW_TH[order_dow])
-        order_suggest = " / ".join(f"วัน{x}" for x in order_days_suggestion) if order_days_suggestion else "วันจันทร์"
-
-        advice = [
-            {
-                "type":    "best_sales_days",
-                "icon":    "🔥",
-                "title":   "วันขายดีที่สุด",
-                "detail":  best_labels,
-                "note":    f"ยอดขายสูงกว่าค่าเฉลี่ย ควรมีของเตรียมพร้อม",
-            },
-            {
-                "type":    "order_schedule",
-                "icon":    "🛒",
-                "title":   "แนะนำสั่งของเข้า",
-                "detail":  order_suggest,
-                "note":    f"สั่งของ 1-2 วันก่อนวันขายดี เพื่อให้มี stock พร้อม",
-            },
-            {
-                "type":    "slow_days",
-                "icon":    "📦",
-                "title":   "วันขายช้า / รับสินค้าได้",
-                "detail":  worst_labels,
-                "note":    "เหมาะนับ stock และเช็คของหมดอายุ",
-            },
-        ]
-
-        # Stock multiplier recommendation
-        if top2:
-            top_index = top2[0]["sales_index"]
-            multiplier = round(top_index / 100, 2)
-            advice.append({
-                "type":    "stock_level",
-                "icon":    "📊",
-                "title":   "ปริมาณสต็อกแนะนำ (วันขายดี)",
-                "detail":  f"เตรียม {multiplier}x เทียบกับวันปกติ",
-                "note":    f"วัน{top2[0]['day_th']} ขายเฉลี่ย ฿{top2[0]['avg_sales']:,.0f} (index {top_index:.0f})",
-            })
+    summary["est_total_cost"] = round(summary["est_total_cost"], 2)
 
     return {
-        "as_of":             today.isoformat(),
-        "lookback_weeks":    lookback_weeks,
-        "branch_code":       branch,
-        "grand_avg_daily":   round(grand_avg, 2),
-        "dow_stats":         dow_stats,       # sorted by DOW (Sun=0..Sat=6)
-        "dow_ranked":        dow_ranked,      # sorted best→worst
-        "advice":            advice,
+        "snapshot_at": snapshot_at,
+        "branch_code": branch_code,
+        "items":       items,
+        "summary":     summary,
     }
