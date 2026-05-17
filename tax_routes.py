@@ -22,12 +22,14 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
+import psycopg2
+import psycopg2.extras
+
 try:
-    import psycopg2
-    import psycopg2.extras
-    from db import get_db_conn
+    from main import get_db_conn  # type: ignore
 except ImportError:
-    raise
+    def get_db_conn():  # type: ignore
+        raise RuntimeError("get_db_conn not available")
 
 logger = logging.getLogger("tax")
 

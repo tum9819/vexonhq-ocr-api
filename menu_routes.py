@@ -2093,3 +2093,93 @@ def pos_payments(
         }
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 51 — Sales Heatmap  GET /pos/heatmap
+# DOW (0=Sun … 6=Sat) × Hour (0–23) matrix — revenue + bill_count per cell
+# ---------------------------------------------------------------------------
+@router.get("/pos/heatmap")
+def pos_heatmap(
+    months: int = Query(3, ge=1, le=24),
+    branch: str = Query(""),
+):
+    conn = get_db_conn()
+    try:
+        start = (date.today().replace(day=1) - relativedelta(months=months - 1))
+        end   = date.today()
+
+        branch_filter = "AND b.branch_code = %(branch)s" if branch else ""
+
+        heatmap_sql = f"""
+            SELECT
+                EXTRACT(DOW  FROM b.sales_date)::int  AS dow,
+                EXTRACT(HOUR FROM b.sales_time)::int  AS hr,
+                SUM(b.net_total)::numeric              AS revenue,
+                COUNT(*)::int                          AS bill_count
+            FROM pos_bills b
+            WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+              AND b.net_total IS NOT NULL
+              {branch_filter}
+            GROUP BY dow, hr
+            ORDER BY dow, hr
+        """
+
+        params = {"start": start, "end": end}
+        if branch:
+            params["branch"] = branch
+
+        with conn.cursor() as cur:
+            cur.execute(heatmap_sql, params)
+            rows = _rows_to_dicts(cur)
+
+        # Build full 7×24 matrix initialised to zero
+        matrix = {
+            dow: {hr: {"revenue": 0.0, "bill_count": 0} for hr in range(24)}
+            for dow in range(7)
+        }
+        for r in rows:
+            d = int(r["dow"]); h = int(r["hr"])
+            matrix[d][h] = {
+                "revenue":    round(float(r["revenue"] or 0), 2),
+                "bill_count": int(r["bill_count"] or 0),
+            }
+
+        # Flatten to list of cells for JSON
+        cells = []
+        max_rev = 0.0
+        for dow in range(7):
+            for hr in range(24):
+                rev = matrix[dow][hr]["revenue"]
+                bc  = matrix[dow][hr]["bill_count"]
+                if rev > max_rev:
+                    max_rev = rev
+                cells.append({"dow": dow, "hr": hr, "revenue": rev, "bill_count": bc})
+
+        # Peak cell
+        peak = max(cells, key=lambda c: c["revenue"]) if cells else None
+
+        # DOW aggregates (for sparkline row totals)
+        dow_totals = []
+        for dow in range(7):
+            total_rev = sum(matrix[dow][hr]["revenue"] for hr in range(24))
+            total_bc  = sum(matrix[dow][hr]["bill_count"] for hr in range(24))
+            dow_totals.append({"dow": dow, "revenue": round(total_rev, 2), "bill_count": total_bc})
+
+        # Hour aggregates
+        hr_totals = []
+        for hr in range(24):
+            total_rev = sum(matrix[dow][hr]["revenue"] for dow in range(7))
+            total_bc  = sum(matrix[dow][hr]["bill_count"] for dow in range(7))
+            hr_totals.append({"hr": hr, "revenue": round(total_rev, 2), "bill_count": total_bc})
+
+        return {
+            "cells":      cells,
+            "dow_totals": dow_totals,
+            "hr_totals":  hr_totals,
+            "max_revenue": round(max_rev, 2),
+            "peak":       peak,
+            "period":     {"months": months, "start": str(start), "end": str(end)},
+        }
+    finally:
+        conn.close()
