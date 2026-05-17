@@ -3635,3 +3635,126 @@ def pos_prices(months: int = Query(6), branch: str = Query(""), item: str = Quer
             }
     finally:
         conn.close()
+
+
+# ── Phase 62: Monthly Revenue Goal Tracker (/pos/goals) ──────────────────────
+@router.get("/pos/goals")
+def pos_goals(
+    month: str = Query(None),
+    target: float = Query(282000),
+    branch: str = Query(""),
+):
+    import calendar as cal
+    from datetime import date
+    today = date.today()
+    if month:
+        try:
+            y, m = int(month[:4]), int(month[5:7])
+        except Exception:
+            y, m = today.year, today.month
+    else:
+        y, m = today.year, today.month
+
+    first_day = date(y, m, 1)
+    days_in_month = cal.monthrange(y, m)[1]
+    last_day = date(y, m, days_in_month)
+
+    if y == today.year and m == today.month:
+        days_elapsed = today.day
+    else:
+        days_elapsed = days_in_month
+    days_remaining = max(0, days_in_month - days_elapsed)
+
+    branch_filter = "AND branch = %(branch)s" if branch else ""
+    params: dict = {"start": str(first_day), "end": str(last_day), "branch": branch}
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT sales_date::text AS dt,
+                       COALESCE(SUM(net_price), 0) AS rev
+                FROM pos_bills
+                WHERE sales_date BETWEEN %(start)s AND %(end)s
+                  AND LOWER(COALESCE(status, '')) NOT IN ('void','cancelled')
+                  {branch_filter}
+                GROUP BY sales_date
+                ORDER BY sales_date
+            """, params)
+            daily_rows = _rows_to_dicts(cur)
+    finally:
+        conn.close()
+
+    daily_map: dict = {r["dt"]: float(r["rev"]) for r in daily_rows}
+    actual = sum(daily_map.values())
+    daily_actual_avg = actual / days_elapsed if days_elapsed > 0 else 0.0
+    projected_eom = daily_actual_avg * days_in_month
+    gap = max(0.0, target - actual)
+    daily_required = gap / days_remaining if days_remaining > 0 else 0.0
+    pct = round(actual / target * 100, 1) if target > 0 else 0.0
+    projected_pct = round(projected_eom / target * 100, 1) if target > 0 else 0.0
+
+    if pct >= 100 or projected_pct >= 95:
+        status = "on_track"
+    elif projected_pct >= 75:
+        status = "at_risk"
+    else:
+        status = "behind"
+
+    target_daily = target / days_in_month if days_in_month > 0 else 0.0
+    is_past = (y < today.year) or (y == today.year and m < today.month)
+
+    # Build daily array with cumulative & target pace line
+    all_days = []
+    cumulative = 0.0
+    for i in range(1, days_in_month + 1):
+        d_str = date(y, m, i).isoformat()
+        rev = daily_map.get(d_str, 0.0)
+        in_past = is_past or (y == today.year and m == today.month and i <= today.day)
+        if in_past:
+            cumulative += rev
+        all_days.append({
+            "date": d_str,
+            "day": i,
+            "revenue": round(rev, 0) if in_past else None,
+            "cumulative": round(cumulative, 0) if in_past else None,
+            "target_pace": round(target_daily * i, 0),
+        })
+
+    # Weekly breakdown (5 weeks max)
+    weekly = []
+    for wk in range(5):
+        ws = 1 + wk * 7
+        we = min(ws + 6, days_in_month)
+        if ws > days_in_month:
+            break
+        w_rev = sum(
+            daily_map.get(date(y, m, d).isoformat(), 0.0)
+            for d in range(ws, we + 1)
+        )
+        w_tgt = target_daily * (we - ws + 1)
+        weekly.append({
+            "week": wk + 1,
+            "label": f"W{wk+1} ({ws}–{we})",
+            "revenue": round(w_rev, 0),
+            "target": round(w_tgt, 0),
+            "pct": round(w_rev / w_tgt * 100, 1) if w_tgt > 0 else 0.0,
+        })
+
+    return {
+        "month": f"{y:04d}-{m:02d}",
+        "target": target,
+        "actual": round(actual, 0),
+        "pct": pct,
+        "gap": round(gap, 0),
+        "days_elapsed": days_elapsed,
+        "days_total": days_in_month,
+        "days_remaining": days_remaining,
+        "daily_actual_avg": round(daily_actual_avg, 0),
+        "daily_required": round(daily_required, 0),
+        "projected_eom": round(projected_eom, 0),
+        "projected_pct": projected_pct,
+        "status": status,
+        "daily": all_days,
+        "weekly": weekly,
+    }
