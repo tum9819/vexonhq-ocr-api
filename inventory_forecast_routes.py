@@ -258,24 +258,11 @@ def purchase_history(
 # qty_in_stock < qty_max (i.e. qty_diff > 0). Includes urgency
 # band and excludes Pro/(pro) promo SKUs.
 
-@router.get("/inventory/reorder")
-def inventory_reorder(
-    branch_code: str = Query(default=DEFAULT_BRANCH),
-    tag: Optional[str] = Query(default=None, description="filter by inventory tag"),
-):
+def _compute_reorder_list(branch_code: str = DEFAULT_BRANCH,
+                          tag: Optional[str] = None) -> dict:
     """
-    Reorder worksheet — items below max with suggested order qty.
-
-    Logic:
-      - Use the same "best snapshot" selector that LINE bot uses
-        (skip partial uploads via _get_latest_snapshot_id).
-      - Filter Pro/(pro) promo SKUs.
-      - qty_to_order = max(qty_max - qty_in_stock, 0).
-      - Urgency:
-          critical  — qty_in_stock <= 0  (out of stock)
-          high      — qty_in_stock < qty_max * 0.25
-          medium    — qty_in_stock < qty_max * 0.5
-          low       — anything else with qty_diff > 0
+    Plain-Python helper (no FastAPI dependency) — called by the HTTP route
+    AND by LINE bot's _handle_reorder_list. Same logic, no Query() injection.
     """
     try:
         from stock_routes import _get_latest_snapshot_id
@@ -361,3 +348,12 @@ def inventory_reorder(
         "items":       items,
         "summary":     summary,
     }
+
+
+@router.get("/inventory/reorder")
+def inventory_reorder(
+    branch_code: str = Query(default=DEFAULT_BRANCH),
+    tag: Optional[str] = Query(default=None, description="filter by inventory tag"),
+):
+    """HTTP wrapper around _compute_reorder_list — see helper for full docs."""
+    return _compute_reorder_list(branch_code=branch_code, tag=tag)

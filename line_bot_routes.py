@@ -1143,8 +1143,8 @@ def _handle_reorder_list() -> str:
     by calling /inventory/reorder endpoint via internal Python import.
     """
     try:
-        from inventory_forecast_routes import inventory_reorder
-        data = inventory_reorder()
+        from inventory_forecast_routes import _compute_reorder_list
+        data = _compute_reorder_list()
     except Exception as e:
         log.error("reorder list query failed: %s", e)
         return f"❌ เกิดข้อผิดพลาด: {str(e)[:80]}"
