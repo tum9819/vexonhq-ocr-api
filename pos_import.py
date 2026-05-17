@@ -28,8 +28,10 @@ import uuid
 from datetime import date, datetime
 from typing import Any, Optional
 
+import threading
+
 import pandas as pd
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -50,6 +52,13 @@ except ImportError:
 
 logger = logging.getLogger("pos_import")
 router = APIRouter(prefix="/pos", tags=["pos"])
+
+# ── In-memory job store for background imports ─────────────────────────────
+# Maps job_id → {"status": ..., "result": ..., "error": ...}
+# Status flow: "queued" → "processing" → "success" | "error"
+# Guarded by a lock so background thread + FastAPI thread can coexist safely.
+_job_lock: threading.Lock = threading.Lock()
+_job_store: dict[str, dict] = {}
 
 
 # ============================================================
@@ -1018,44 +1027,51 @@ async def detect_only(file: UploadFile = File(...)):
         raise HTTPException(400, f"Detection failed: {e}")
 
 
-@router.post("/import", response_model=ImportResponse)
-async def import_pos_excel(
-    file: UploadFile = File(...),
-    branch_code: str = Form("thawi_watthana"),
-    period_year_hint: int = Form(2026),    # used by monthly_summary
-    uploaded_by: Optional[str] = Form(None),
-):
-    """
-    Upload one FoodStory POS Excel report. Auto-detects type from header row.
-    Re-uploading the same period overwrites existing rows for that period.
-    """
-    # 1. Read bytes + hash
-    content = await file.read()
-    if not content:
-        raise HTTPException(400, "Empty file")
-    file_hash = hashlib.sha256(content).hexdigest()
+# ============================================================
+# 5b. Background worker  (runs in FastAPI's thread-pool)
+# ============================================================
 
-    # 2. Parse file + detect type (handles XLSX and CSV)
-    df, rtype = read_and_detect(content, file.filename or "")
+def _process_import_background(
+    job_id: str,
+    content: bytes,
+    filename: str,
+    branch_code: str,
+    period_year_hint: int,
+    uploaded_by: Optional[str],
+) -> None:
+    """Heavy lifting: parse → DB write.  Called by BackgroundTasks."""
+    import_id: str = ""
+    conn = None
 
-    # 4. Open DB + create pos_imports row
-    conn = get_db_conn()
+    def _set(update: dict) -> None:
+        with _job_lock:
+            _job_store[job_id].update(update)
+
     try:
+        _set({"status": "processing"})
+
+        file_hash = hashlib.sha256(content).hexdigest()
+
+        # Parse + detect (raises ValueError-style on bad file)
+        df, rtype = read_and_detect(content, filename)
+
+        conn = get_db_conn()
         with conn.cursor() as cur:
             import_id = str(uuid.uuid4())
+
+            # Insert pos_imports row
             cur.execute("""
                 INSERT INTO public.pos_imports
                   (id, report_type, branch_code, source_file, file_size,
                    file_hash, status, uploaded_by, uploaded_at)
                 VALUES (%s, %s, %s, %s, %s, %s, 'parsing', %s, now())
-            """, (import_id, rtype, branch_code, file.filename,
+            """, (import_id, rtype, branch_code, filename,
                   len(content), file_hash, uploaded_by))
             conn.commit()
 
-            # 5. Call parser
+            # Call parser
             parser = PARSERS[rtype]
             parser_kwargs: dict[str, Any] = {"year_hint": period_year_hint}
-            # period hints for parsers that need them (file is whole-month-ish)
             parser_kwargs["period_start"] = date(period_year_hint, 1, 1)
             parser_kwargs["period_end"]   = date(period_year_hint, 12, 31)
             parser_kwargs["snapshot_at"]  = datetime.now()
@@ -1064,12 +1080,11 @@ async def import_pos_excel(
             ps, pe = result["period_start"], result["period_end"]
             total_rows = 0
 
-            # 6. Write each table
+            # Write each table (same logic as original sync endpoint)
             for table, rows in result["tables"].items():
                 if not rows:
                     continue
                 if table == "pos_inventory_snapshots":
-                    # Phase 27: plain INSERT — file-hash dedup prevents re-import
                     snap = rows[0]
                     snap["source_import_id"] = import_id
                     cur.execute("""
@@ -1081,7 +1096,6 @@ async def import_pos_excel(
                     continue
 
                 if table == "_inventory_items":
-                    # special: needs snapshot id from the snapshot we JUST inserted
                     cur.execute("SELECT id FROM pos_inventory_snapshots "
                                 "WHERE source_import_id = %s "
                                 "ORDER BY created_at DESC LIMIT 1",
@@ -1099,8 +1113,8 @@ async def import_pos_excel(
                         f"VALUES ({_values_clause(rows, cols)})", rows)
                     total_rows += len(rows)
                     continue
+
                 if table == "_sales_items":
-                    # special: resolve bill_id via natural key
                     for it in rows:
                         bk = it.pop("_bill_key")
                         cur.execute("""SELECT id FROM pos_bills
@@ -1119,17 +1133,282 @@ async def import_pos_excel(
                         total_rows += len(rows)
                     continue
 
-                # Regular WRITER_CONFIG tables
                 cfg = WRITER_CONFIG.get(table)
                 if not cfg:
-                    logger.warning("No WRITER_CONFIG for table %s â skipped", table)
+                    logger.warning("No WRITER_CONFIG for table %s — skipped", table)
                     continue
                 for r in rows:
                     r["source_import_id"] = import_id
                 n = _upsert(cur, table, rows, **cfg)
                 total_rows += n
 
-            # 7. Update import record
+            # Mark DB record success
+            cur.execute(
+                "UPDATE public.pos_imports "
+                "SET status='success', period_start=%s, period_end=%s, "
+                "row_count=%s, finished_at=now() WHERE id=%s",
+                (ps, pe, total_rows, import_id))
+            conn.commit()
+
+        _set({
+            "status": "success",
+            "result": {
+                "import_id":    import_id,
+                "report_type":  rtype,
+                "status":       "success",
+                "rows_imported": total_rows,
+                "period_start": str(ps) if ps else None,
+                "period_end":   str(pe) if pe else None,
+            },
+        })
+
+    except Exception as e:
+        err_str = str(e)
+        # Duplicate file — silent skip
+        if "uq_pos_imports_hash" in err_str or (
+            "duplicate key" in err_str and "file_hash" in err_str
+        ):
+            try:
+                if conn:
+                    conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn2 = get_db_conn()
+                file_hash2 = hashlib.sha256(content).hexdigest()
+                with conn2.cursor() as cur2:
+                    cur2.execute(
+                        "SELECT id, report_type, row_count, period_start, period_end "
+                        "FROM public.pos_imports WHERE file_hash=%s AND status='success' "
+                        "ORDER BY uploaded_at DESC LIMIT 1",
+                        (file_hash2,))
+                    orig = cur2.fetchone()
+                conn2.close()
+            except Exception:
+                orig = None
+            _set({
+                "status": "already_imported",
+                "result": {
+                    "import_id":    orig[0] if orig else "duplicate",
+                    "report_type":  orig[1] if orig else "unknown",
+                    "status":       "already_imported",
+                    "rows_imported": orig[2] if orig else 0,
+                    "period_start": str(orig[3]) if orig and orig[3] else None,
+                    "period_end":   str(orig[4]) if orig and orig[4] else None,
+                    "detail":       {"message": "ไฟล์นี้นำเข้าไปแล้ว ข้ามซ้ำโดยอัตโนมัติ"},
+                },
+            })
+            return
+
+        logger.exception("POS import background task failed")
+        # Try to mark DB record as error
+        if import_id:
+            try:
+                conn2 = get_db_conn()
+                with conn2.cursor() as cur2:
+                    cur2.execute(
+                        "UPDATE public.pos_imports SET status='error', "
+                        "error_message=%s WHERE id=%s",
+                        (err_str[:2000], import_id))
+                    conn2.commit()
+                conn2.close()
+            except Exception:
+                pass
+        _set({"status": "error", "error": err_str})
+
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+# ============================================================
+# 5c. POST /pos/import  — returns 202 immediately
+# ============================================================
+
+@router.post("/import")
+async def import_pos_excel(
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None,
+    branch_code: str = Form("thawi_watthana"),
+    period_year_hint: int = Form(2026),
+    uploaded_by: Optional[str] = Form(None),
+):
+    """
+    Upload one POS report (FoodStory XLSX, Grab CSV, Lineman XLSX).
+    Returns 202 immediately with a job_id; processing happens in the background.
+    Poll GET /pos/import/status/{job_id} to check progress.
+    """
+    content = await file.read()
+    if not content:
+        raise HTTPException(400, "Empty file")
+
+    job_id = str(uuid.uuid4())
+    with _job_lock:
+        _job_store[job_id] = {
+            "status":   "queued",
+            "filename": file.filename,
+            "result":   None,
+            "error":    None,
+        }
+
+    background_tasks.add_task(
+        _process_import_background,
+        job_id,
+        content,
+        file.filename or "",
+        branch_code,
+        period_year_hint,
+        uploaded_by,
+    )
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "job_id":   job_id,
+            "status":   "queued",
+            "filename": file.filename,
+            "message":  "กำลังประมวลผลในพื้นหลัง — ตรวจสอบสถานะที่ GET /pos/import/status/{job_id}",
+        },
+    )
+
+
+# ============================================================
+# 5d. GET /pos/import/status/{job_id}  — poll endpoint
+# ============================================================
+
+@router.get("/import/status/{job_id}")
+async def import_status(job_id: str):
+    """Poll the status of a background import job."""
+    with _job_lock:
+        job = _job_store.get(job_id)
+    if job is None:
+        raise HTTPException(404, f"Job {job_id} not found (may have expired or never existed)")
+    return job
+
+
+# ============================================================
+# 5e. ImportResponse model  (used by legacy sync + list endpoints)
+# ============================================================
+
+class ImportResponse(BaseModel):
+    import_id: str
+    report_type: str
+    status: str
+    rows_imported: int
+    period_start: Optional[date] = None
+    period_end: Optional[date] = None
+    detail: dict = {}
+
+# ============================================================
+# 5g. POST /pos/import_sync  — legacy synchronous endpoint
+#     (kept for debugging; prefer POST /pos/import above)
+# ============================================================
+
+@router.post("/import_sync", response_model=ImportResponse)
+async def import_pos_excel_sync(
+    file: UploadFile = File(...),
+    branch_code: str = Form("thawi_watthana"),
+    period_year_hint: int = Form(2026),
+    uploaded_by: Optional[str] = Form(None),
+):
+    """
+    [LEGACY — kept for debugging] Synchronous import. Prefer POST /pos/import.
+    Upload one POS report. Auto-detects type. Blocks until done.
+    """
+    content = await file.read()
+    if not content:
+        raise HTTPException(400, "Empty file")
+    file_hash = hashlib.sha256(content).hexdigest()
+
+    df, rtype = read_and_detect(content, file.filename or "")
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            import_id = str(uuid.uuid4())
+            cur.execute("""
+                INSERT INTO public.pos_imports
+                  (id, report_type, branch_code, source_file, file_size,
+                   file_hash, status, uploaded_by, uploaded_at)
+                VALUES (%s, %s, %s, %s, %s, %s, 'parsing', %s, now())
+            """, (import_id, rtype, branch_code, file.filename,
+                  len(content), file_hash, uploaded_by))
+            conn.commit()
+
+            parser = PARSERS[rtype]
+            parser_kwargs: dict[str, Any] = {"year_hint": period_year_hint}
+            parser_kwargs["period_start"] = date(period_year_hint, 1, 1)
+            parser_kwargs["period_end"]   = date(period_year_hint, 12, 31)
+            parser_kwargs["snapshot_at"]  = datetime.now()
+            result = parser(df, **parser_kwargs)
+
+            ps, pe = result["period_start"], result["period_end"]
+            total_rows = 0
+
+            for table, rows in result["tables"].items():
+                if not rows:
+                    continue
+                if table == "pos_inventory_snapshots":
+                    snap = rows[0]
+                    snap["source_import_id"] = import_id
+                    cur.execute("""
+                        INSERT INTO public.pos_inventory_snapshots
+                            (branch_code, snapshot_at, item_count, total_value, source_import_id)
+                        VALUES (%(branch_code)s, %(snapshot_at)s, %(item_count)s,
+                                %(total_value)s, %(source_import_id)s)
+                    """, snap)
+                    continue
+
+                if table == "_inventory_items":
+                    cur.execute("SELECT id FROM pos_inventory_snapshots "
+                                "WHERE source_import_id = %s "
+                                "ORDER BY created_at DESC LIMIT 1",
+                                (import_id,))
+                    snap_row = cur.fetchone()
+                    if not snap_row:
+                        logger.warning("inventory items present but no snapshot row found")
+                        continue
+                    snap_id = snap_row[0]
+                    for it in rows:
+                        it["snapshot_id"] = snap_id
+                    cols = list(rows[0].keys())
+                    cur.executemany(
+                        f"INSERT INTO pos_inventory_items ({','.join(cols)}) "
+                        f"VALUES ({_values_clause(rows, cols)})", rows)
+                    total_rows += len(rows)
+                    continue
+
+                if table == "_sales_items":
+                    for it in rows:
+                        bk = it.pop("_bill_key")
+                        cur.execute("""SELECT id FROM pos_bills
+                                       WHERE branch_code=%s AND receipt_code=%s
+                                         AND sales_date=%s""", bk)
+                        bid = cur.fetchone()
+                        if bid:
+                            it["bill_id"] = bid[0]
+                    rows = [r for r in rows if "bill_id" in r]
+                    cols = list(rows[0].keys()) if rows else []
+                    if rows:
+                        cur.executemany(
+                            "INSERT INTO public.pos_sales_items ({}) VALUES ({})".format(
+                                ",".join(cols), _values_clause(rows, cols)),
+                            rows)
+                        total_rows += len(rows)
+                    continue
+
+                cfg = WRITER_CONFIG.get(table)
+                if not cfg:
+                    logger.warning("No WRITER_CONFIG for table %s — skipped", table)
+                    continue
+                for r in rows:
+                    r["source_import_id"] = import_id
+                n = _upsert(cur, table, rows, **cfg)
+                total_rows += n
+
             cur.execute(
                 "UPDATE public.pos_imports "
                 "SET status='success', period_start=%s, period_end=%s, "
@@ -1150,7 +1429,6 @@ async def import_pos_excel(
         raise
     except Exception as e:
         err_str = str(e)
-        # Duplicate file — silently skip, return the original import record
         if "uq_pos_imports_hash" in err_str or (
             "duplicate key" in err_str and "file_hash" in err_str
         ):
@@ -1158,7 +1436,6 @@ async def import_pos_excel(
                 conn.rollback()
             except Exception:
                 pass
-            # Look up the original import by hash
             try:
                 conn2 = get_db_conn()
                 with conn2.cursor() as cur2:
@@ -1180,7 +1457,7 @@ async def import_pos_excel(
                 period_end=orig[4] if orig else None,
                 detail={"message": "ไฟล์นี้นำเข้าไปแล้ว ข้ามซ้ำโดยอัตโนมัติ"},
             )
-        logger.exception("POS import failed")
+        logger.exception("POS import (sync) failed")
         try:
             with conn.cursor() as cur:
                 cur.execute(
