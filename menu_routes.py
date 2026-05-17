@@ -1884,3 +1884,209 @@ def pos_menu_engineering(
 
     finally:
         conn.close()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 50 — Payment Method & Discount Analytics
+# GET /pos/payments?months=3&branch=thawi_watthana
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PAYMENT_LABEL = {
+    "qr":           "QR Code",
+    "qrcode":       "QR Code",
+    "qr_code":      "QR Code",
+    "cash":         "เงินสด",
+    "credit":       "บัตรเครดิต",
+    "credit_card":  "บัตรเครดิต",
+    "creditcard":   "บัตรเครดิต",
+    "transfer":     "โอนเงิน",
+    "bank":         "โอนเงิน",
+    "grab":         "Grab Pay",
+    "lineman":      "LINE MAN",
+    "line":         "LINE MAN",
+    "voucher":      "Voucher",
+    "coupon":       "Coupon",
+    "member":       "Member Card",
+}
+_PAYMENT_COLOR = {
+    "QR Code":      "#00b96b",
+    "เงินสด":       "#3b82f6",
+    "บัตรเครดิต":  "#f59e0b",
+    "โอนเงิน":      "#8b5cf6",
+    "Grab Pay":     "#00b14f",
+    "LINE MAN":     "#ffc800",
+    "Voucher":      "#ec4899",
+    "Coupon":       "#f97316",
+    "Member Card":  "#06b6d4",
+    "อื่นๆ":        "#94a3b8",
+}
+
+def _normalize_payment(raw: str) -> str:
+    if not raw:
+        return "อื่นๆ"
+    key = raw.strip().lower().replace(" ", "_").replace("-", "_")
+    for k, v in _PAYMENT_LABEL.items():
+        if k in key:
+            return v
+    return raw.strip() or "อื่นๆ"
+
+@router.get("/pos/payments")
+def pos_payments(
+    months: int = Query(3, ge=1, le=12),
+    branch: str = Query("thawi_watthana"),
+):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            end   = date.today().replace(day=1)
+            start = end - relativedelta(months=months)
+
+            # ── Payment method breakdown ──────────────────────────────────
+            cur.execute(
+                """SELECT
+                       payment_type_raw,
+                       COUNT(*)                  AS bill_count,
+                       SUM(net_total)::numeric   AS total_revenue,
+                       AVG(net_total)::numeric   AS avg_bill
+                   FROM public.pos_bills
+                   WHERE branch_code = %s
+                     AND sales_date >= %s
+                     AND sales_date < %s
+                     AND payment_type_raw IS NOT NULL
+                   GROUP BY payment_type_raw
+                   ORDER BY total_revenue DESC""",
+                (branch, start, end),
+            )
+            pay_rows = _rows_to_dicts(cur)
+
+            # aggregate by normalized label
+            pay_agg: dict = {}
+            for r in pay_rows:
+                label = _normalize_payment(r["payment_type_raw"])
+                if label not in pay_agg:
+                    pay_agg[label] = {"bill_count": 0, "total_revenue": 0.0}
+                pay_agg[label]["bill_count"]    += int(r["bill_count"])
+                pay_agg[label]["total_revenue"] += float(r["total_revenue"] or 0)
+
+            grand_pay_rev = sum(v["total_revenue"] for v in pay_agg.values()) or 1
+            payment_methods = sorted(
+                [
+                    {
+                        "label":         lbl,
+                        "bill_count":    v["bill_count"],
+                        "total_revenue": round(v["total_revenue"], 2),
+                        "avg_bill":      round(v["total_revenue"] / v["bill_count"], 2) if v["bill_count"] else 0,
+                        "pct":           round(v["total_revenue"] / grand_pay_rev * 100, 1),
+                        "color":         _PAYMENT_COLOR.get(lbl, "#94a3b8"),
+                    }
+                    for lbl, v in pay_agg.items()
+                ],
+                key=lambda x: -x["total_revenue"],
+            )
+
+            # ── Monthly payment trend ─────────────────────────────────────
+            cur.execute(
+                """SELECT
+                       TO_CHAR(sales_date, 'YYYY-MM') AS month,
+                       payment_type_raw,
+                       SUM(net_total)::numeric         AS total_revenue
+                   FROM public.pos_bills
+                   WHERE branch_code = %s
+                     AND sales_date >= %s
+                     AND sales_date < %s
+                     AND payment_type_raw IS NOT NULL
+                   GROUP BY 1, 2
+                   ORDER BY 1""",
+                (branch, start, end),
+            )
+            trend_rows = _rows_to_dicts(cur)
+
+            months_set: dict = {}
+            for r in trend_rows:
+                mo = r["month"]
+                lbl = _normalize_payment(r["payment_type_raw"])
+                if mo not in months_set:
+                    months_set[mo] = {}
+                months_set[mo][lbl] = months_set[mo].get(lbl, 0) + float(r["total_revenue"] or 0)
+
+            pay_trend = [
+                {"month": mo, **{k: round(v, 2) for k, v in vals.items()}}
+                for mo, vals in sorted(months_set.items())
+            ]
+
+            # ── Discount summary ──────────────────────────────────────────
+            cur.execute(
+                """SELECT
+                       COUNT(*)                                              AS total_bills,
+                       SUM(gross)::numeric                                   AS total_gross,
+                       SUM(item_discount + bill_discount)::numeric           AS total_discount,
+                       SUM(net_total)::numeric                               AS total_net,
+                       COUNT(*) FILTER (
+                           WHERE (item_discount + bill_discount) > 0
+                       )                                                      AS bills_with_discount,
+                       AVG(item_discount + bill_discount) FILTER (
+                           WHERE (item_discount + bill_discount) > 0
+                       )::numeric                                             AS avg_discount_when_given
+                   FROM public.pos_bills
+                   WHERE branch_code = %s
+                     AND sales_date >= %s
+                     AND sales_date < %s""",
+                (branch, start, end),
+            )
+            ds = _rows_to_dicts(cur)[0]
+            total_gross    = float(ds["total_gross"]    or 0)
+            total_discount = float(ds["total_discount"] or 0)
+            discount_summary = {
+                "total_bills":          int(ds["total_bills"] or 0),
+                "total_gross":          round(total_gross, 2),
+                "total_discount":       round(total_discount, 2),
+                "total_net":            round(float(ds["total_net"] or 0), 2),
+                "bills_with_discount":  int(ds["bills_with_discount"] or 0),
+                "avg_discount_when_given": round(float(ds["avg_discount_when_given"] or 0), 2),
+                "discount_rate_pct":    round(total_discount / total_gross * 100, 2) if total_gross else 0,
+                "pct_bills_discounted": round(
+                    int(ds["bills_with_discount"] or 0) / int(ds["total_bills"] or 1) * 100, 1
+                ),
+            }
+
+            # ── Monthly discount trend ────────────────────────────────────
+            cur.execute(
+                """SELECT
+                       TO_CHAR(sales_date, 'YYYY-MM')            AS month,
+                       SUM(gross)::numeric                        AS gross,
+                       SUM(item_discount + bill_discount)::numeric AS discount,
+                       SUM(net_total)::numeric                    AS net,
+                       COUNT(*) FILTER (
+                           WHERE (item_discount + bill_discount) > 0
+                       )                                          AS bills_discounted,
+                       COUNT(*)                                   AS total_bills
+                   FROM public.pos_bills
+                   WHERE branch_code = %s
+                     AND sales_date >= %s
+                     AND sales_date < %s
+                   GROUP BY 1
+                   ORDER BY 1""",
+                (branch, start, end),
+            )
+            disc_trend = []
+            for r in _rows_to_dicts(cur):
+                g = float(r["gross"] or 0)
+                d = float(r["discount"] or 0)
+                disc_trend.append({
+                    "month":            r["month"],
+                    "gross":            round(g, 2),
+                    "discount":         round(d, 2),
+                    "net":              round(float(r["net"] or 0), 2),
+                    "discount_rate":    round(d / g * 100, 2) if g else 0,
+                    "bills_discounted": int(r["bills_discounted"] or 0),
+                    "total_bills":      int(r["total_bills"] or 0),
+                })
+
+        return {
+            "payment_methods":   payment_methods,
+            "pay_trend":         pay_trend,
+            "discount_summary":  discount_summary,
+            "disc_trend":        disc_trend,
+            "period":            {"months": months, "start": str(start), "end": str(end)},
+        }
+    finally:
+        conn.close()
