@@ -782,12 +782,23 @@ def _classify_intent(text: str) -> str:
 
 
 def _extract_product_keyword(text: str) -> str:
-    """Extract the product keyword from the query to search in stock."""
-    lower = text.lower().strip()
-    for kw in _STOCK_PRODUCT_KEYWORDS:
-        if kw in lower:
-            return kw
-    return text.strip()
+    """
+    Extract the product keyword to use for ILIKE search.
+
+    Session 15 fix (2026-05-17): previously this returned the FIRST matching
+    keyword from _STOCK_PRODUCT_KEYWORDS, so "เบียร์สิงห์" → "เบียร์" →
+    matched all beer brands. User wants precise matching: "เบียร์สิงห์"
+    should return only เบียร์สิงห์, "เบียร์ช้าง" should return เบียร์ช้าง*.
+
+    New behavior: strip command words ("เช็ค", "หา", "stock") and return
+    the user's actual product phrase. The DB query uses ILIKE %text% so
+    longer phrases produce more specific results.
+    """
+    cleaned = text.lower().strip()
+    for noise in ("เช็ค", "ค้นหา", "หา ", "ดู ", "เอา ", "stock", "สต็อก", "สต็อค", "สต๊อก", "สต๊อค"):
+        cleaned = cleaned.replace(noise, "")
+    cleaned = cleaned.strip()
+    return cleaned if cleaned else text.strip()
 
 
 def _handle_stock_summary() -> str:
