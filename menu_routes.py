@@ -1493,3 +1493,256 @@ def alerts_summary(branch: str = "thawi_watthana"):
         }
     finally:
         conn.close()
+
+
+# ============================================================
+# Phase 48 — Monthly Business Scorecard
+# ============================================================
+
+def _score_status(value: float, good_thresh: float, warn_thresh: float, higher_is_better: bool = True) -> str:
+    """Return 'good' | 'warning' | 'danger' based on thresholds."""
+    if higher_is_better:
+        if value >= good_thresh: return "good"
+        if value >= warn_thresh: return "warning"
+        return "danger"
+    else:
+        if value <= good_thresh: return "good"
+        if value <= warn_thresh: return "warning"
+        return "danger"
+
+@router.get("/scorecard")
+def scorecard(month: str = "", branch: str = "thawi_watthana"):
+    """
+    Monthly business KPI scorecard.
+    month = YYYY-MM (default = current month).
+    Returns 8 KPIs each with value, label, status (good/warning/danger), vs_last_month.
+    """
+    if not month:
+        month = date.today().strftime("%Y-%m")
+
+    # Compute previous month
+    y, m = int(month[:4]), int(month[5:7])
+    if m == 1:
+        prev_month = f"{y-1}-12"
+    else:
+        prev_month = f"{y}-{m-1:02d}"
+
+    conn = get_db_conn()
+    try:
+        def q(sql: str, params: tuple):
+            rows = _rows_to_dicts(conn, sql, params)
+            return rows[0] if rows else {}
+
+        B = branch
+
+        # ── 1. Revenue this month vs last ─────────────────────
+        rev_sql = """
+            SELECT
+                SUM(CASE WHEN TO_CHAR(entry_date,'YYYY-MM')=%s THEN amount ELSE 0 END) AS this_rev,
+                SUM(CASE WHEN TO_CHAR(entry_date,'YYYY-MM')=%s THEN amount ELSE 0 END) AS prev_rev
+            FROM public.v_daybook
+            WHERE direction='income'
+              AND TO_CHAR(entry_date,'YYYY-MM') IN (%s,%s)
+              AND (%s='' OR branch_code=%s)
+        """
+        rev = q(rev_sql, (month, prev_month, month, prev_month, B, B))
+        this_rev  = float(rev.get("this_rev") or 0)
+        prev_rev  = float(rev.get("prev_rev") or 0)
+        rev_delta = round((this_rev - prev_rev) / prev_rev * 100, 1) if prev_rev else 0
+
+        # ── 2. Total Expenses ─────────────────────────────────
+        exp_sql = """
+            SELECT
+                SUM(CASE WHEN TO_CHAR(entry_date,'YYYY-MM')=%s THEN amount ELSE 0 END) AS this_exp,
+                SUM(CASE WHEN TO_CHAR(entry_date,'YYYY-MM')=%s THEN amount ELSE 0 END) AS prev_exp
+            FROM public.v_daybook
+            WHERE direction='expense'
+              AND TO_CHAR(entry_date,'YYYY-MM') IN (%s,%s)
+              AND (%s='' OR branch_code=%s)
+        """
+        exp = q(exp_sql, (month, prev_month, month, prev_month, B, B))
+        this_exp  = float(exp.get("this_exp") or 0)
+        prev_exp  = float(exp.get("prev_exp") or 0)
+
+        # ── 3. Net Profit ─────────────────────────────────────
+        net_profit = this_rev - this_exp
+        prev_net   = prev_rev - prev_exp
+        net_margin = round(net_profit / this_rev * 100, 1) if this_rev else 0
+        net_delta  = round((net_profit - prev_net) / abs(prev_net) * 100, 1) if prev_net else 0
+
+        # ── 4. Food Cost % ────────────────────────────────────
+        fc_sql = """
+            SELECT COALESCE(SUM(amount),0) AS food_cost
+            FROM public.v_daybook
+            WHERE direction='expense'
+              AND category_code IN ('food_cost','raw_meat','raw_veggies','raw_seasoning','raw_oil_gas','raw_beverage')
+              AND TO_CHAR(entry_date,'YYYY-MM')=%s
+              AND (%s='' OR branch_code=%s)
+        """
+        fc = q(fc_sql, (month, B, B))
+        food_cost    = float(fc.get("food_cost") or 0)
+        food_cost_pct = round(food_cost / this_rev * 100, 1) if this_rev else 0
+
+        # ── 5. Budget Compliance ──────────────────────────────
+        budget_sql = """
+            SELECT
+                COUNT(*) AS total_cats,
+                SUM(CASE WHEN COALESCE(act.actual,0) <= bt.amount THEN 1 ELSE 0 END) AS ok_cats
+            FROM public.budget_targets bt
+            LEFT JOIN (
+                SELECT COALESCE(category_code,'other') AS category_code, SUM(amount) AS actual
+                FROM public.v_daybook
+                WHERE direction='expense' AND TO_CHAR(entry_date,'YYYY-MM')=%s
+                  AND (%s='' OR branch_code=%s)
+                GROUP BY 1
+            ) act USING (category_code)
+            WHERE bt.month=%s AND (%s='' OR bt.branch_code=%s)
+        """
+        budget = q(budget_sql, (month, B, B, month, B, B))
+        total_cats = int(budget.get("total_cats") or 0)
+        ok_cats    = int(budget.get("ok_cats") or 0)
+        budget_pct = round(ok_cats / total_cats * 100) if total_cats else 100
+
+        # ── 6. Delivery Revenue % ─────────────────────────────
+        del_sql = """
+            SELECT COALESCE(SUM(amount),0) AS delivery_rev
+            FROM public.v_daybook
+            WHERE direction='income'
+              AND source IN ('rider_income_grab','rider_income_lineman')
+              AND TO_CHAR(entry_date,'YYYY-MM')=%s
+              AND (%s='' OR branch_code=%s)
+        """
+        del_rev = float((q(del_sql, (month, B, B))).get("delivery_rev") or 0)
+        delivery_pct = round(del_rev / this_rev * 100, 1) if this_rev else 0
+
+        # ── 7. AP Overdue count ───────────────────────────────
+        ap_sql = """
+            SELECT COUNT(*) AS overdue_count, COALESCE(SUM(amount),0) AS overdue_total
+            FROM public.vendor_bills
+            WHERE payment_status='unpaid' AND review_status='confirmed'
+              AND due_date < CURRENT_DATE
+              AND due_date IS NOT NULL
+              AND (%s='' OR branch_code=%s)
+        """
+        ap = q(ap_sql, (B, B))
+        ap_overdue_count = int(ap.get("overdue_count") or 0)
+        ap_overdue_total = float(ap.get("overdue_total") or 0)
+
+        # ── 8. Top Expense Category ───────────────────────────
+        top_exp_sql = """
+            SELECT category_code, SUM(amount) AS total
+            FROM public.v_daybook
+            WHERE direction='expense' AND TO_CHAR(entry_date,'YYYY-MM')=%s
+              AND (%s='' OR branch_code=%s)
+              AND category_code IS NOT NULL
+            GROUP BY category_code ORDER BY total DESC LIMIT 1
+        """
+        top_exp = q(top_exp_sql, (month, B, B))
+
+        # ── Build scorecard ───────────────────────────────────
+        kpis = [
+            {
+                "key":      "revenue",
+                "label":    "รายรับรวม",
+                "value":    this_rev,
+                "display":  f"฿{this_rev:,.0f}",
+                "vs_prev":  rev_delta,
+                "sub":      f"{'▲' if rev_delta>=0 else '▼'} {abs(rev_delta):.1f}% จากเดือนก่อน",
+                "status":   _score_status(rev_delta, 0, -10, higher_is_better=True),
+                "unit":     "บาท",
+                "link":     "/revenue",
+            },
+            {
+                "key":      "net_profit",
+                "label":    "กำไรสุทธิ",
+                "value":    net_profit,
+                "display":  f"฿{net_profit:,.0f}",
+                "vs_prev":  net_delta,
+                "sub":      f"Margin {net_margin:.1f}%",
+                "status":   _score_status(net_margin, 15, 5, higher_is_better=True),
+                "unit":     "บาท",
+                "link":     "/pnl",
+            },
+            {
+                "key":      "food_cost",
+                "label":    "Food Cost %",
+                "value":    food_cost_pct,
+                "display":  f"{food_cost_pct:.1f}%",
+                "vs_prev":  None,
+                "sub":      f"฿{food_cost:,.0f} จากรายรับ",
+                "status":   _score_status(food_cost_pct, 30, 40, higher_is_better=False),
+                "unit":     "%",
+                "link":     "/dashboard",
+            },
+            {
+                "key":      "budget",
+                "label":    "Budget ตามแผน",
+                "value":    budget_pct,
+                "display":  f"{ok_cats}/{total_cats} หมวด" if total_cats else "ไม่มีงบ",
+                "vs_prev":  None,
+                "sub":      f"อยู่ในงบ {budget_pct}%",
+                "status":   _score_status(budget_pct, 80, 50, higher_is_better=True) if total_cats else "info",
+                "unit":     "%",
+                "link":     "/budget",
+            },
+            {
+                "key":      "expenses",
+                "label":    "รายจ่ายรวม",
+                "value":    this_exp,
+                "display":  f"฿{this_exp:,.0f}",
+                "vs_prev":  round((this_exp-prev_exp)/prev_exp*100,1) if prev_exp else 0,
+                "sub":      f"{round(this_exp/this_rev*100,1):.1f}% ของรายรับ" if this_rev else "-",
+                "status":   _score_status(this_exp/this_rev if this_rev else 1, 0.7, 0.85, higher_is_better=False),
+                "unit":     "บาท",
+                "link":     "/expense-trends",
+            },
+            {
+                "key":      "delivery",
+                "label":    "สัดส่วน Delivery",
+                "value":    delivery_pct,
+                "display":  f"{delivery_pct:.1f}%",
+                "vs_prev":  None,
+                "sub":      f"฿{del_rev:,.0f} (Grab + LINE MAN)",
+                "status":   "good" if delivery_pct > 0 else "info",
+                "unit":     "%",
+                "link":     "/delivery",
+            },
+            {
+                "key":      "ap_overdue",
+                "label":    "บิลค้างจ่าย",
+                "value":    ap_overdue_count,
+                "display":  f"{ap_overdue_count} บิล",
+                "vs_prev":  None,
+                "sub":      f"฿{ap_overdue_total:,.0f} รวม",
+                "status":   "danger" if ap_overdue_count > 3 else "warning" if ap_overdue_count > 0 else "good",
+                "unit":     "บิล",
+                "link":     "/bills/payment",
+            },
+            {
+                "key":      "top_expense",
+                "label":    "หมวดรายจ่ายสูงสุด",
+                "value":    float(top_exp.get("total") or 0),
+                "display":  top_exp.get("category_code") or "-",
+                "vs_prev":  None,
+                "sub":      f"฿{float(top_exp.get('total') or 0):,.0f}" if top_exp else "-",
+                "status":   "info",
+                "unit":     "",
+                "link":     "/expense-trends",
+            },
+        ]
+
+        # Overall score = count of good/total (excluding info)
+        scored = [k for k in kpis if k["status"] in ("good","warning","danger")]
+        good_count = sum(1 for k in scored if k["status"] == "good")
+        overall_pct = round(good_count / len(scored) * 100) if scored else 0
+
+        return {
+            "month":        month,
+            "prev_month":   prev_month,
+            "kpis":         kpis,
+            "overall_score": overall_pct,
+            "good_count":   good_count,
+            "total_scored": len(scored),
+        }
+    finally:
+        conn.close()
