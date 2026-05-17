@@ -1746,3 +1746,141 @@ def scorecard(month: str = "", branch: str = "thawi_watthana"):
         }
     finally:
         conn.close()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 49 — Menu Engineering Matrix
+# GET /pos/menu-engineering?months=3&branch=thawi_watthana&min_orders=3
+# Classifies menu items into Star / Plowhorse / Puzzle / Dog quadrants
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/pos/menu-engineering")
+def pos_menu_engineering(
+    months: int = Query(3, ge=1, le=12),
+    branch: str = Query("thawi_watthana"),
+    min_orders: int = Query(3, ge=1),
+):
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            end   = date.today().replace(day=1)
+            start = end - relativedelta(months=months)
+
+            # ── Check item-level data exists ──────────────────────────────
+            cur.execute(
+                """SELECT COUNT(*) AS cnt
+                   FROM public.pos_sales_items si
+                   JOIN public.pos_bills pb ON pb.id = si.bill_id
+                   WHERE pb.branch_code = %s
+                     AND pb.sales_date >= %s AND pb.sales_date < %s""",
+                (branch, start, end),
+            )
+            if cur.fetchone()[0] == 0:
+                return {
+                    "has_data": False,
+                    "message": "ไม่มีข้อมูล item-level — ต้อง upload FoodStory Type 7 (bill detail) ก่อน",
+                    "items": [], "summary": {}, "period": {"months": months, "start": str(start), "end": str(end)},
+                }
+
+            # ── Pull all items with popularity & revenue stats ─────────────
+            cur.execute(
+                """SELECT
+                       si.item_name,
+                       COALESCE(si.category, 'ไม่ระบุหมวด') AS category,
+                       SUM(si.qty)::numeric                  AS total_qty,
+                       SUM(si.net_amount)::numeric           AS total_revenue,
+                       COUNT(DISTINCT si.bill_id)            AS order_count,
+                       AVG(si.unit_price)::numeric           AS avg_price
+                   FROM public.pos_sales_items si
+                   JOIN public.pos_bills pb ON pb.id = si.bill_id
+                   WHERE pb.branch_code = %s
+                     AND pb.sales_date >= %s
+                     AND pb.sales_date < %s
+                     AND si.item_name IS NOT NULL
+                     AND si.item_name <> ''
+                   GROUP BY si.item_name, si.category
+                   HAVING COUNT(DISTINCT si.bill_id) >= %s
+                   ORDER BY total_revenue DESC""",
+                (branch, start, end, min_orders),
+            )
+            rows = _rows_to_dicts(cur)
+
+        if not rows:
+            return {
+                "has_data": False,
+                "message": f"ไม่มี item ที่มี order >= {min_orders} ในช่วง {months} เดือน",
+                "items": [], "summary": {}, "period": {"months": months, "start": str(start), "end": str(end)},
+            }
+
+        # ── Calculate popularity index & revenue index ────────────────────
+        total_items    = len(rows)
+        avg_qty        = sum(float(r["total_qty"])     for r in rows) / total_items
+        avg_revenue    = sum(float(r["total_revenue"]) for r in rows) / total_items
+
+        def _classify(qty, revenue):
+            high_pop = float(qty)     >= avg_qty
+            high_rev = float(revenue) >= avg_revenue
+            if high_pop and high_rev:     return "star"
+            if high_pop and not high_rev: return "plowhorse"
+            if not high_pop and high_rev: return "puzzle"
+            return "dog"
+
+        _QUAD_META = {
+            "star":       {"label": "⭐ Star",       "label_th": "เมนูเด่น",      "color": "#22c55e", "action": "รักษาคุณภาพ + โปรโมต"},
+            "plowhorse":  {"label": "🐄 Plowhorse",  "label_th": "ขายดีแต่กำไรน้อย", "color": "#3b82f6", "action": "พิจารณาขึ้นราคาหรือลดต้นทุน"},
+            "puzzle":     {"label": "❓ Puzzle",      "label_th": "กำไรดีแต่ขายน้อย", "color": "#f59e0b", "action": "โปรโมตให้มากขึ้น"},
+            "dog":        {"label": "🐕 Dog",         "label_th": "ขายน้อยกำไรน้อย", "color": "#ef4444", "action": "พิจารณาตัดเมนูออก"},
+        }
+
+        items = []
+        counts = {"star": 0, "plowhorse": 0, "puzzle": 0, "dog": 0}
+        revenue_by_quad = {"star": 0.0, "plowhorse": 0.0, "puzzle": 0.0, "dog": 0.0}
+
+        grand_total_revenue = sum(float(r["total_revenue"]) for r in rows)
+
+        for r in rows:
+            quad = _classify(r["total_qty"], r["total_revenue"])
+            rev  = float(r["total_revenue"])
+            counts[quad] += 1
+            revenue_by_quad[quad] += rev
+            pct_total = round(rev / grand_total_revenue * 100, 1) if grand_total_revenue else 0
+            pop_index = round(float(r["total_qty"]) / avg_qty, 2)
+            rev_index = round(rev / avg_revenue, 2)
+            items.append({
+                "item_name":    r["item_name"],
+                "category":     r["category"],
+                "quadrant":     quad,
+                "total_qty":    float(r["total_qty"]),
+                "total_revenue": rev,
+                "order_count":  int(r["order_count"]),
+                "avg_price":    round(float(r["avg_price"]), 2),
+                "pct_total":    pct_total,
+                "popularity_index": pop_index,
+                "revenue_index":    rev_index,
+                **_QUAD_META[quad],
+            })
+
+        summary = {
+            "total_items": total_items,
+            "avg_qty":     round(avg_qty, 1),
+            "avg_revenue": round(avg_revenue, 1),
+            "grand_total_revenue": round(grand_total_revenue, 2),
+            "quadrants": {
+                q: {
+                    "count":   counts[q],
+                    "revenue": round(revenue_by_quad[q], 2),
+                    "pct":     round(revenue_by_quad[q] / grand_total_revenue * 100, 1) if grand_total_revenue else 0,
+                    **_QUAD_META[q],
+                }
+                for q in ["star", "plowhorse", "puzzle", "dog"]
+            },
+        }
+
+        return {
+            "has_data": True,
+            "items":    items,
+            "summary":  summary,
+            "period":   {"months": months, "start": str(start), "end": str(end)},
+        }
+
+    finally:
+        conn.close()
