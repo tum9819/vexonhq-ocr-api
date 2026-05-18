@@ -3665,7 +3665,7 @@ def pos_goals(
         days_elapsed = days_in_month
     days_remaining = max(0, days_in_month - days_elapsed)
 
-    branch_filter = "AND branch = %(branch)s" if branch else ""
+    branch_filter = "AND branch_code = %(branch)s" if branch else ""
     params: dict = {"start": str(first_day), "end": str(last_day), "branch": branch}
 
     conn = get_db_conn()
@@ -3673,10 +3673,10 @@ def pos_goals(
         with conn.cursor() as cur:
             cur.execute(f"""
                 SELECT sales_date::text AS dt,
-                       COALESCE(SUM(net_price), 0) AS rev
+                       COALESCE(SUM(bill_net), 0) AS rev
                 FROM pos_bills
                 WHERE sales_date BETWEEN %(start)s AND %(end)s
-                  AND LOWER(COALESCE(status, '')) NOT IN ('void','cancelled')
+                  AND bill_net > 0
                   {branch_filter}
                 GROUP BY sales_date
                 ORDER BY sales_date
