@@ -3904,7 +3904,7 @@ def pos_food_cost(
         start = (start - timedelta(days=1)).replace(day=1)
     start_str = str(start)
 
-    branch_filter = "AND b.branch = %(branch)s" if branch else ""
+    branch_filter = "AND b.branch_code = %(branch)s" if branch else ""
     params: dict = {"start": start_str, "branch": branch}
 
     conn = get_db_conn()
@@ -3936,7 +3936,7 @@ def pos_food_cost(
                 JOIN pos_bills b ON b.id = si.bill_id
                 WHERE b.sales_date >= %(start)s
                   AND si.unit_price > 0
-                  AND LOWER(COALESCE(b.status,'')) NOT IN ('void','cancelled')
+                  AND b.bill_net > 0
                   {branch_filter}
                 GROUP BY si.item_name
                 ORDER BY revenue DESC
@@ -3946,10 +3946,10 @@ def pos_food_cost(
 
             # Total revenue for the period (for summary)
             cur.execute(f"""
-                SELECT COALESCE(SUM(net_price), 0) AS total_rev
+                SELECT COALESCE(SUM(bill_net), 0) AS total_rev
                 FROM pos_bills b
                 WHERE b.sales_date >= %(start)s
-                  AND LOWER(COALESCE(b.status,'')) NOT IN ('void','cancelled')
+                  AND b.bill_net > 0
                   {branch_filter}
             """, params)
             total_rev = float((_rows_to_dicts(cur)[0])["total_rev"] or 0)
