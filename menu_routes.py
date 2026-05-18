@@ -2666,12 +2666,13 @@ def pos_calendar(
             cur.execute(f"""
                 SELECT
                     sales_date,
-                    SUM(net_total)   AS revenue,
+                    SUM(bill_net)    AS revenue,
                     COUNT(*)         AS bill_count,
-                    AVG(net_total)   AS avg_bill,
-                    MAX(net_total)   AS max_bill
+                    AVG(bill_net)    AS avg_bill,
+                    MAX(bill_net)    AS max_bill
                 FROM pos_bills
                 WHERE sales_date BETWEEN %(start)s AND %(end)s
+                  AND bill_net > 0
                   {branch_sql}
                 GROUP BY sales_date
                 ORDER BY sales_date
@@ -2681,14 +2682,15 @@ def pos_calendar(
             # ── Month KPIs ──────────────────────────────────────────────────
             cur.execute(f"""
                 SELECT
-                    SUM(net_total)   AS total_revenue,
+                    SUM(bill_net)    AS total_revenue,
                     COUNT(*)         AS total_bills,
-                    AVG(net_total)   AS avg_bill,
-                    MAX(net_total)   AS max_bill,
-                    MIN(net_total)   AS min_bill,
+                    AVG(bill_net)    AS avg_bill,
+                    MAX(bill_net)    AS max_bill,
+                    MIN(bill_net)    AS min_bill,
                     COUNT(DISTINCT sales_date) AS active_days
                 FROM pos_bills
                 WHERE sales_date BETWEEN %(start)s AND %(end)s
+                  AND bill_net > 0
                   {branch_sql}
             """, params)
             kpi = _rows_to_dicts(cur)[0] if cur.rowcount else {}
