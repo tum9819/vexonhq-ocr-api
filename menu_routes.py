@@ -2916,13 +2916,14 @@ def pos_compare(
             cur.execute(f"""
                 SELECT
                     COUNT(*)            AS total_bills,
-                    SUM(net_total)      AS total_revenue,
-                    AVG(net_total)      AS avg_bill,
-                    MAX(net_total)      AS max_bill,
-                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY net_total) AS median_bill,
+                    SUM(bill_net)       AS total_revenue,
+                    AVG(bill_net)       AS avg_bill,
+                    MAX(bill_net)       AS max_bill,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY bill_net) AS median_bill,
                     COUNT(DISTINCT sales_date) AS active_days
                 FROM pos_bills b
                 WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  AND b.bill_net > 0
                   {branch_sql}
             """, params)
             kpi = _rows_to_dicts(cur)[0]
@@ -2957,10 +2958,11 @@ def pos_compare(
             # DOW avg revenue
             cur.execute(f"""
                 SELECT EXTRACT(DOW FROM b.sales_date)::int AS dow,
-                       AVG(b.net_total) AS avg_bill,
+                       AVG(b.bill_net) AS avg_bill,
                        COUNT(*) AS bill_count
                 FROM pos_bills b
                 WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  AND b.bill_net > 0
                   {branch_sql}
                 GROUP BY 1
                 ORDER BY 1
@@ -2970,9 +2972,10 @@ def pos_compare(
             # Order type
             cur.execute(f"""
                 SELECT COALESCE(NULLIF(TRIM(order_type),''),'ไม่ระบุ') AS order_type,
-                       COUNT(*) AS bill_count, SUM(net_total) AS revenue
+                       COUNT(*) AS bill_count, SUM(bill_net) AS revenue
                 FROM pos_bills b
                 WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  AND b.bill_net > 0
                   {branch_sql}
                 GROUP BY 1
                 ORDER BY revenue DESC
