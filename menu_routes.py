@@ -2115,11 +2115,11 @@ def pos_heatmap(
             SELECT
                 EXTRACT(DOW  FROM b.sales_date)::int  AS dow,
                 EXTRACT(HOUR FROM b.sales_time)::int  AS hr,
-                SUM(b.net_total)::numeric              AS revenue,
+                SUM(b.bill_net)::numeric               AS revenue,
                 COUNT(*)::int                          AS bill_count
             FROM pos_bills b
             WHERE b.sales_date BETWEEN %(start)s AND %(end)s
-              AND b.net_total IS NOT NULL
+              AND b.bill_net > 0
               {branch_filter}
             GROUP BY dow, hr
             ORDER BY dow, hr
