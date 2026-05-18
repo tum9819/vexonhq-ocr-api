@@ -3774,41 +3774,46 @@ def pos_voids(
         start = (start - timedelta(days=1)).replace(day=1)
     start_str = str(start)
 
-    branch_filter = "AND branch = %(branch)s" if branch else ""
+    branch_filter = "AND branch_code = %(branch)s" if branch else ""
+    branch_filter_b = "AND b.branch_code = %(branch)s" if branch else ""
     params: dict = {"start": start_str, "branch": branch}
 
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            # Total bills & revenue (all statuses)
+            # Total bills & revenue (all bills incl. voids; voids have bill_net=0 so SUM unaffected)
             cur.execute(f"""
                 SELECT COUNT(*) AS total_bills,
-                       COALESCE(SUM(net_price), 0) AS total_rev
+                       COALESCE(SUM(bill_net), 0) AS total_rev
                 FROM pos_bills
                 WHERE sales_date >= %(start)s {branch_filter}
             """, params)
             totals = _rows_to_dicts(cur)[0]
 
             # Void summary
+            # No `status` column on pos_bills — void defined as bill_net = 0 AND bill_gross > 0
+            # (bill had items rung up then cancelled, leaving net at zero). Phase 63 / Session 20 fix.
             cur.execute(f"""
                 SELECT COUNT(*) AS void_count,
-                       COALESCE(SUM(net_price), 0) AS void_amount,
-                       COALESCE(AVG(net_price), 0) AS avg_void
+                       COALESCE(SUM(bill_gross), 0) AS void_amount,
+                       COALESCE(AVG(bill_gross), 0) AS avg_void
                 FROM pos_bills
                 WHERE sales_date >= %(start)s
-                  AND LOWER(COALESCE(status,'')) IN ('void','cancelled')
+                  AND bill_net = 0
+                  AND bill_gross > 0
                   {branch_filter}
             """, params)
             void_sum = _rows_to_dicts(cur)[0]
 
-            # By staff
+            # By staff (opened_by — same convention as /pos/staff-stats)
             cur.execute(f"""
-                SELECT COALESCE(staff, '(ไม่ระบุ)') AS staff,
+                SELECT COALESCE(NULLIF(TRIM(opened_by), ''), 'ไม่ระบุ') AS staff,
                        COUNT(*) AS voids,
-                       COALESCE(SUM(net_price), 0) AS amount
+                       COALESCE(SUM(bill_gross), 0) AS amount
                 FROM pos_bills
                 WHERE sales_date >= %(start)s
-                  AND LOWER(COALESCE(status,'')) IN ('void','cancelled')
+                  AND bill_net = 0
+                  AND bill_gross > 0
                   {branch_filter}
                 GROUP BY staff
                 ORDER BY voids DESC
@@ -3820,10 +3825,11 @@ def pos_voids(
             cur.execute(f"""
                 SELECT EXTRACT(HOUR FROM sales_time::time)::int AS hour,
                        COUNT(*) AS voids,
-                       COALESCE(SUM(net_price), 0) AS amount
+                       COALESCE(SUM(bill_gross), 0) AS amount
                 FROM pos_bills
                 WHERE sales_date >= %(start)s
-                  AND LOWER(COALESCE(status,'')) IN ('void','cancelled')
+                  AND bill_net = 0
+                  AND bill_gross > 0
                   AND sales_time IS NOT NULL
                   {branch_filter}
                 GROUP BY hour
@@ -3835,10 +3841,11 @@ def pos_voids(
             cur.execute(f"""
                 SELECT TO_CHAR(sales_date,'YYYY-MM') AS month,
                        COUNT(*) AS voids,
-                       COALESCE(SUM(net_price), 0) AS amount
+                       COALESCE(SUM(bill_gross), 0) AS amount
                 FROM pos_bills
                 WHERE sales_date >= %(start)s
-                  AND LOWER(COALESCE(status,'')) IN ('void','cancelled')
+                  AND bill_net = 0
+                  AND bill_gross > 0
                   {branch_filter}
                 GROUP BY month
                 ORDER BY month
@@ -3854,8 +3861,9 @@ def pos_voids(
                 FROM pos_sales_items si
                 JOIN pos_bills b ON b.id = si.bill_id
                 WHERE b.sales_date >= %(start)s
-                  AND LOWER(COALESCE(b.status,'')) IN ('void','cancelled')
-                  {branch_filter}
+                  AND b.bill_net = 0
+                  AND b.bill_gross > 0
+                  {branch_filter_b}
                 GROUP BY si.item_name
                 ORDER BY void_count DESC
                 LIMIT 15
