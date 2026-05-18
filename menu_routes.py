@@ -4034,7 +4034,7 @@ def pos_shifts(
         start = (start - timedelta(days=1)).replace(day=1)
     start_str = str(start)
 
-    branch_filter = "AND branch = %(branch)s" if branch else ""
+    branch_filter = "AND branch_code = %(branch)s" if branch else ""
     params: dict = {"start": start_str, "branch": branch}
 
     conn = get_db_conn()
@@ -4046,11 +4046,11 @@ def pos_shifts(
                        EXTRACT(DOW  FROM sales_date)::int        AS dow,
                        TO_CHAR(sales_date,'YYYY-MM')             AS month,
                        COUNT(*)                                   AS bills,
-                       COALESCE(SUM(net_price),0)                 AS revenue
+                       COALESCE(SUM(bill_net),0)                  AS revenue
                 FROM pos_bills
                 WHERE sales_date >= %(start)s
                   AND sales_time IS NOT NULL
-                  AND LOWER(COALESCE(status,'')) NOT IN ('void','cancelled')
+                  AND bill_net > 0
                   {branch_filter}
                 GROUP BY hour, dow, month
                 ORDER BY hour
