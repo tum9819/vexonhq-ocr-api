@@ -3915,13 +3915,14 @@ def pos_food_cost(
             priced_count = int((_rows_to_dicts(cur)[0])["cnt"] or 0)
 
             # Recipe cost per menu item (SUM of ingredient qty × price)
+            # NOTE: recipes table uses `name` column, aliased to menu_name for backward compat (Session 18 fix)
             cur.execute("""
-                SELECT r.menu_name,
+                SELECT r.name AS menu_name,
                        COALESCE(SUM(ri.quantity * COALESCE(i.price_per_unit, 0)), 0) AS cost_per_unit
                 FROM recipes r
                 JOIN recipe_ingredients ri ON ri.recipe_id = r.id
                 JOIN ingredients i ON i.id = ri.ingredient_id
-                GROUP BY r.menu_name
+                GROUP BY r.name
             """)
             recipe_costs = {row["menu_name"]: float(row["cost_per_unit"]) for row in _rows_to_dicts(cur)}
 
