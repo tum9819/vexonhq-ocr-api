@@ -200,6 +200,9 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "https://vexonhq-ocr.vercel.app",
+        # Coolify self-host frontend (Session 16 migration)
+        "http://r7plics0ljl0lxwr6r8zdun0.178.128.31.76.sslip.io",
+        "https://r7plics0ljl0lxwr6r8zdun0.178.128.31.76.sslip.io",
     ],
     allow_credentials=True,
     allow_methods=["*"],
