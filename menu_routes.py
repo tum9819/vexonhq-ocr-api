@@ -22,6 +22,7 @@ from typing import Any, Optional
 from uuid import UUID
 
 import psycopg2
+from dateutil.relativedelta import relativedelta
 from fastapi import APIRouter, HTTPException, Query
 
 try:
