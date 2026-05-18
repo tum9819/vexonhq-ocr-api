@@ -41,7 +41,19 @@ DEFAULT_BRANCH = "thawi_watthana"
 # Helpers
 # ─────────────────────────────────────────────────────────
 
-def _rows_to_dicts(cur) -> list[dict]:
+def _rows_to_dicts(cur_or_conn, sql=None, params=None) -> list[dict]:
+    """Convert query rows to list of dicts.
+
+    Two calling conventions:
+      _rows_to_dicts(cur)                 cursor that already executed a query
+      _rows_to_dicts(conn, sql, params)   connection + SQL + params (executes here)
+    """
+    if sql is not None:
+        with cur_or_conn.cursor() as cur:
+            cur.execute(sql, params if params is not None else ())
+            return _rows_to_dicts(cur)
+
+    cur = cur_or_conn
     if cur.description is None:
         return []
     cols = [d[0] for d in cur.description]
