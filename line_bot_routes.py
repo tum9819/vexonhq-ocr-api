@@ -1463,4 +1463,35 @@ def _process_line_events(data: dict) -> None:
         try:
             _process_one_event(event)
         except Exception as e:
-            log
+            log.error("LINE event processing failed: %s", e, exc_info=True)
+
+
+# -------------------------------------------------------------
+# Webhook endpoint (Session 16 restore - Phase 2 bot)
+# Returns 200 immediately; processing happens in BackgroundTask
+# so LINE's 30-second reply_token does not expire on slow ops.
+# -------------------------------------------------------------
+@router.post("/webhook")
+async def line_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_line_signature: Optional[str] = Header(None, alias="X-Line-Signature"),
+):
+    """Receive LINE webhook events and dispatch to background processor."""
+    body = await request.body()
+
+    if x_line_signature and not _verify_signature(body, x_line_signature):
+        log.warning("LINE webhook: invalid signature")
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+    try:
+        data = json.loads(body.decode("utf-8") or "{}")
+    except json.JSONDecodeError as e:
+        log.error("LINE webhook: bad JSON: %s", e)
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    events = data.get("events", [])
+    log.info("LINE webhook received: %d event(s)", len(events))
+
+    background_tasks.add_task(_process_line_events, data)
+    return {"status": "ok", "events_queued": len(events)}
