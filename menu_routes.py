@@ -1948,12 +1948,13 @@ def pos_payments(
                 """SELECT
                        payment_type_raw,
                        COUNT(*)                  AS bill_count,
-                       SUM(net_total)::numeric   AS total_revenue,
-                       AVG(net_total)::numeric   AS avg_bill
+                       SUM(bill_net)::numeric    AS total_revenue,
+                       AVG(bill_net)::numeric    AS avg_bill
                    FROM public.pos_bills
                    WHERE branch_code = %s
                      AND sales_date >= %s
                      AND sales_date < %s
+                     AND bill_net > 0
                      AND payment_type_raw IS NOT NULL
                    GROUP BY payment_type_raw
                    ORDER BY total_revenue DESC""",
@@ -1991,11 +1992,12 @@ def pos_payments(
                 """SELECT
                        TO_CHAR(sales_date, 'YYYY-MM') AS month,
                        payment_type_raw,
-                       SUM(net_total)::numeric         AS total_revenue
+                       SUM(bill_net)::numeric          AS total_revenue
                    FROM public.pos_bills
                    WHERE branch_code = %s
                      AND sales_date >= %s
                      AND sales_date < %s
+                     AND bill_net > 0
                      AND payment_type_raw IS NOT NULL
                    GROUP BY 1, 2
                    ORDER BY 1""",
@@ -2017,22 +2019,29 @@ def pos_payments(
             ]
 
             # ── Discount summary ──────────────────────────────────────────
+            # pos_bills has only bill-level discount; per-line item discount
+            # lives on pos_sales_items.discount — JOIN to capture both.
             cur.execute(
                 """SELECT
-                       COUNT(*)                                              AS total_bills,
-                       SUM(gross)::numeric                                   AS total_gross,
-                       SUM(item_discount + bill_discount)::numeric           AS total_discount,
-                       SUM(net_total)::numeric                               AS total_net,
+                       COUNT(*)                                                                  AS total_bills,
+                       SUM(b.bill_gross)::numeric                                                AS total_gross,
+                       SUM(COALESCE(si.item_disc, 0) + b.bill_discount)::numeric                 AS total_discount,
+                       SUM(b.bill_net)::numeric                                                  AS total_net,
                        COUNT(*) FILTER (
-                           WHERE (item_discount + bill_discount) > 0
-                       )                                                      AS bills_with_discount,
-                       AVG(item_discount + bill_discount) FILTER (
-                           WHERE (item_discount + bill_discount) > 0
-                       )::numeric                                             AS avg_discount_when_given
-                   FROM public.pos_bills
-                   WHERE branch_code = %s
-                     AND sales_date >= %s
-                     AND sales_date < %s""",
+                           WHERE (COALESCE(si.item_disc, 0) + b.bill_discount) > 0
+                       )                                                                          AS bills_with_discount,
+                       AVG(COALESCE(si.item_disc, 0) + b.bill_discount) FILTER (
+                           WHERE (COALESCE(si.item_disc, 0) + b.bill_discount) > 0
+                       )::numeric                                                                 AS avg_discount_when_given
+                   FROM public.pos_bills b
+                   LEFT JOIN (
+                       SELECT bill_id, SUM(discount) AS item_disc
+                       FROM public.pos_sales_items
+                       GROUP BY bill_id
+                   ) si ON si.bill_id = b.id
+                   WHERE b.branch_code = %s
+                     AND b.sales_date >= %s
+                     AND b.sales_date < %s""",
                 (branch, start, end),
             )
             ds = _rows_to_dicts(cur)[0]
@@ -2054,18 +2063,23 @@ def pos_payments(
             # ── Monthly discount trend ────────────────────────────────────
             cur.execute(
                 """SELECT
-                       TO_CHAR(sales_date, 'YYYY-MM')            AS month,
-                       SUM(gross)::numeric                        AS gross,
-                       SUM(item_discount + bill_discount)::numeric AS discount,
-                       SUM(net_total)::numeric                    AS net,
+                       TO_CHAR(b.sales_date, 'YYYY-MM')                                AS month,
+                       SUM(b.bill_gross)::numeric                                      AS gross,
+                       SUM(COALESCE(si.item_disc, 0) + b.bill_discount)::numeric       AS discount,
+                       SUM(b.bill_net)::numeric                                        AS net,
                        COUNT(*) FILTER (
-                           WHERE (item_discount + bill_discount) > 0
-                       )                                          AS bills_discounted,
-                       COUNT(*)                                   AS total_bills
-                   FROM public.pos_bills
-                   WHERE branch_code = %s
-                     AND sales_date >= %s
-                     AND sales_date < %s
+                           WHERE (COALESCE(si.item_disc, 0) + b.bill_discount) > 0
+                       )                                                                AS bills_discounted,
+                       COUNT(*)                                                         AS total_bills
+                   FROM public.pos_bills b
+                   LEFT JOIN (
+                       SELECT bill_id, SUM(discount) AS item_disc
+                       FROM public.pos_sales_items
+                       GROUP BY bill_id
+                   ) si ON si.bill_id = b.id
+                   WHERE b.branch_code = %s
+                     AND b.sales_date >= %s
+                     AND b.sales_date < %s
                    GROUP BY 1
                    ORDER BY 1""",
                 (branch, start, end),
