@@ -3382,17 +3382,18 @@ def pos_predict(weeks: int = Query(8), branch: str = Query("")):
                 SELECT
                     EXTRACT(DOW FROM sales_date)::int  AS dow,   -- 0=Sun..6=Sat (postgres)
                     COUNT(DISTINCT sales_date)          AS day_count,
-                    COALESCE(SUM(net_total), 0)         AS total_rev,
-                    COALESCE(AVG(net_total), 0)         AS avg_daily_rev,
-                    COALESCE(STDDEV(net_total), 0)      AS std_dev,
+                    COALESCE(SUM(daily_rev), 0)         AS total_rev,
+                    COALESCE(AVG(daily_rev), 0)         AS avg_daily_rev,
+                    COALESCE(STDDEV(daily_rev), 0)      AS std_dev,
                     COUNT(*)                            AS total_bills,
                     COALESCE(AVG(COUNT(*)) OVER(), 0)   AS overall_avg_bills
                 FROM (
                     SELECT sales_date,
-                           SUM(net_total)  AS net_total,
+                           SUM(bill_net)   AS daily_rev,
                            COUNT(*)        AS bills
                     FROM pos_bills
                     WHERE sales_date BETWEEN %(train_start)s AND %(today)s
+                      AND bill_net > 0
                     {branch_filter}
                     GROUP BY sales_date
                 ) daily
@@ -3421,9 +3422,10 @@ def pos_predict(weeks: int = Query(8), branch: str = Query("")):
             cur.execute(f"""
                 SELECT
                     sales_date,
-                    SUM(net_total) AS daily_rev
+                    SUM(bill_net) AS daily_rev
                 FROM pos_bills
                 WHERE sales_date BETWEEN %(train_start)s AND %(today)s
+                  AND bill_net > 0
                 {branch_filter}
                 GROUP BY sales_date
                 ORDER BY sales_date
@@ -3472,10 +3474,11 @@ def pos_predict(weeks: int = Query(8), branch: str = Query("")):
             cur.execute(f"""
                 SELECT
                     sales_date,
-                    SUM(net_total) AS revenue,
+                    SUM(bill_net) AS revenue,
                     COUNT(*)       AS bills
                 FROM pos_bills
                 WHERE sales_date BETWEEN %(as)s AND %(today)s
+                  AND bill_net > 0
                 {branch_filter}
                 GROUP BY sales_date
                 ORDER BY sales_date
