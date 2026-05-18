@@ -3228,22 +3228,33 @@ def pos_discounts(months: int = Query(3), branch: str = Query("")):
         with conn.cursor() as cur:
             end_date   = date_type.today()
             start_date = (end_date.replace(day=1) - relativedelta(months=months - 1))
-            branch_filter = "AND branch_code = %(branch)s" if branch else ""
+            branch_filter = "AND b.branch_code = %(branch)s" if branch else ""
             params = {"start": start_date, "end": end_date, "branch": branch}
+
+            # pos_bills has only bill-level discount; per-line item discount
+            # lives on pos_sales_items.discount — JOIN aggregates per bill_id.
+            si_join = """
+                LEFT JOIN (
+                    SELECT bill_id, SUM(discount) AS item_disc
+                    FROM pos_sales_items
+                    GROUP BY bill_id
+                ) si ON si.bill_id = b.id
+            """
 
             # Overall summary
             cur.execute(f"""
                 SELECT
-                    COUNT(*)                                                        AS total_bills,
-                    COALESCE(SUM(net_total), 0)                                    AS total_net,
-                    COALESCE(SUM(item_discount + bill_discount), 0)                AS total_discount,
-                    COALESCE(SUM(item_discount), 0)                                AS total_item_disc,
-                    COALESCE(SUM(bill_discount), 0)                                AS total_bill_disc,
-                    COUNT(*) FILTER (WHERE (item_discount + bill_discount) > 0)    AS discounted_bills,
-                    COALESCE(AVG(item_discount + bill_discount)
-                        FILTER (WHERE (item_discount + bill_discount) > 0), 0)     AS avg_discount_per_bill
-                FROM pos_bills
-                WHERE sales_date BETWEEN %(start)s AND %(end)s
+                    COUNT(*)                                                                    AS total_bills,
+                    COALESCE(SUM(b.bill_net), 0)                                                AS total_net,
+                    COALESCE(SUM(COALESCE(si.item_disc, 0) + b.bill_discount), 0)               AS total_discount,
+                    COALESCE(SUM(COALESCE(si.item_disc, 0)), 0)                                 AS total_item_disc,
+                    COALESCE(SUM(b.bill_discount), 0)                                           AS total_bill_disc,
+                    COUNT(*) FILTER (WHERE (COALESCE(si.item_disc, 0) + b.bill_discount) > 0)   AS discounted_bills,
+                    COALESCE(AVG(COALESCE(si.item_disc, 0) + b.bill_discount)
+                        FILTER (WHERE (COALESCE(si.item_disc, 0) + b.bill_discount) > 0), 0)    AS avg_discount_per_bill
+                FROM pos_bills b
+                {si_join}
+                WHERE b.sales_date BETWEEN %(start)s AND %(end)s
                 {branch_filter}
             """, params)
             row = cur.fetchone()
@@ -3262,19 +3273,20 @@ def pos_discounts(months: int = Query(3), branch: str = Query("")):
                 "pct_bills_discounted": round(int(row[5] or 0) / max(int(row[0] or 1), 1) * 100, 1),
             }
 
-            # By staff (top 15 staff with most discount given)
+            # By staff (top 15 staff with most discount given) — opened_by aliased as staff
             cur.execute(f"""
                 SELECT
-                    COALESCE(staff_name, 'ไม่ระบุ')              AS staff,
-                    COUNT(*)                                       AS bills,
-                    COUNT(*) FILTER (WHERE (item_discount + bill_discount) > 0) AS disc_bills,
-                    COALESCE(SUM(item_discount + bill_discount), 0) AS total_disc,
-                    COALESCE(SUM(net_total), 0)                    AS net_rev
-                FROM pos_bills
-                WHERE sales_date BETWEEN %(start)s AND %(end)s
+                    COALESCE(NULLIF(TRIM(b.opened_by), ''), 'ไม่ระบุ') AS staff,
+                    COUNT(*)                                            AS bills,
+                    COUNT(*) FILTER (WHERE (COALESCE(si.item_disc, 0) + b.bill_discount) > 0) AS disc_bills,
+                    COALESCE(SUM(COALESCE(si.item_disc, 0) + b.bill_discount), 0) AS total_disc,
+                    COALESCE(SUM(b.bill_net), 0)                        AS net_rev
+                FROM pos_bills b
+                {si_join}
+                WHERE b.sales_date BETWEEN %(start)s AND %(end)s
                 {branch_filter}
                 GROUP BY staff
-                HAVING SUM(item_discount + bill_discount) > 0
+                HAVING SUM(COALESCE(si.item_disc, 0) + b.bill_discount) > 0
                 ORDER BY total_disc DESC
                 LIMIT 15
             """, params)
@@ -3295,11 +3307,12 @@ def pos_discounts(months: int = Query(3), branch: str = Query("")):
             # By hour of day
             cur.execute(f"""
                 SELECT
-                    EXTRACT(HOUR FROM sales_time::time)::int       AS hr,
-                    COUNT(*) FILTER (WHERE (item_discount + bill_discount) > 0) AS disc_bills,
-                    COALESCE(SUM(item_discount + bill_discount), 0) AS total_disc
-                FROM pos_bills
-                WHERE sales_date BETWEEN %(start)s AND %(end)s
+                    EXTRACT(HOUR FROM b.sales_time::time)::int     AS hr,
+                    COUNT(*) FILTER (WHERE (COALESCE(si.item_disc, 0) + b.bill_discount) > 0) AS disc_bills,
+                    COALESCE(SUM(COALESCE(si.item_disc, 0) + b.bill_discount), 0) AS total_disc
+                FROM pos_bills b
+                {si_join}
+                WHERE b.sales_date BETWEEN %(start)s AND %(end)s
                 {branch_filter}
                 GROUP BY hr
                 ORDER BY hr
@@ -3313,13 +3326,14 @@ def pos_discounts(months: int = Query(3), branch: str = Query("")):
             # Monthly trend
             cur.execute(f"""
                 SELECT
-                    TO_CHAR(sales_date, 'YYYY-MM')                 AS month,
-                    COALESCE(SUM(net_total), 0)                    AS net_rev,
-                    COALESCE(SUM(item_discount + bill_discount), 0) AS total_disc,
-                    COUNT(*) FILTER (WHERE (item_discount + bill_discount) > 0) AS disc_bills,
+                    TO_CHAR(b.sales_date, 'YYYY-MM')               AS month,
+                    COALESCE(SUM(b.bill_net), 0)                   AS net_rev,
+                    COALESCE(SUM(COALESCE(si.item_disc, 0) + b.bill_discount), 0) AS total_disc,
+                    COUNT(*) FILTER (WHERE (COALESCE(si.item_disc, 0) + b.bill_discount) > 0) AS disc_bills,
                     COUNT(*)                                        AS total_bills
-                FROM pos_bills
-                WHERE sales_date BETWEEN %(start)s AND %(end)s
+                FROM pos_bills b
+                {si_join}
+                WHERE b.sales_date BETWEEN %(start)s AND %(end)s
                 {branch_filter}
                 GROUP BY month
                 ORDER BY month
@@ -3341,12 +3355,13 @@ def pos_discounts(months: int = Query(3), branch: str = Query("")):
             # By order type
             cur.execute(f"""
                 SELECT
-                    COALESCE(order_type, 'ไม่ระบุ')               AS otype,
+                    COALESCE(b.order_type, 'ไม่ระบุ')              AS otype,
                     COUNT(*)                                        AS bills,
-                    COALESCE(SUM(item_discount + bill_discount), 0) AS total_disc,
-                    COALESCE(SUM(net_total), 0)                    AS net_rev
-                FROM pos_bills
-                WHERE sales_date BETWEEN %(start)s AND %(end)s
+                    COALESCE(SUM(COALESCE(si.item_disc, 0) + b.bill_discount), 0) AS total_disc,
+                    COALESCE(SUM(b.bill_net), 0)                   AS net_rev
+                FROM pos_bills b
+                {si_join}
+                WHERE b.sales_date BETWEEN %(start)s AND %(end)s
                 {branch_filter}
                 GROUP BY otype
                 ORDER BY total_disc DESC
