@@ -2375,25 +2375,25 @@ def pos_bill_analysis(
         kpi_sql = f"""
             SELECT
                 COUNT(*)::int                        AS total_bills,
-                AVG(net_total)::numeric              AS avg_bill,
-                MIN(net_total)::numeric              AS min_bill,
-                MAX(net_total)::numeric              AS max_bill,
-                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY net_total)::numeric AS median_bill,
-                SUM(net_total)::numeric              AS total_revenue
+                AVG(bill_net)::numeric               AS avg_bill,
+                MIN(bill_net)::numeric               AS min_bill,
+                MAX(bill_net)::numeric               AS max_bill,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY bill_net)::numeric AS median_bill,
+                SUM(bill_net)::numeric               AS total_revenue
             FROM pos_bills
             WHERE sales_date BETWEEN %(start)s AND %(end)s
-              AND net_total > 0
+              AND bill_net > 0
               {branch_filter}
         """
 
         # Histogram — 10 buckets (0-99, 100-199, ..., 900+)
         hist_sql = f"""
             SELECT
-                FLOOR(net_total / 100) * 100 AS bucket_start,
+                FLOOR(bill_net / 100) * 100 AS bucket_start,
                 COUNT(*)::int                AS bill_count
             FROM pos_bills
             WHERE sales_date BETWEEN %(start)s AND %(end)s
-              AND net_total >= 0 AND net_total < 10000
+              AND bill_net >= 0 AND bill_net < 10000
               {branch_filter}
             GROUP BY bucket_start
             ORDER BY bucket_start
@@ -2403,11 +2403,11 @@ def pos_bill_analysis(
         dow_sql = f"""
             SELECT
                 EXTRACT(DOW FROM sales_date)::int AS dow,
-                AVG(net_total)::numeric           AS avg_bill,
+                AVG(bill_net)::numeric            AS avg_bill,
                 COUNT(*)::int                     AS bill_count
             FROM pos_bills
             WHERE sales_date BETWEEN %(start)s AND %(end)s
-              AND net_total > 0
+              AND bill_net > 0
               {branch_filter}
             GROUP BY dow
             ORDER BY dow
@@ -2417,12 +2417,12 @@ def pos_bill_analysis(
         otype_sql = f"""
             SELECT
                 COALESCE(NULLIF(TRIM(order_type), ''), 'ไม่ระบุ') AS order_type,
-                AVG(net_total)::numeric  AS avg_bill,
+                AVG(bill_net)::numeric   AS avg_bill,
                 COUNT(*)::int            AS bill_count,
-                SUM(net_total)::numeric  AS total_revenue
+                SUM(bill_net)::numeric   AS total_revenue
             FROM pos_bills
             WHERE sales_date BETWEEN %(start)s AND %(end)s
-              AND net_total > 0
+              AND bill_net > 0
               {branch_filter}
             GROUP BY order_type
             ORDER BY total_revenue DESC
@@ -2432,12 +2432,12 @@ def pos_bill_analysis(
         trend_sql = f"""
             SELECT
                 TO_CHAR(DATE_TRUNC('month', sales_date), 'YYYY-MM') AS month,
-                AVG(net_total)::numeric  AS avg_bill,
+                AVG(bill_net)::numeric   AS avg_bill,
                 COUNT(*)::int            AS bill_count,
-                SUM(net_total)::numeric  AS total_revenue
+                SUM(bill_net)::numeric   AS total_revenue
             FROM pos_bills
             WHERE sales_date BETWEEN %(start)s AND %(end)s
-              AND net_total > 0
+              AND bill_net > 0
               {branch_filter}
             GROUP BY month
             ORDER BY month
