@@ -64,6 +64,7 @@ from stock_routes import router as stock_router
 from recipe_routes import router as recipe_router, ingredient_router
 from tax_routes import router as tax_router
 from auth_routes import router as auth_router, verify_token
+from alerts_webhook_routes import router as alerts_router
 # === Phase 2: psycopg connection for POS bulk imports ===
 # (Phase 1 uses supabase client for OCR flows — this is for high-volume
 #  executemany() inserts that need raw PG driver)
@@ -142,6 +143,7 @@ app.include_router(stock_router)
 app.include_router(recipe_router)
 app.include_router(ingredient_router)
 app.include_router(tax_router)
+app.include_router(alerts_router)
 # ============================================================
 # JWT Auth Middleware — protects all routes except public ones
 # NOTE: Must be added BEFORE CORSMiddleware so CORS is outermost.
@@ -153,7 +155,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse as StarletteJSONResponse
 
-PUBLIC_PATHS = {"/", "/health", "/auth/login", "/auth/logout", "/docs", "/openapi.json", "/redoc", "/ap/due-reminder", "/stock/alert"}
+PUBLIC_PATHS = {"/", "/health", "/auth/login", "/auth/logout", "/docs", "/openapi.json", "/redoc", "/ap/due-reminder", "/stock/alert", "/alerts/uptime-webhook", "/alerts/test-telegram"}
 
 class JWTAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: StarletteRequest, call_next):
