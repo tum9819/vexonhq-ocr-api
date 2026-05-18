@@ -3071,12 +3071,13 @@ def pos_flash(date: str = Query(None), branch: str = Query("")):
             def fetch_day_kpi(d):
                 cur.execute(f"""
                     SELECT
-                        COALESCE(SUM(net_total), 0)        AS revenue,
+                        COALESCE(SUM(bill_net), 0)         AS revenue,
                         COUNT(*)                            AS bills,
-                        COALESCE(AVG(net_total), 0)        AS avg_bill,
-                        COALESCE(MAX(net_total), 0)        AS max_bill
+                        COALESCE(AVG(bill_net), 0)         AS avg_bill,
+                        COALESCE(MAX(bill_net), 0)         AS max_bill
                     FROM pos_bills
                     WHERE sales_date = %(d)s
+                      AND bill_net > 0
                     {branch_filter}
                 """, {**params, "d": d})
                 row = cur.fetchone()
@@ -3115,10 +3116,11 @@ def pos_flash(date: str = Query(None), branch: str = Query("")):
             cur.execute(f"""
                 SELECT
                     EXTRACT(HOUR FROM sales_time::time)::int AS hr,
-                    COALESCE(SUM(net_total), 0)              AS revenue,
+                    COALESCE(SUM(bill_net), 0)               AS revenue,
                     COUNT(*)                                  AS bills
                 FROM pos_bills
                 WHERE sales_date = %(d)s
+                  AND bill_net > 0
                 {branch_filter}
                 GROUP BY hr
                 ORDER BY hr
@@ -3149,9 +3151,10 @@ def pos_flash(date: str = Query(None), branch: str = Query("")):
 
             # Order type split today
             cur.execute(f"""
-                SELECT order_type, COUNT(*) AS bills, SUM(net_total) AS revenue
+                SELECT order_type, COUNT(*) AS bills, SUM(bill_net) AS revenue
                 FROM pos_bills
                 WHERE sales_date = %(d)s
+                  AND bill_net > 0
                 {branch_filter}
                 GROUP BY order_type
                 ORDER BY revenue DESC
@@ -3167,11 +3170,12 @@ def pos_flash(date: str = Query(None), branch: str = Query("")):
             month_start = target.replace(day=1)
             cur.execute(f"""
                 SELECT
-                    COALESCE(SUM(net_total), 0) AS mtd_revenue,
+                    COALESCE(SUM(bill_net), 0)  AS mtd_revenue,
                     COUNT(*)                     AS mtd_bills,
                     COUNT(DISTINCT sales_date)   AS active_days
                 FROM pos_bills
                 WHERE sales_date BETWEEN %(ms)s AND %(t)s
+                  AND bill_net > 0
                 {branch_filter}
             """, {**params, "ms": month_start, "t": target})
             mtd_row = cur.fetchone()
