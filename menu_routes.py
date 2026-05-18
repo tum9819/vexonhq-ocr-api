@@ -3918,7 +3918,7 @@ def pos_food_cost(
             # NOTE: recipes table uses `name` column, aliased to menu_name for backward compat (Session 18 fix)
             cur.execute("""
                 SELECT r.name AS menu_name,
-                       COALESCE(SUM(ri.quantity * COALESCE(i.price_per_unit, 0)), 0) AS cost_per_unit
+                       COALESCE(SUM(ri.qty_used * COALESCE(i.price_per_unit, 0)), 0) AS cost_per_unit
                 FROM recipes r
                 JOIN recipe_ingredients ri ON ri.recipe_id = r.id
                 JOIN ingredients i ON i.id = ri.ingredient_id
