@@ -156,7 +156,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse as StarletteJSONResponse
 
-PUBLIC_PATHS = {"/", "/health", "/health/deep", "/auth/login", "/auth/logout", "/docs", "/openapi.json", "/redoc", "/ap/due-reminder", "/stock/alert", "/alerts/uptime-webhook", "/alerts/test-telegram"}
+PUBLIC_PATHS = {"/", "/health", "/health/deep", "/auth/login", "/auth/logout", "/docs", "/openapi.json", "/redoc", "/ap/due-reminder", "/stock/alert", "/alerts/uptime-webhook", "/alerts/test-telegram", "/line/webhook"}
 
 class JWTAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: StarletteRequest, call_next):
@@ -166,10 +166,12 @@ class JWTAuthMiddleware(BaseHTTPMiddleware):
         if request.method == "OPTIONS":
             return await call_next(request)
 
-        # Allow public routes and LINE webhook without auth
+        # Allow public routes (LINE webhook listed explicitly in PUBLIC_PATHS
+        # — was previously a broad `/line/*` prefix, which exposed
+        # /line/scheduler/status, /line/digest/*, /line/test, /line/weekly-summary
+        # to unauthenticated readers. Narrowed Session 24 P1 task O.)
         if (path in PUBLIC_PATHS
                 or path.startswith("/auth/")
-                or path.startswith("/line/")
                 or path.startswith("/docs")
                 or path.startswith("/redoc")):
             return await call_next(request)

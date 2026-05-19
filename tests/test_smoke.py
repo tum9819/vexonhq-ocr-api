@@ -53,12 +53,6 @@ PUBLIC_ROUTES = [
     ("GET", "/health"),
     ("GET", "/health/deep"),
     ("GET", "/openapi.json"),
-    # JWTAuthMiddleware in main.py exempts any path starting with /line/
-    # (so LINE Messaging API can call /line/webhook without a Bearer token).
-    # Side effect: /line/scheduler/status is publicly readable too.
-    # If you want to lock it down, narrow the middleware prefix to
-    # /line/webhook explicitly and move this back to AUTHED_ROUTES.
-    ("GET", "/line/scheduler/status"),
 ]
 
 # ──────────────────────────────────────────────────────────
@@ -145,6 +139,11 @@ AUTHED_ROUTES = [
 
     # Auth
     ("GET", "/auth/me"),
+
+    # LINE bot diagnostics (now authed after Session 24 task O narrowed
+    # the middleware prefix — only /line/webhook stays public for LINE
+    # Messaging API callbacks)
+    ("GET", "/line/scheduler/status"),
 ]
 
 
