@@ -421,6 +421,85 @@ def invoice_queue(limit: int = 50, offset: int = 0):
     return {"success": True, "invoices": resp.data, "count": len(resp.data or [])}
 
 
+@app.get("/invoice/duplicates")
+def invoice_suspected_duplicates():
+    """Find groups of pending bills suspected to be duplicates of each other.
+
+    Strict-match heuristic (high precision, low recall):
+      same vendor_name (lowercase trim) + same amount + same bill_date.
+
+    Catches OCR misread cases where the same paper invoice was uploaded twice
+    and the model extracted slightly different `invoice_no` strings (e.g.
+    "SS 68093823" vs "SS 680903823" — an extra "0"). Strict dedup by invoice_no
+    in _save_invoice() can't catch this; this endpoint surfaces it for the user.
+
+    Only considers bills with `review_status IN ('pending', 'needs_attention')`.
+    Once a bill is confirmed/rejected, it's intentionally excluded so the
+    operator can re-upload a confirmed bill if needed.
+
+    Returns groups of >= 2 bills. Each group lists the bills sorted by
+    `created_at` ascending (oldest first) so the user can keep the original
+    and reject the later upload.
+    """
+    sb = get_supabase()
+    resp = (
+        sb.table("vendor_bills")
+        .select("id, vendor_name, invoice_no, bill_date, amount, "
+                "created_at, review_status, payment_status")
+        .in_("review_status", ["pending", "needs_attention"])
+        .execute()
+    )
+    rows = resp.data or []
+
+    from collections import defaultdict
+    groups: dict[tuple, list[dict]] = defaultdict(list)
+    for r in rows:
+        vendor_raw = r.get("vendor_name")
+        amount_raw = r.get("amount")
+        if not vendor_raw or amount_raw is None:
+            continue
+        vendor_norm = vendor_raw.strip().lower()
+        try:
+            amount_num = float(amount_raw)
+        except (TypeError, ValueError):
+            continue
+        if amount_num <= 0:
+            continue
+        key = (vendor_norm, amount_num, r.get("bill_date"))
+        groups[key].append(r)
+
+    out_groups: list[dict] = []
+    for (_vendor_norm, amount_num, _bill_date), bills in groups.items():
+        if len(bills) < 2:
+            continue
+        bills.sort(key=lambda b: b.get("created_at") or "")
+        out_groups.append({
+            "vendor_name": bills[0].get("vendor_name"),
+            "amount": amount_num,
+            "bill_date": bills[0].get("bill_date"),
+            "count": len(bills),
+            "bills": [
+                {
+                    "id": b["id"],
+                    "invoice_no": b.get("invoice_no"),
+                    "created_at": b.get("created_at"),
+                    "review_status": b.get("review_status"),
+                    "payment_status": b.get("payment_status"),
+                }
+                for b in bills
+            ],
+        })
+
+    out_groups.sort(key=lambda g: (g["vendor_name"] or "", g["amount"]))
+
+    return {
+        "success": True,
+        "groups": out_groups,
+        "total_groups": len(out_groups),
+        "total_bills": sum(g["count"] for g in out_groups),
+    }
+
+
 @app.get("/invoice/{invoice_id}")
 def invoice_detail(invoice_id: str):
     """Full invoice detail: header + items + pages + warnings."""
