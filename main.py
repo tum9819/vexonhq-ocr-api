@@ -1216,7 +1216,151 @@ def invoice_confirm(
     )
     if not resp.data:
         raise HTTPException(404, "invoice not found")
-    return {"success": True, "invoice": resp.data[0]}
+
+    # Invoice ↔ Statement dedup workflow (TOMORROW.md item D).
+    # When a vendor bill is confirmed, look for a matching outgoing row
+    # in bank_statement_entries and re-tag it as `vendor_payment` so the
+    # P&L Phase 1 exclusion list stops counting it twice. The vendor_bill
+    # itself becomes the canonical expense source going forward.
+    #
+    # Failure here is non-fatal — the confirm itself already succeeded.
+    # If the match logic crashes (network, schema mismatch, etc.) we log
+    # and return the unchanged bill payload. TUM can re-run via the
+    # explicit POST /invoice/{id}/match-statement below.
+    match_summary = None
+    try:
+        match_summary = _match_invoice_against_statement(invoice_id, reviewer)
+    except Exception:
+        log.exception("invoice ↔ statement dedup failed (non-fatal) for %s", invoice_id)
+
+    return {
+        "success": True,
+        "invoice": resp.data[0],
+        "statement_match": match_summary,
+    }
+
+
+def _match_invoice_against_statement(
+    invoice_id: str,
+    actor: Optional[str],
+) -> Optional[dict]:
+    """
+    Try to dedup a freshly-confirmed `vendor_bill` against an outgoing
+    row in `bank_statement_entries`.
+
+    Match criteria (loosest first → tightest):
+      - same amount within ±1 baht
+      - bill_date within ±7 days of statement txn_date
+      - statement row currently source_type IN ('bank_statement',
+                                                'vendor_purchase')
+      - statement row not already matched to another invoice
+
+    Behaviour:
+      - 0 candidates → return None (no double-count to fix)
+      - 1 candidate  → re-tag statement row as `vendor_payment` and
+                       point matched_invoice_id at this bill
+      - >1 candidates → mark them `match_status='needs_review'` and
+                        DON'T flip source_type — TUM picks the right
+                        one manually via `/bills/payment` UI.
+    """
+    sb = get_supabase()
+    bill = (
+        sb.table("vendor_bills")
+        .select("id, bill_date, amount, vendor_name")
+        .eq("id", invoice_id)
+        .limit(1)
+        .execute()
+    )
+    if not bill.data:
+        return None
+    bill_row = bill.data[0]
+    amount = bill_row.get("amount")
+    bill_date = bill_row.get("bill_date")
+    if amount is None or not bill_date:
+        # Not enough info to match against the statement.
+        return {"status": "skipped", "reason": "amount or bill_date missing"}
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, txn_date, debit, description, source_type, match_status
+                FROM public.bank_statement_entries
+                WHERE matched_invoice_id IS NULL
+                  AND debit > 0
+                  AND ABS(debit - %s) <= 1.00
+                  AND ABS(txn_date - %s::date) <= 7
+                  AND source_type IN ('bank_statement', 'vendor_purchase')
+                ORDER BY ABS(txn_date - %s::date), ABS(debit - %s)
+                """,
+                (amount, bill_date, bill_date, amount),
+            )
+            candidates = cur.fetchall()
+
+            if not candidates:
+                return {"status": "no_match", "candidates": 0}
+
+            if len(candidates) == 1:
+                stmt_id, txn_date, debit, description, _src, _ms = candidates[0]
+                cur.execute(
+                    """
+                    UPDATE public.bank_statement_entries
+                    SET source_type        = 'vendor_payment',
+                        matched_invoice_id = %s,
+                        match_status       = 'auto',
+                        notes              = COALESCE(notes, '')
+                                             || CASE WHEN COALESCE(notes,'') = '' THEN '' ELSE ' | ' END
+                                             || 'matched by ' || COALESCE(%s, 'system')
+                                             || ' at ' || NOW()::text
+                    WHERE id = %s
+                    """,
+                    (invoice_id, actor, str(stmt_id)),
+                )
+                conn.commit()
+                return {
+                    "status":          "matched",
+                    "statement_id":    str(stmt_id),
+                    "txn_date":        str(txn_date),
+                    "amount":          float(debit),
+                    "description":     description,
+                }
+
+            # Multiple candidates — flag for review, don't auto-flip.
+            ids = [str(r[0]) for r in candidates]
+            cur.execute(
+                """
+                UPDATE public.bank_statement_entries
+                SET match_status = 'needs_review'
+                WHERE id = ANY(%s)
+                """,
+                (ids,),
+            )
+            conn.commit()
+            return {
+                "status":     "ambiguous",
+                "candidates": len(candidates),
+                "statement_ids": ids,
+            }
+    finally:
+        conn.close()
+
+
+@app.post("/invoice/{invoice_id}/match-statement")
+def invoice_match_statement(invoice_id: str, request: Request):
+    """
+    Manually re-trigger the invoice ↔ statement dedup matcher for an
+    already-confirmed bill. Useful when TUM later imports the statement
+    PDF (so the matching row didn't exist at confirm time) or when the
+    initial auto-match was ambiguous and he wants to retry after editing.
+    """
+    actor = _current_username(request)
+    sb = get_supabase()
+    bill = sb.table("vendor_bills").select("id").eq("id", invoice_id).execute()
+    if not bill.data:
+        raise HTTPException(404, "invoice not found")
+    result = _match_invoice_against_statement(invoice_id, actor)
+    return {"success": True, "statement_match": result}
 
 
 @app.post("/invoice/{invoice_id}/reject")
