@@ -252,3 +252,127 @@ def get_suggestions():
             "บิล Lineman เดือนเมษายน",
         ]
     }
+
+
+@router.get("/empty-hints")
+def get_empty_hints(q: str = ""):
+    """
+    Helper for `/search/receipt` 0-results UX (Issue 2, Session 25).
+
+    Returns three lists so the frontend can show *actionable* hints when a
+    user search returns nothing:
+
+    - **top_vendors** – the 10 biggest confirmed vendors by total amount.
+      Lets the user see what's actually in the database (e.g. their bills
+      are labelled "ซีพี แอ็กซ์ตร้า", not "Makro").
+    - **alias_hints** – rows from `vendor_aliases` whose `product_keyword`
+      overlaps with the query. Surfaces TUM-curated mappings (e.g.
+      "เบียร์ช้าง" → "วัฒนา") so the user can re-search with the
+      bank-statement name instead of the brand name.
+    - **fuzzy_matches** – up to 5 confirmed vendor_names whose full text
+      contains the query as a substring (case-insensitive). Catches the
+      "I searched 'ซีพี' but the vendor is 'บริษัท ซีพี แอ็กซ์ตร้า…'"
+      case directly.
+
+    Pure read-only; no side effects. JWT-protected by the global
+    middleware (same as the rest of `/search/*`).
+    """
+    q_norm = (q or "").strip()
+
+    try:
+        conn = get_db_conn()
+    except Exception as exc:
+        logger.exception("DB connection failed: %s", exc)
+        raise HTTPException(503, f"Database connection failed: {exc}")
+
+    try:
+        with conn.cursor() as cur:
+            # 1. Top vendors by total — always returned so the user always
+            #    has something concrete to click on.
+            cur.execute(
+                """
+                SELECT vendor_name,
+                       COUNT(*)::int AS bills,
+                       SUM(amount)::numeric(12,2) AS total
+                FROM public.vendor_bills
+                WHERE review_status = 'confirmed'
+                  AND vendor_name IS NOT NULL
+                  AND vendor_name <> ''
+                GROUP BY vendor_name
+                ORDER BY total DESC NULLS LAST
+                LIMIT 10
+                """
+            )
+            top_vendors = [
+                {
+                    "vendor_name": r[0],
+                    "bills": int(r[1] or 0),
+                    "total": float(r[2] or 0),
+                }
+                for r in cur.fetchall()
+            ]
+
+            # 2. Alias hints — only if the user actually typed something.
+            #    Match in both directions so short keywords ("makro") hit
+            #    longer aliases and vice versa.
+            alias_hints: list[dict] = []
+            if q_norm:
+                cur.execute(
+                    """
+                    SELECT product_keyword, vendor_name
+                    FROM public.vendor_aliases
+                    WHERE is_active = true
+                      AND (
+                            LOWER(product_keyword) LIKE LOWER(%s)
+                         OR LOWER(%s) LIKE '%%' || LOWER(product_keyword) || '%%'
+                          )
+                    ORDER BY LENGTH(product_keyword) DESC
+                    LIMIT 5
+                    """,
+                    (f"%{q_norm}%", q_norm),
+                )
+                alias_hints = [
+                    {"product_keyword": r[0], "vendor_name": r[1]}
+                    for r in cur.fetchall()
+                ]
+
+            # 3. Fuzzy substring match on real vendor_names. Skip for very
+            #    short queries (≤ 2 chars) so we don't return half the
+            #    database.
+            fuzzy_matches: list[dict] = []
+            if q_norm and len(q_norm) >= 3:
+                cur.execute(
+                    """
+                    SELECT vendor_name,
+                           COUNT(*)::int AS bills,
+                           SUM(amount)::numeric(12,2) AS total
+                    FROM public.vendor_bills
+                    WHERE review_status = 'confirmed'
+                      AND vendor_name IS NOT NULL
+                      AND vendor_name ILIKE %s
+                    GROUP BY vendor_name
+                    ORDER BY total DESC NULLS LAST
+                    LIMIT 5
+                    """,
+                    (f"%{q_norm}%",),
+                )
+                fuzzy_matches = [
+                    {
+                        "vendor_name": r[0],
+                        "bills": int(r[1] or 0),
+                        "total": float(r[2] or 0),
+                    }
+                    for r in cur.fetchall()
+                ]
+    except Exception as exc:
+        logger.exception("empty-hints query failed: %s", exc)
+        raise HTTPException(500, f"Database query failed: {exc}")
+    finally:
+        conn.close()
+
+    return {
+        "query": q_norm,
+        "top_vendors": top_vendors,
+        "alias_hints": alias_hints,
+        "fuzzy_matches": fuzzy_matches,
+    }
