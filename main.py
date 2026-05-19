@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 import uuid
 from datetime import date, datetime
 from typing import Any, Optional
@@ -155,7 +156,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse as StarletteJSONResponse
 
-PUBLIC_PATHS = {"/", "/health", "/auth/login", "/auth/logout", "/docs", "/openapi.json", "/redoc", "/ap/due-reminder", "/stock/alert", "/alerts/uptime-webhook", "/alerts/test-telegram"}
+PUBLIC_PATHS = {"/", "/health", "/health/deep", "/auth/login", "/auth/logout", "/docs", "/openapi.json", "/redoc", "/ap/due-reminder", "/stock/alert", "/alerts/uptime-webhook", "/alerts/test-telegram"}
 
 class JWTAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: StarletteRequest, call_next):
@@ -234,6 +235,100 @@ def health():
         "vision_model": OPENAI_VISION_MODEL,
         "storage_bucket": SUPABASE_STORAGE_BUCKET,
     }
+
+
+@app.get("/health/deep")
+def health_deep():
+    """
+    Deep health check — actually verifies dependencies (P0.1, Session 24).
+
+    Unlike /health (which only reports env-var presence), this:
+      1. SELECT 1 against Postgres with 5s connect timeout
+         (proves DATABASE_URL still valid + Supabase pooler reachable)
+      2. SELECT id LIMIT 1 against Supabase REST
+         (proves service-role key + PostgREST still working)
+      3. Reports env-var presence for OpenAI / LINE / Telegram
+         (NO outbound API ping — keeps cost zero, Uptime Robot polls every 5 min)
+
+    Status codes:
+      200 healthy   — all critical checks ok
+      200 degraded  — some env vars missing but core DB ok (don't trigger alert)
+      503 unhealthy — Postgres or Supabase failed (Uptime Robot fires Telegram alert)
+
+    No side effects, read-only. Designed for Uptime Robot polling.
+    """
+    checks: dict[str, Any] = {}
+    db_ok = True
+
+    # 1) Postgres direct (proves pooler URL still valid)
+    t0 = time.perf_counter()
+    try:
+        conn = psycopg2.connect(os.environ["DATABASE_URL"], connect_timeout=5)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+            checks["postgres"] = {
+                "ok": True,
+                "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+            }
+        finally:
+            conn.close()
+    except Exception as e:
+        log.exception("health/deep: postgres check failed")
+        checks["postgres"] = {
+            "ok": False,
+            "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+            "error": str(e)[:200],
+        }
+        db_ok = False
+
+    # 2) Supabase REST (proves service-role key still valid)
+    t0 = time.perf_counter()
+    try:
+        sb = get_supabase()
+        sb.table("vendor_bills").select("id").limit(1).execute()
+        checks["supabase"] = {
+            "ok": True,
+            "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+        }
+    except Exception as e:
+        log.exception("health/deep: supabase check failed")
+        checks["supabase"] = {
+            "ok": False,
+            "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+            "error": str(e)[:200],
+        }
+        db_ok = False
+
+    # 3) Env-var presence (no outbound calls — cost-free)
+    checks["openai_configured"] = bool(OPENAI_API_KEY)
+    checks["line_configured"] = bool(os.environ.get("LINE_CHANNEL_ACCESS_TOKEN"))
+    checks["telegram_configured"] = bool(
+        os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID")
+    )
+
+    # Decide overall status + HTTP code
+    if not db_ok:
+        status = "unhealthy"
+        http_code = 503
+    elif not (checks["openai_configured"] and checks["line_configured"]):
+        status = "degraded"
+        http_code = 200
+    else:
+        status = "healthy"
+        http_code = 200
+
+    body = {
+        "status": status,
+        "checks": checks,
+        "version": app.version,
+        "checked_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+    if http_code != 200:
+        return StarletteJSONResponse(status_code=http_code, content=body)
+    return body
 
 
 # ============================================================
