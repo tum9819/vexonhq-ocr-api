@@ -27,6 +27,12 @@ Language: respond in Thai mixed with English, technical when needed. Keep things
 6. **Verify column names against `information_schema.columns` before writing SQL.** AI tends to hallucinate column names. Every wrong SQL column has cost hours of debugging in past sessions.
 7. **Don't reflexively `git checkout HEAD -- .`** based on a single bash read showing truncation — PowerShell `git status` is source of truth. (This was a Cowork-on-Windows-mount quirk; less relevant when running Claude Code on Windows directly, but still: trust PowerShell.)
 8. **No emojis in code or commits.** Markdown docs and chat replies — only if user uses them first.
+9. **DigitalOcean snapshot rotation — keep at most 3 snapshots on `vexonhq-core`.** DO charges $0.06/GB/month for snapshot storage, and at ~30 GB per session a snapshot per session compounds fast (Session 23 inherited 20 snapshots = ~345 GB = $20.73/month in storage alone, on top of $24 for the droplet). Standing slots:
+   1. `vexonhq-clean-base` — pristine OS image, never delete (recreate only after major OS upgrade).
+   2. `vexonhq-<previous-stable>` — last known-good state before the current session.
+   3. `vexonhq-session<N>-complete-YYYY-MM-DD` — latest stable state.
+
+   At the end of every successful session, the session that just finished becomes the new "previous-stable" — promote it (rename if needed) and delete the snapshot it displaces. Use the exact "complete" suffix only on the final, all-fixes-in snapshot; intermediate snapshots taken mid-session must be deleted before session close so they don't pollute the rotation. Cost ceiling: ~$5/month for snapshots. If the snapshot bill is trending over $10/month, the rotation is being skipped — audit before taking any new snapshot.
 
 ---
 
