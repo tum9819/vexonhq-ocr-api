@@ -765,84 +765,127 @@ def invoice_auto_classify(invoice_id: str, force: bool = False):
     if not bill.data:
         raise HTTPException(404, "invoice not found")
 
+    # Count "would-be-skipped" rows separately so the response can still
+    # report them. The shared helper itself doesn't track skips because
+    # the OCR-upload path doesn't care.
+    skipped = 0
+    if not force:
+        conn_count = get_db_conn()
+        try:
+            with conn_count.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*)::int
+                    FROM public.invoice_items
+                    WHERE vendor_bill_id = %s
+                      AND canonical_sku IS NOT NULL
+                    """,
+                    (invoice_id,),
+                )
+                skipped = int(cur.fetchone()[0] or 0)
+        finally:
+            conn_count.close()
+
+    result = _auto_classify_invoice_items(invoice_id, only_unclassified=not force)
+    return {
+        "success":    True,
+        "classified": result["classified"],
+        "skipped":    skipped,
+        "results":    result["results"],
+    }
+
+
+@app.post("/invoice/items/auto-classify-bulk")
+def invoice_items_auto_classify_bulk(
+    only_confirmed: bool = True,
+    limit_bills: int = 200,
+):
+    """
+    One-shot backfill of canonical_sku across many bills at once.
+
+    Use case (Session 25): TUM already confirmed ~64 bills in Session 22
+    before the canonical SKU layer existed. This endpoint lets him run
+    the classifier across every one of those bills in a single call so
+    the catalogue is consistent — no need to open each invoice and
+    press "AI ช่วยจัดหมวด" individually.
+
+    Default mode (`only_confirmed=true`) restricts the scope to bills
+    in review_status='confirmed'. Pass `only_confirmed=false` to also
+    classify draft/pending bills (rare — usually you'd let auto-classify-
+    on-upload handle those). `limit_bills` is a safety cap — even at
+    cheap GPT-4o-mini pricing, we never want a single call to fan out
+    over the entire table by accident.
+
+    Idempotent: rows that already have `canonical_sku` set are skipped.
+    No `force` flag here on purpose — manual confirmations must not be
+    clobbered by a bulk run. If you do need to re-classify everything,
+    NULL the column first via SQL.
+
+    Returns counts + per-bill summary so the operator can see what
+    actually changed.
+    """
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, product_name, canonical_sku
-                FROM public.invoice_items
-                WHERE vendor_bill_id = %s
-                ORDER BY line_no, id
-                """,
-                (invoice_id,),
-            )
-            rows = cur.fetchall()
-            if not rows:
-                return {
-                    "success":    True,
-                    "classified": 0,
-                    "skipped":    0,
-                    "results":    [],
-                }
-
-            # Decide which rows to touch.
-            targets: list[tuple[str, str]] = []  # (item_id, product_name)
-            skipped = 0
-            for item_id, product_name, canonical_sku in rows:
-                if not force and canonical_sku is not None:
-                    skipped += 1
-                    continue
-                targets.append((str(item_id), product_name or ""))
-
-            if not targets:
-                return {
-                    "success":    True,
-                    "classified": 0,
-                    "skipped":    skipped,
-                    "results":    [],
-                }
-
-            from product_classifier import classify_items_batch
-            classifications = classify_items_batch(
-                conn,
-                [t[1] for t in targets],
-            )
-
-            updates = []
-            results = []
-            for (item_id, name), guess in zip(targets, classifications):
-                sku = guess.get("sku") or "other"
-                conf = guess.get("confidence") or 0.0
-                updates.append((sku, conf, item_id))
-                results.append({
-                    "item_id":              item_id,
-                    "product_name":         name,
-                    "canonical_sku":        sku,
-                    "canonical_confidence": conf,
-                })
-
-            cur.executemany(
-                """
-                UPDATE public.invoice_items
-                SET canonical_sku        = %s,
-                    canonical_confidence = %s
-                WHERE id = %s
-                """,
-                updates,
-            )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+            # Find the set of bills that still have unclassified items.
+            # GROUP BY vendor_bill_id so we touch each bill exactly once
+            # — `_auto_classify_invoice_items` already does the per-row
+            # WHERE filter inside.
+            sql = """
+                SELECT vb.id, vb.vendor_name, vb.bill_date,
+                       COUNT(*) FILTER (WHERE ii.canonical_sku IS NULL) AS unclassified
+                FROM public.vendor_bills vb
+                JOIN public.invoice_items ii ON ii.vendor_bill_id = vb.id
+                WHERE ii.canonical_sku IS NULL
+            """
+            params: list = []
+            if only_confirmed:
+                sql += " AND vb.review_status = 'confirmed'"
+            sql += """
+                GROUP BY vb.id, vb.vendor_name, vb.bill_date
+                HAVING COUNT(*) FILTER (WHERE ii.canonical_sku IS NULL) > 0
+                ORDER BY vb.bill_date DESC NULLS LAST
+                LIMIT %s
+            """
+            params.append(limit_bills)
+            cur.execute(sql, params)
+            bills_to_classify = cur.fetchall()
     finally:
         conn.close()
 
+    total_bills_touched = 0
+    total_items_classified = 0
+    summary: list[dict] = []
+    errors: list[dict] = []
+
+    for bill_id, vendor_name, bill_date, unclassified_count in bills_to_classify:
+        bill_id_str = str(bill_id)
+        try:
+            result = _auto_classify_invoice_items(bill_id_str, only_unclassified=True)
+        except Exception as exc:
+            log.exception("bulk classify failed for bill %s", bill_id_str)
+            errors.append({
+                "invoice_id":  bill_id_str,
+                "vendor_name": vendor_name,
+                "error":       str(exc)[:200],
+            })
+            continue
+        total_bills_touched += 1
+        total_items_classified += result["classified"]
+        summary.append({
+            "invoice_id":  bill_id_str,
+            "vendor_name": vendor_name,
+            "bill_date":   str(bill_date) if bill_date else None,
+            "classified":  result["classified"],
+        })
+
     return {
-        "success":    True,
-        "classified": len(results),
-        "skipped":    skipped,
-        "results":    results,
+        "success":             True,
+        "total_bills_found":   len(bills_to_classify),
+        "total_bills_touched": total_bills_touched,
+        "total_items_classified": total_items_classified,
+        "errors":              errors,
+        "summary":             summary,
     }
 
 
@@ -1618,6 +1661,104 @@ def _insert_items(invoice_id: str, items: list[dict[str, Any]], source_page: int
         log.info("filtered %d placeholder item(s) from page %d", dropped, source_page)
     if rows:
         sb.table("invoice_items").insert(rows).execute()
+        # Auto-classify on upload (Session 25 — TUM asked for this so the
+        # dropdown is pre-filled by the time he opens /invoices/<id>). Any
+        # failure here is non-fatal: items are already saved; canonical_sku
+        # just stays NULL and TUM can press the manual button later.
+        try:
+            _auto_classify_invoice_items(invoice_id, only_unclassified=True)
+        except Exception:
+            log.exception("auto-classify after _insert_items failed (non-fatal)")
+
+
+def _auto_classify_invoice_items(
+    invoice_id: str,
+    *,
+    only_unclassified: bool = True,
+) -> dict:
+    """
+    Run the AI classifier on every line item of an invoice and write the
+    result + confidence back to invoice_items.
+
+    Shared helper used by:
+      - `_insert_items()`              → auto-classify on OCR upload
+      - `POST /invoice/{id}/auto-classify` → manual "AI ช่วยจัดหมวด" button
+      - `POST /invoice/items/auto-classify-bulk` (per-bill loop)
+
+    Idempotent in the default mode — rows with a non-null canonical_sku
+    are skipped so TUM's manual confirmations aren't overwritten. Set
+    `only_unclassified=False` to force a re-classification.
+
+    Returns a dict with `classified`, `skipped`, and `results` so the
+    caller can decide what to surface to the UI.
+    """
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            if only_unclassified:
+                cur.execute(
+                    """
+                    SELECT id, product_name
+                    FROM public.invoice_items
+                    WHERE vendor_bill_id = %s
+                      AND canonical_sku IS NULL
+                    ORDER BY line_no, id
+                    """,
+                    (invoice_id,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, product_name
+                    FROM public.invoice_items
+                    WHERE vendor_bill_id = %s
+                    ORDER BY line_no, id
+                    """,
+                    (invoice_id,),
+                )
+            rows = cur.fetchall()
+            if not rows:
+                return {"classified": 0, "skipped": 0, "results": []}
+
+            from product_classifier import classify_items_batch
+            classifications = classify_items_batch(
+                conn,
+                [(r[1] or "") for r in rows],
+            )
+
+            updates = []
+            results = []
+            for (item_id, name), guess in zip(rows, classifications):
+                sku = guess.get("sku") or "other"
+                conf = guess.get("confidence") or 0.0
+                updates.append((sku, conf, str(item_id)))
+                results.append({
+                    "item_id":              str(item_id),
+                    "product_name":         name,
+                    "canonical_sku":        sku,
+                    "canonical_confidence": conf,
+                })
+            cur.executemany(
+                """
+                UPDATE public.invoice_items
+                SET canonical_sku        = %s,
+                    canonical_confidence = %s
+                WHERE id = %s
+                """,
+                updates,
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    return {
+        "classified": len(results),
+        "skipped":    0,
+        "results":    results,
+    }
 
 
 def _save_warnings(invoice_id: str, warnings: list[dict[str, str]]):
