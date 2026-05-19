@@ -644,12 +644,16 @@ def invoice_items_suggest(q: str = "", limit: int = 10):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            # Group by the *normalized* product name (trim + collapse
-            # internal whitespace) so OCR variants like "เบียร์ช้าง 620 มล."
-            # vs "เบียร์ช้าง  620 มล. " consolidate into one suggestion
-            # row instead of polluting the dropdown with near-duplicates.
-            # Use mode() over the raw product_name to surface the
-            # most-common canonical spelling for display.
+            # Group by an aggressively-normalized product name so OCR
+            # variants of the same product collapse into one suggestion:
+            #   1. TRIM leading/trailing whitespace
+            #   2. Collapse multiple internal spaces (`a  b` -> `a b`)
+            #   3. Strip trailing punctuation + whitespace
+            #      (`เบียร์ช้าง 620 มล.` and `เบียร์ช้าง 620 มล` group
+            #      together; verified case from TUM's catalogue)
+            # The SELECT keeps `mode() OVER product_name` so the
+            # displayed name uses the most-common canonical spelling
+            # rather than the normalized form (which has no period).
             cur.execute(
                 """
                 SELECT
@@ -664,7 +668,10 @@ def invoice_items_suggest(q: str = "", limit: int = 10):
                   AND ii.product_name IS NOT NULL
                   AND TRIM(ii.product_name) <> ''
                   AND ii.product_name ILIKE %s
-                GROUP BY regexp_replace(TRIM(ii.product_name), '\\s+', ' ', 'g')
+                GROUP BY regexp_replace(
+                            regexp_replace(TRIM(ii.product_name), '\\s+', ' ', 'g'),
+                            '[\\s\\.\\,\\;\\:]+$', ''
+                         )
                 ORDER BY uses DESC,
                          MAX(vb.bill_date) DESC NULLS LAST,
                          mode() WITHIN GROUP (ORDER BY ii.product_name) ASC
