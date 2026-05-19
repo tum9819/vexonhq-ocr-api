@@ -62,6 +62,50 @@ VEXON_HASH = os.environ.get(
 )
 # Default password: mara2026  (override via VEXON_HASH env var in Coolify)
 
+
+def _load_users() -> dict[str, str]:
+    """
+    Discover every configured user account from env vars.
+
+    Two patterns are accepted, additively:
+
+    1. **Legacy single-user** — `VEXON_USER` + `VEXON_HASH`. The
+       admin account that has existed since day one. Always present
+       so the system never locks itself out.
+    2. **Multi-user** — `VEXON_USER_<KEY>` + `VEXON_HASH_<KEY>` pairs.
+       The `<KEY>` suffix is just a label that ties username to hash;
+       it has no role in auth. Example env pair:
+           VEXON_USER_TUM = Tum
+           VEXON_HASH_TUM = pbkdf2:sha256:260000:...
+
+    Returns a dict keyed by `username.lower()` so the login handler
+    can do an O(1) case-insensitive lookup. Hash is the PBKDF2 string
+    in the same format `_verify_password` expects.
+    """
+    users: dict[str, str] = {}
+    if VEXON_USER and VEXON_HASH:
+        users[VEXON_USER.strip().lower()] = VEXON_HASH
+
+    prefix = "VEXON_USER_"
+    for env_key, env_value in os.environ.items():
+        if not env_key.startswith(prefix):
+            continue
+        suffix = env_key[len(prefix):]
+        if not suffix:
+            continue
+        username = (env_value or "").strip()
+        if not username:
+            continue
+        user_hash = os.environ.get(f"VEXON_HASH_{suffix}")
+        if not user_hash:
+            log.warning(
+                "auth: env %s set to %r but matching VEXON_HASH_%s is missing — skipping account",
+                env_key, username, suffix,
+            )
+            continue
+        users[username.lower()] = user_hash
+    return users
+
 # Simple in-memory rate limiter: {ip: [timestamp, ...]}
 _login_attempts: dict[str, list[float]] = {}
 MAX_ATTEMPTS = 10
@@ -170,25 +214,42 @@ def login(body: LoginRequest, request: Request):
     username = body.username.strip().lower()
     password = body.password
 
-    # Constant-time username check
-    username_ok = secrets.compare_digest(username, VEXON_USER.lower())
-    password_ok = _verify_password(password, VEXON_HASH) if username_ok else False
+    # Look up the user's stored hash from the configured account list.
+    # _load_users() reads env vars on every call so password rotation
+    # in Coolify is picked up without a worker restart.
+    users = _load_users()
+    stored_hash = users.get(username)
+    # Always run _verify_password (even when the user is unknown) so the
+    # response time doesn't leak which usernames exist — feed it a
+    # placeholder hash in the missing-user case.
+    placeholder_hash = "pbkdf2:sha256:260000:0:" + base64.b64encode(b"\x00" * 32).decode()
+    password_ok = _verify_password(password, stored_hash or placeholder_hash)
+    auth_ok = bool(stored_hash) and password_ok
 
-    if not (username_ok and password_ok):
+    if not auth_ok:
         log.warning("Failed login attempt for user '%s' from %s", username, client_ip)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง",
         )
 
-    token = create_token(VEXON_USER)
-    log.info("Successful login for user '%s' from %s", username, client_ip)
+    # Use the original-cased username from env (display name) when we
+    # can find it; fall back to the lowercase form otherwise.
+    display_name = username
+    for env_key, env_value in os.environ.items():
+        if (env_key == "VEXON_USER" or env_key.startswith("VEXON_USER_")) and \
+           env_value and env_value.strip().lower() == username:
+            display_name = env_value.strip()
+            break
+
+    token = create_token(display_name)
+    log.info("Successful login for user '%s' from %s", display_name, client_ip)
 
     return {
         "access_token": token,
         "token_type": "bearer",
         "expires_in": JWT_EXPIRE_HOURS * 3600,
-        "username": VEXON_USER,
+        "username": display_name,
     }
 
 
