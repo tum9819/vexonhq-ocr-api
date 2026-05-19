@@ -34,7 +34,7 @@ from typing import Any, Optional
 import cv2
 import pypdfium2 as pdfium
 import pytesseract
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from PIL import Image
@@ -194,6 +194,12 @@ class JWTAuthMiddleware(BaseHTTPMiddleware):
                 status_code=401,
                 content={"detail": "Session หมดอายุ กรุณาเข้าสู่ระบบใหม่"},
             )
+
+        # Stash the JWT subject (username) on request.state so endpoints
+        # can read it for audit trail (created_by / updated_by / reviewed_by)
+        # without re-parsing the token. Falls back to None if the token had
+        # no `sub` claim (legacy / malformed JWTs).
+        request.state.username = payload.get("sub")
 
         return await call_next(request)
 
@@ -1072,8 +1078,22 @@ def invoice_detail(invoice_id: str):
     }
 
 
+def _current_username(request: Request) -> Optional[str]:
+    """
+    Pull the JWT-verified username off `request.state`.
+
+    Populated by the JWTAuthMiddleware after a successful `verify_token`
+    call. Returns None if the request didn't go through the middleware
+    (shouldn't happen for protected routes) or if the token had no `sub`
+    claim. Endpoints use this for audit-trail fields (`updated_by` /
+    `reviewed_by` / `created_by`) so we record the *actual* signed-in
+    user instead of trusting a client-supplied field.
+    """
+    return getattr(request.state, "username", None)
+
+
 @app.patch("/invoice/{invoice_id}")
-def invoice_edit(invoice_id: str, update: InvoiceUpdate):
+def invoice_edit(invoice_id: str, update: InvoiceUpdate, request: Request):
     """
     Edit invoice header fields and/or replace the line-item array.
 
@@ -1092,6 +1112,14 @@ def invoice_edit(invoice_id: str, update: InvoiceUpdate):
 
     if not header_payload and items_payload is None:
         raise HTTPException(400, "no fields to update")
+
+    # Audit: who is making this change? Stamp updated_by + updated_at on
+    # the vendor_bills row even when the caller only sent `items` (the
+    # bill content changed, that's an audit-worthy event).
+    username = _current_username(request)
+    if username:
+        header_payload["updated_by"] = username
+    header_payload["updated_at"] = datetime.utcnow().isoformat()
 
     sb = get_supabase()
 
@@ -1161,16 +1189,27 @@ def invoice_edit(invoice_id: str, update: InvoiceUpdate):
 
 
 @app.post("/invoice/{invoice_id}/confirm")
-def invoice_confirm(invoice_id: str, body: Optional[ConfirmRequest] = None):
+def invoice_confirm(
+    invoice_id: str,
+    request: Request,
+    body: Optional[ConfirmRequest] = None,
+):
+    # Prefer JWT-derived username (trustworthy) over client-supplied
+    # `reviewed_by` (legacy + tamperable). Falls back to client value
+    # only when middleware didn't populate state.username (shouldn't
+    # happen for protected routes).
+    reviewer = _current_username(request) or (body.reviewed_by if body else None)
     sb = get_supabase()
     now_iso = datetime.utcnow().isoformat()
     resp = (
         sb.table("vendor_bills")
         .update({
             "review_status": "confirmed",
-            "reviewed_by": (body.reviewed_by if body else None),
-            "reviewed_at": now_iso,
-            "confirmed_at": now_iso,
+            "reviewed_by":   reviewer,
+            "reviewed_at":   now_iso,
+            "confirmed_at":  now_iso,
+            "updated_by":    reviewer,
+            "updated_at":    now_iso,
         })
         .eq("id", invoice_id)
         .execute()
@@ -1181,15 +1220,19 @@ def invoice_confirm(invoice_id: str, body: Optional[ConfirmRequest] = None):
 
 
 @app.post("/invoice/{invoice_id}/reject")
-def invoice_reject(invoice_id: str, body: RejectRequest):
+def invoice_reject(invoice_id: str, body: RejectRequest, request: Request):
+    reviewer = _current_username(request) or body.reviewed_by
     sb = get_supabase()
+    now_iso = datetime.utcnow().isoformat()
     resp = (
         sb.table("vendor_bills")
         .update({
-            "review_status": "rejected",
-            "reviewed_by": body.reviewed_by,
-            "reviewed_at": datetime.utcnow().isoformat(),
-            "reject_reason": body.reject_reason,
+            "review_status":  "rejected",
+            "reviewed_by":    reviewer,
+            "reviewed_at":    now_iso,
+            "reject_reason":  body.reject_reason,
+            "updated_by":     reviewer,
+            "updated_at":     now_iso,
         })
         .eq("id", invoice_id)
         .execute()
