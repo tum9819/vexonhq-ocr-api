@@ -207,17 +207,34 @@ If auto-deploy doesn't trigger, manual: Coolify dashboard → `vexonhq-ocr-api` 
 
 ## Testing
 
-Smoke tests live in `tests/test_smoke.py` (added Session 19). Run them against the live backend:
+Smoke tests live in `tests/test_smoke.py` (actually added Session 24, 2026-05-19 — earlier CLAUDE.md claimed Session 19 but the file never existed until now).
+
+**Easiest: the `verify.ps1` wrapper.** Run from the repo root in PowerShell.
 
 ```powershell
-pip install pytest requests
+.\verify.ps1            # default mode: compileall syntax check on all .py (~2s, no deps)
+.\verify.ps1 -Smoke     # + live pytest against deployed backend (~5s when healthy)
+```
+
+The `-Smoke` mode needs `pip install pytest requests` once. It hits 55 critical routes over HTTP and fails loudly if any returns 404 — the Phase 32 regression class. It also asserts `/health/deep` actually returns DB ok and that `/openapi.json` lists ≥ 150 paths.
+
+The smoke suite includes `_request_with_retry()` that retries 502/503/504 + ConnectionError up to 3× with 3s backoff, so a Coolify auto-deploy window doesn't trip false failures. Real outages (> ~10s) still fail loudly.
+
+Direct pytest invocation (if you prefer):
+```powershell
 $env:BACKEND_URL = "https://b4zhad8qkoxjushdq8465056.178.128.31.76.sslip.io"
 pytest tests/test_smoke.py -v
 ```
 
-They check `/health`, `/openapi.json`, and a list of CRITICAL_ROUTES — fail loudly if an endpoint went missing (the Phase 32 regression class).
+For per-feature changes: ask user whether to add a new pytest case to `tests/test_smoke.py` before claiming the fix is complete.
 
-For per-feature changes: ask user whether to add a new pytest case to that file before claiming a fix is complete.
+---
+
+## Monitoring (Session 24)
+
+- **`GET /health/deep`** (public, accepts GET+HEAD) probes Postgres + Supabase with real queries — returns 200 healthy / 200 degraded / 503 unhealthy. Use this URL when adding new external monitors; `/health` only reports env-var flags.
+- **Uptime Robot** monitors `/health/deep` every 5 min and fires Discord `@everyone` alerts to TUM's `VEXONHQ Ops` server on DOWN + UP transitions.
+- **`/alerts/uptime-webhook` → Telegram** (Session 19) is dormant: Uptime Robot free plan locks both Telegram and Webhook integrations. Keep the code; reactivate when either upgrading the plan or switching to self-hosted UptimeKuma.
 
 ---
 
