@@ -742,6 +742,147 @@ def products_list(category: Optional[str] = None, include_inactive: bool = False
         conn.close()
 
 
+@app.get("/invoice/items/monthly-by-sku")
+def invoice_items_monthly_by_sku(
+    month: Optional[str] = None,
+    branch_code: Optional[str] = None,
+):
+    """
+    Aggregate confirmed-bill invoice_items for one month by canonical SKU.
+
+    Powers the `/invoices/monthly-by-sku` frontend page (TOMORROW.md
+    item G — "this month I ordered N cases of Y product"). Returns:
+
+    - one row per (category, canonical_sku, name_th) tuple
+    - total quantity (sum of quantity column)
+    - total amount (sum of amount column)
+    - bill count (distinct vendor_bills per product)
+    - latest unit_price seen (handy for spotting price changes)
+    - latest bill_date (so the UI can sort by recency)
+
+    Plus a top-level summary with overall totals + month range. Items
+    with NULL canonical_sku are grouped under a synthetic "(ยังไม่ได้
+    จัดหมวด)" bucket so they're visible — that hints to TUM that he
+    should re-run the auto-classify bulk for those bills.
+
+    Filters:
+      - month=YYYY-MM   (default: current month)
+      - branch_code=... (default: all branches)
+    """
+    if not month:
+        # Default to current month (Asia/Bangkok local — Coolify TZ=Asia/Bangkok)
+        month = date.today().strftime("%Y-%m")
+
+    try:
+        year, mon = month.split("-")
+        year_i = int(year)
+        mon_i = int(mon)
+        if not (2020 <= year_i <= 2099) or not (1 <= mon_i <= 12):
+            raise ValueError
+    except ValueError:
+        raise HTTPException(400, f"Invalid month {month!r}, expected YYYY-MM")
+
+    # Compute month range end (first day of next month)
+    if mon_i == 12:
+        next_year, next_mon = year_i + 1, 1
+    else:
+        next_year, next_mon = year_i, mon_i + 1
+    range_start = f"{year_i:04d}-{mon_i:02d}-01"
+    range_end = f"{next_year:04d}-{next_mon:02d}-01"
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # Build query — bind branch_code only if provided
+            params: list = [range_start, range_end]
+            branch_filter = ""
+            if branch_code:
+                branch_filter = " AND vb.branch_code = %s"
+                params.append(branch_code)
+
+            cur.execute(
+                f"""
+                SELECT
+                    COALESCE(p.category, 'unclassified')              AS category,
+                    ii.canonical_sku                                  AS sku,
+                    COALESCE(p.name_th, '(ยังไม่ได้จัดหมวด)')          AS name_th,
+                    COALESCE(p.default_unit, MAX(ii.unit))            AS unit,
+                    COUNT(DISTINCT vb.id)::int                        AS bills,
+                    SUM(ii.quantity)::numeric(12,2)                   AS total_qty,
+                    SUM(ii.amount)::numeric(12,2)                     AS total_amount,
+                    (SELECT ii2.unit_price
+                       FROM public.invoice_items ii2
+                       JOIN public.vendor_bills vb2 ON vb2.id = ii2.vendor_bill_id
+                      WHERE ii2.canonical_sku IS NOT DISTINCT FROM ii.canonical_sku
+                        AND vb2.review_status = 'confirmed'
+                        AND vb2.bill_date IS NOT NULL
+                      ORDER BY vb2.bill_date DESC NULLS LAST, ii2.id DESC
+                      LIMIT 1)                                        AS latest_unit_price,
+                    MAX(vb.bill_date)                                 AS latest_bill_date,
+                    COALESCE(p.sort_order, 999)                       AS sort_order
+                FROM public.invoice_items ii
+                JOIN public.vendor_bills vb ON vb.id = ii.vendor_bill_id
+                LEFT JOIN public.products p ON p.sku = ii.canonical_sku
+                WHERE vb.review_status = 'confirmed'
+                  AND vb.bill_date >= %s::date
+                  AND vb.bill_date <  %s::date
+                  {branch_filter}
+                GROUP BY p.category, ii.canonical_sku, p.name_th,
+                         p.default_unit, p.sort_order
+                ORDER BY sort_order, name_th
+                """,
+                params,
+            )
+            rows = []
+            for r in cur.fetchall():
+                rows.append({
+                    "category":          r[0],
+                    "sku":               r[1],
+                    "name_th":           r[2],
+                    "unit":              r[3],
+                    "bills":             int(r[4] or 0),
+                    "total_qty":         float(r[5]) if r[5] is not None else 0.0,
+                    "total_amount":      float(r[6]) if r[6] is not None else 0.0,
+                    "latest_unit_price": float(r[7]) if r[7] is not None else None,
+                    "latest_bill_date":  str(r[8]) if r[8] else None,
+                })
+
+            # Summary
+            total_amount = sum(r["total_amount"] for r in rows)
+            total_qty = sum(r["total_qty"] for r in rows if r["total_qty"])
+            total_bills = 0
+            cur.execute(
+                f"""
+                SELECT COUNT(DISTINCT vb.id)::int
+                FROM public.vendor_bills vb
+                JOIN public.invoice_items ii ON ii.vendor_bill_id = vb.id
+                WHERE vb.review_status = 'confirmed'
+                  AND vb.bill_date >= %s::date
+                  AND vb.bill_date <  %s::date
+                  {branch_filter}
+                """,
+                params,
+            )
+            row = cur.fetchone()
+            total_bills = int(row[0] or 0) if row else 0
+    finally:
+        conn.close()
+
+    return {
+        "success":   True,
+        "month":     month,
+        "range":     {"from": range_start, "to": range_end},
+        "items":     rows,
+        "summary": {
+            "total_amount":  round(total_amount, 2),
+            "total_qty":     round(total_qty, 2),
+            "total_bills":   total_bills,
+            "skus":          len(rows),
+            "unclassified":  next((r["total_amount"] for r in rows if r["sku"] is None), 0.0),
+        },
+    }
+
+
 @app.post("/invoice/{invoice_id}/auto-classify")
 def invoice_auto_classify(invoice_id: str, force: bool = False):
     """
