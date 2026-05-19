@@ -613,6 +613,75 @@ def invoice_suspected_duplicates():
     }
 
 
+@app.get("/invoice/items/suggest")
+def invoice_items_suggest(q: str = "", limit: int = 10):
+    """
+    Autocomplete suggestions for invoice line item product names.
+
+    Returns distinct product_name values seen on previously confirmed
+    bills, ranked by frequency (most-purchased first) then recency.
+    Used by the /invoices/<id> editor so TUM can pick an existing name
+    instead of typing a new variant — keeps the items catalogue from
+    accumulating "เบียร์สิงห์" vs "เบียร์ สิงห์" vs "สิงห์ เบียร์"
+    duplicates that the OCR pipeline can introduce.
+
+    Each suggestion also surfaces the most-common `unit` and the
+    most-common `unit_price` seen for that product so the frontend
+    can pre-fill all three fields with one click.
+
+    Note: route is placed BEFORE `/invoice/{invoice_id}` in source
+    order. FastAPI evaluates routes in registration order; even though
+    path parameters don't span slashes (so /invoice/items/suggest
+    wouldn't match /invoice/{invoice_id} anyway), keeping the
+    specific path first is the safer convention.
+    """
+    q_norm = (q or "").strip()
+    if not q_norm:
+        return {"query": q_norm, "suggestions": []}
+
+    safe_limit = min(max(limit, 1), 50)
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    ii.product_name,
+                    COUNT(*)::int AS uses,
+                    mode() WITHIN GROUP (ORDER BY ii.unit)        AS common_unit,
+                    mode() WITHIN GROUP (ORDER BY ii.unit_price)  AS common_unit_price,
+                    MAX(vb.bill_date)                             AS last_used
+                FROM public.invoice_items ii
+                JOIN public.vendor_bills vb ON vb.id = ii.vendor_bill_id
+                WHERE vb.review_status = 'confirmed'
+                  AND ii.product_name IS NOT NULL
+                  AND ii.product_name <> ''
+                  AND ii.product_name ILIKE %s
+                GROUP BY ii.product_name
+                ORDER BY uses DESC,
+                         MAX(vb.bill_date) DESC NULLS LAST,
+                         ii.product_name ASC
+                LIMIT %s
+                """,
+                (f"%{q_norm}%", safe_limit),
+            )
+            suggestions = [
+                {
+                    "product_name":     r[0],
+                    "uses":             int(r[1] or 0),
+                    "common_unit":      r[2],
+                    "common_unit_price": float(r[3]) if r[3] is not None else None,
+                    "last_used":        str(r[4]) if r[4] else None,
+                }
+                for r in cur.fetchall()
+            ]
+    finally:
+        conn.close()
+
+    return {"query": q_norm, "suggestions": suggestions}
+
+
 @app.get("/invoice/{invoice_id}")
 def invoice_detail(invoice_id: str):
     """Full invoice detail: header + items + pages + warnings."""
