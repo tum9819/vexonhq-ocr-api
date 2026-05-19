@@ -347,6 +347,17 @@ async def do_ocr(file: UploadFile = File(...)):
 # ============================================================
 # Invoice Review Pipeline — models
 # ============================================================
+class InvoiceItemPayload(BaseModel):
+    """One row in the items[] array of an invoice PATCH."""
+    line_no: Optional[int] = None
+    sku: Optional[str] = None
+    product_name: Optional[str] = None
+    quantity: Optional[float] = None
+    unit: Optional[str] = None
+    unit_price: Optional[float] = None
+    amount: Optional[float] = None
+
+
 class InvoiceUpdate(BaseModel):
     vendor_name: Optional[str] = None
     merchant_tax_id: Optional[str] = None
@@ -358,6 +369,11 @@ class InvoiceUpdate(BaseModel):
     amount: Optional[float] = None    # total
     payment_type: Optional[str] = None
     notes: Optional[str] = None
+    # Optional full replacement of the invoice_items rows during edit.
+    #   - None (key absent or null)  -> existing items untouched
+    #   - []                          -> all items deleted (user removed everything)
+    #   - [ {...}, {...} ]            -> DELETE existing + INSERT these rows
+    items: Optional[list[InvoiceItemPayload]] = None
 
 
 class ConfirmRequest(BaseModel):
@@ -641,16 +657,87 @@ def invoice_detail(invoice_id: str):
 
 @app.patch("/invoice/{invoice_id}")
 def invoice_edit(invoice_id: str, update: InvoiceUpdate):
-    """Edit invoice fields during review (only non-null fields are updated)."""
-    payload = {k: v for k, v in update.dict().items() if v is not None}
-    if not payload:
+    """
+    Edit invoice header fields and/or replace the line-item array.
+
+    Two independent payloads in one call:
+      - Header fields (vendor_name, dates, totals, etc.) -> partial update
+        on vendor_bills (only the keys actually provided).
+      - `items` (optional) -> if present, the entire invoice_items array
+        for this invoice is replaced atomically (DELETE + INSERT in one
+        psycopg2 transaction so we never end up with the old items
+        partially deleted on failure).
+    """
+    # Pydantic v1: .dict(); v2: .model_dump()  — main.py uses v1 elsewhere.
+    update_dict = update.dict()
+    items_payload = update_dict.pop("items", None)
+    header_payload = {k: v for k, v in update_dict.items() if v is not None}
+
+    if not header_payload and items_payload is None:
         raise HTTPException(400, "no fields to update")
 
     sb = get_supabase()
-    resp = sb.table("vendor_bills").update(payload).eq("id", invoice_id).execute()
-    if not resp.data:
-        raise HTTPException(404, "invoice not found")
-    return {"success": True, "invoice": resp.data[0]}
+
+    # 1. Header update (or just existence check if only items are being edited).
+    if header_payload:
+        resp = sb.table("vendor_bills").update(header_payload).eq("id", invoice_id).execute()
+        if not resp.data:
+            raise HTTPException(404, "invoice not found")
+        invoice = resp.data[0]
+    else:
+        bill = sb.table("vendor_bills").select("*").eq("id", invoice_id).execute()
+        if not bill.data:
+            raise HTTPException(404, "invoice not found")
+        invoice = bill.data[0]
+
+    # 2. Replace invoice_items atomically when caller passed the items array.
+    if items_payload is not None:
+        conn = get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM public.invoice_items WHERE vendor_bill_id = %s",
+                    (invoice_id,),
+                )
+                if items_payload:
+                    rows_to_insert = []
+                    for idx, it in enumerate(items_payload, start=1):
+                        rows_to_insert.append((
+                            invoice_id,
+                            it.get("line_no") or idx,
+                            it.get("sku"),
+                            it.get("product_name"),
+                            it.get("quantity"),
+                            it.get("unit"),
+                            it.get("unit_price"),
+                            it.get("amount"),
+                        ))
+                    cur.executemany(
+                        """
+                        INSERT INTO public.invoice_items
+                            (vendor_bill_id, line_no, sku, product_name,
+                             quantity, unit, unit_price, amount)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        rows_to_insert,
+                    )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    # 3. Return the (possibly updated) header + the freshly read items so
+    #    the client doesn't have to refetch.
+    items = (
+        sb.table("invoice_items")
+        .select("*")
+        .eq("vendor_bill_id", invoice_id)
+        .order("line_no")
+        .execute()
+    )
+    return {"success": True, "invoice": invoice, "items": items.data or []}
 
 
 @app.post("/invoice/{invoice_id}/confirm")
