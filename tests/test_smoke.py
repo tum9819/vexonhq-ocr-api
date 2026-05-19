@@ -33,6 +33,7 @@ If BACKEND_URL is unset, defaults to the production sslip.io URL above.
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 import requests
@@ -154,11 +155,36 @@ def session():
     return s
 
 
+def _request_with_retry(session, method, url, **kwargs):
+    """
+    HTTP request with retry on transient gateway/connection errors.
+
+    Coolify auto-deploy creates a ~20-30s window where the proxy can't
+    reach the upstream container, surfacing as 502/503/504. Real outages
+    last longer and will still fail (3 attempts x 3s wait = ~9s max).
+    """
+    last_response = None
+    for attempt in range(3):
+        try:
+            r = session.request(method, url, **kwargs)
+            if r.status_code in (502, 503, 504) and attempt < 2:
+                last_response = r
+                time.sleep(3)
+                continue
+            return r
+        except requests.exceptions.RequestException:
+            if attempt < 2:
+                time.sleep(3)
+                continue
+            raise
+    return last_response  # 3 attempts all returned 5xx
+
+
 @pytest.mark.parametrize("method,path", PUBLIC_ROUTES, ids=lambda x: str(x))
 def test_public_route_responds(session, method, path):
     """Public routes must return 200."""
-    r = session.request(
-        method, f"{BACKEND_URL}{path}",
+    r = _request_with_retry(
+        session, method, f"{BACKEND_URL}{path}",
         timeout=DEFAULT_TIMEOUT, allow_redirects=True,
     )
     assert r.status_code == 200, (
@@ -175,8 +201,8 @@ def test_authed_route_exists(session, method, path):
     Also accept 405 (wrong method but route exists) and 422 (validation
     rejected our params but route exists) — both prove registration.
     """
-    r = session.request(
-        method, f"{BACKEND_URL}{path}",
+    r = _request_with_retry(
+        session, method, f"{BACKEND_URL}{path}",
         timeout=DEFAULT_TIMEOUT, allow_redirects=False,
     )
     assert r.status_code != 404, (
@@ -191,7 +217,7 @@ def test_authed_route_exists(session, method, path):
 
 def test_health_deep_actually_works(session):
     """/health/deep proves DB+Supabase are reachable (P0.1 contract)."""
-    r = session.get(f"{BACKEND_URL}/health/deep", timeout=30)
+    r = _request_with_retry(session, "GET", f"{BACKEND_URL}/health/deep", timeout=30)
     assert r.status_code == 200, f"Got {r.status_code}: {r.text[:200]}"
     body = r.json()
     assert body.get("status") in ("healthy", "degraded"), (
@@ -217,7 +243,7 @@ def test_openapi_route_count_floor(session):
     Adjust this floor over time as the app evolves, but NEVER decrease
     it without investigating — lowering the floor masks regressions.
     """
-    r = session.get(f"{BACKEND_URL}/openapi.json", timeout=DEFAULT_TIMEOUT)
+    r = _request_with_retry(session, "GET", f"{BACKEND_URL}/openapi.json", timeout=DEFAULT_TIMEOUT)
     assert r.status_code == 200
     spec = r.json()
     count = len(spec.get("paths", {}))
