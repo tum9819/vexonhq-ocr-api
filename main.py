@@ -237,7 +237,7 @@ def health():
     }
 
 
-@app.get("/health/deep")
+@app.api_route("/health/deep", methods=["GET", "HEAD"])
 def health_deep():
     """
     Deep health check — actually verifies dependencies (P0.1, Session 24).
