@@ -356,6 +356,12 @@ class InvoiceItemPayload(BaseModel):
     unit: Optional[str] = None
     unit_price: Optional[float] = None
     amount: Optional[float] = None
+    # Canonical SKU + AI confidence (Session 25/26 hybrid classifier).
+    # `canonical_sku` references public.products.sku; `canonical_confidence`
+    # is the model's self-reported score in [0, 1]. Both optional so older
+    # clients that don't know about classification still work.
+    canonical_sku:        Optional[str] = None
+    canonical_confidence: Optional[float] = None
 
 
 class InvoiceUpdate(BaseModel):
@@ -695,6 +701,151 @@ def invoice_items_suggest(q: str = "", limit: int = 10):
     return {"query": q_norm, "suggestions": suggestions}
 
 
+@app.get("/products")
+def products_list(category: Optional[str] = None, include_inactive: bool = False):
+    """
+    Return the canonical SKU master list (Session 25/26).
+
+    Front-end loads this once on /invoices/<id> mount to populate the
+    "หมวด" dropdown in the items table. The list is small (~21 rows) so
+    no pagination — caller filters client-side by category if needed.
+
+    Optional query params:
+      - category=<str>      filter to one category (e.g. 'beer')
+      - include_inactive=1  also return rows where is_active = false
+    """
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            sql = """
+                SELECT sku, name_th, category, default_unit, notes,
+                       is_active, sort_order
+                FROM public.products
+                WHERE (%s OR is_active = true)
+                  AND (%s::text IS NULL OR category = %s)
+                ORDER BY sort_order, category, sku
+            """
+            cur.execute(sql, (include_inactive, category, category))
+            rows = []
+            for r in cur.fetchall():
+                rows.append({
+                    "sku":           r[0],
+                    "name_th":       r[1],
+                    "category":      r[2],
+                    "default_unit":  r[3],
+                    "notes":         r[4],
+                    "is_active":     bool(r[5]),
+                    "sort_order":    int(r[6] or 100),
+                })
+        return {"success": True, "products": rows}
+    finally:
+        conn.close()
+
+
+@app.post("/invoice/{invoice_id}/auto-classify")
+def invoice_auto_classify(invoice_id: str, force: bool = False):
+    """
+    Backfill canonical_sku for an invoice's line items using AI.
+
+    Called from the "AI ช่วยจัดหมวด" button on /invoices/<id>. The
+    classifier reads each row's `product_name`, asks GPT-4o-mini to pick
+    a matching SKU from the master list, and writes the result + a
+    confidence score back to invoice_items.
+
+    Default behaviour: only rows where canonical_sku IS NULL are touched
+    (idempotent — re-running on a bill leaves TUM's manual selections
+    intact). Pass `?force=true` to re-classify every row regardless of
+    existing value.
+
+    Response includes the per-row classification so the frontend can
+    refresh the table without a second round-trip.
+    """
+    sb = get_supabase()
+    bill = sb.table("vendor_bills").select("id").eq("id", invoice_id).execute()
+    if not bill.data:
+        raise HTTPException(404, "invoice not found")
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, product_name, canonical_sku
+                FROM public.invoice_items
+                WHERE vendor_bill_id = %s
+                ORDER BY line_no, id
+                """,
+                (invoice_id,),
+            )
+            rows = cur.fetchall()
+            if not rows:
+                return {
+                    "success":    True,
+                    "classified": 0,
+                    "skipped":    0,
+                    "results":    [],
+                }
+
+            # Decide which rows to touch.
+            targets: list[tuple[str, str]] = []  # (item_id, product_name)
+            skipped = 0
+            for item_id, product_name, canonical_sku in rows:
+                if not force and canonical_sku is not None:
+                    skipped += 1
+                    continue
+                targets.append((str(item_id), product_name or ""))
+
+            if not targets:
+                return {
+                    "success":    True,
+                    "classified": 0,
+                    "skipped":    skipped,
+                    "results":    [],
+                }
+
+            from product_classifier import classify_items_batch
+            classifications = classify_items_batch(
+                conn,
+                [t[1] for t in targets],
+            )
+
+            updates = []
+            results = []
+            for (item_id, name), guess in zip(targets, classifications):
+                sku = guess.get("sku") or "other"
+                conf = guess.get("confidence") or 0.0
+                updates.append((sku, conf, item_id))
+                results.append({
+                    "item_id":              item_id,
+                    "product_name":         name,
+                    "canonical_sku":        sku,
+                    "canonical_confidence": conf,
+                })
+
+            cur.executemany(
+                """
+                UPDATE public.invoice_items
+                SET canonical_sku        = %s,
+                    canonical_confidence = %s
+                WHERE id = %s
+                """,
+                updates,
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    return {
+        "success":    True,
+        "classified": len(results),
+        "skipped":    skipped,
+        "results":    results,
+    }
+
+
 @app.get("/invoice/{invoice_id}")
 def invoice_detail(invoice_id: str):
     """Full invoice detail: header + items + pages + warnings."""
@@ -793,13 +944,16 @@ def invoice_edit(invoice_id: str, update: InvoiceUpdate):
                             it.get("unit"),
                             it.get("unit_price"),
                             it.get("amount"),
+                            it.get("canonical_sku"),
+                            it.get("canonical_confidence"),
                         ))
                     cur.executemany(
                         """
                         INSERT INTO public.invoice_items
                             (vendor_bill_id, line_no, sku, product_name,
-                             quantity, unit, unit_price, amount)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                             quantity, unit, unit_price, amount,
+                             canonical_sku, canonical_confidence)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         rows_to_insert,
                     )
