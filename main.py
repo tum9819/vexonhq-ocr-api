@@ -303,7 +303,7 @@ def health_deep():
 
     # 3) Env-var presence (no outbound calls — cost-free)
     checks["openai_configured"] = bool(OPENAI_API_KEY)
-    checks["line_configured"] = bool(os.environ.get("LINE_CHANNEL_ACCESS_TOKEN"))
+    checks["line_configured"] = bool(os.environ.get("LINE_CHANNEL_TOKEN"))
     checks["telegram_configured"] = bool(
         os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID")
     )
