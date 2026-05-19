@@ -175,6 +175,26 @@ def _query_inventory(
 # Order matters: more specific patterns must come BEFORE more general ones
 # (e.g. "เป๊ปซี่ เล็ก" before "เป๊ปซี่", "น้ำเปล่า 1.5" before "น้ำเปล่า").
 # Iteration stops at the first match.
+# Items whose name would otherwise match a _PACK_RULES pattern but TUM
+# tracks per-bottle, not by pack. Checked BEFORE the rules list — if any
+# substring here is in the item name, fall through to "{qty} {unit}".
+# Most often these are flavored/specialty SKUs that come in mixed cases
+# at the supplier rather than uniform packs.
+_PACK_EXCLUDE: list[str] = [
+    # Singha flavored sodas (bottled) — siblings of the generic "โซดา"
+    # rule but TUM doesn't track them by ลัง.
+    "สิงห์พิ้งก์",          # สิงห์พิ้งก์เลม่อนโซดา
+    "สิงห์เรดเลมอน",        # สิงห์เรดเลมอนโซดา
+    "สิงห์เรดเลม่อน",       # diacritic variant
+    "สิงห์บ๊วย",            # สิงห์บ๊วยเลมอนโซดา
+    "สิงห์เลมอน",           # สิงห์เลมอนโซดา
+    "สิงห์เลม่อน",          # diacritic variant
+    # Roosé special-edition beer — would otherwise hit the "เบียร์" rule.
+    "ตะวันแดง โรเซ",
+    "ตะวันแดงโรเซ",         # no-space variant
+]
+
+
 _PACK_RULES: list[tuple[str, int, str]] = [
     # Soft drinks — use แพ็ค (retail pack) as label.
     # 1-litre bottle is bigger -> fewer per pack; check it BEFORE the
@@ -187,6 +207,10 @@ _PACK_RULES: list[tuple[str, int, str]] = [
     ("น้ำเปล่า 1.5",   6, "แพ็ค"),  # 1.5L large bottle, 6 per pack
     ("น้ำเปล่า 550",  12, "แพ็ค"),  # 550 ml bottle, 12 per pack
     ("น้ำเปล่า",      12, "แพ็ค"),  # default for other water sizes
+    # Singha Reserve premium beer — 1 ลัง = 12 ขวด. More specific than the
+    # generic "เบียร์" rule so its pattern just uses the brand string.
+    ("สิงห์Reserve",   12, "ลัง"),
+    ("สิงห์ Reserve",  12, "ลัง"),  # with-space variant
     # Soda water (bottle form) — TUM tracks by ลัง of 24, same as beer label.
     ("โซดา",          24, "ลัง"),
     # Beer — keeps existing convention: 1 ลัง = 12 ขวด
@@ -213,6 +237,11 @@ def _fmt_qty(item_name: str, qty: float, unit: str) -> str:
     so this is purely additive.
     """
     unit = (unit or "").strip()
+    # Honor explicit exclusions first — these SKUs would otherwise match a
+    # rule (e.g. via "โซดา" or "เบียร์") but TUM doesn't track them by pack.
+    for skip_pattern in _PACK_EXCLUDE:
+        if skip_pattern in item_name:
+            return f"{qty:g} {unit}".strip()
     # Find the first rule whose substring is in the item name.
     pack_size = 0
     pack_label = ""
