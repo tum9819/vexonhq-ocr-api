@@ -263,7 +263,10 @@ def _summarize_month(cur, period_month: date, branch_code: str) -> dict:
            FROM public.v_daybook
            WHERE branch_code = %s
              AND entry_date >= %s AND entry_date < %s
-             AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error')""",
+             AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
+                            'bank_statement', 'vendor_payment',
+                            'grab_payout', 'lineman_payout',
+                            'pos_cash_deposit', 'cash_withdrawal')""",
         (branch_code, period_month, pe),
     )
     row = cur.fetchone()
@@ -317,7 +320,10 @@ def dashboard_overview(
                        FROM public.v_daybook
                        WHERE branch_code = %s
                          AND entry_date >= %s AND entry_date < %s
-                         AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error')""",
+                         AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
+                            'bank_statement', 'vendor_payment',
+                            'grab_payout', 'lineman_payout',
+                            'pos_cash_deposit', 'cash_withdrawal')""",
                     (branch, year_start, ytd_end),
                 )
                 ytd_row = cur.fetchone()

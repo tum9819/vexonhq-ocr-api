@@ -459,7 +459,10 @@ def _build_weekly_summary() -> str:
                 COALESCE(SUM(CASE WHEN direction='expense' THEN amount ELSE 0 END), 0) AS exp
             FROM public.v_daybook
             WHERE entry_date BETWEEN %s AND %s
-              AND source NOT IN ('owner_capital','owner_advance','transfer_error')
+              AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
+                            'bank_statement', 'vendor_payment',
+                            'grab_payout', 'lineman_payout',
+                            'pos_cash_deposit', 'cash_withdrawal')
         """, (week_start.isoformat(), week_end.isoformat()))
         row = cur.fetchone()
         income  = float(row[0])
@@ -475,7 +478,10 @@ def _build_weekly_summary() -> str:
             LEFT JOIN public.categories cat ON cat.code = d.category_code
             WHERE d.entry_date BETWEEN %s AND %s
               AND d.direction = 'expense'
-              AND d.source NOT IN ('owner_capital','owner_advance','transfer_error')
+              AND d.source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
+                            'bank_statement', 'vendor_payment',
+                            'grab_payout', 'lineman_payout',
+                            'pos_cash_deposit', 'cash_withdrawal')
             GROUP BY COALESCE(cat.name, d.category_code, 'อื่นๆ')
             ORDER BY total DESC
             LIMIT 3

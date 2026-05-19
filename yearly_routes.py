@@ -92,7 +92,10 @@ def pnl_yearly(
                    FROM public.v_daybook
                    WHERE branch_code = %s
                      AND EXTRACT(YEAR FROM entry_date) = %s
-                     AND source NOT IN ('owner_capital','owner_advance','transfer_error')
+                     AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
+                            'bank_statement', 'vendor_payment',
+                            'grab_payout', 'lineman_payout',
+                            'pos_cash_deposit', 'cash_withdrawal')
                    GROUP BY 1""",
                 (branch, year),
             )

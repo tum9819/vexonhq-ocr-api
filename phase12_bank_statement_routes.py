@@ -216,6 +216,61 @@ def _load_rules(conn) -> list[dict]:
 MUSICIAN_AMOUNTS = {600, 700, 2100, 2800}
 
 
+# Built-in pattern rules — applied BEFORE DB rules. Each tuple is
+#   (direction, description_substrings, source_type, category_code).
+# Description match is case-insensitive substring against either the Thai
+# or English form of the bank's transaction description.
+#
+# Source-type semantics (see EXCLUDED_PNL_SOURCES in routes that compute P&L):
+#   *_payout / *_payment / pos_cash_deposit / cash_withdrawal -> NOT counted
+#     in P&L because the underlying business event was already counted
+#     elsewhere (vendor_bills, rider_deliveries, pos_bills).
+#   utility_expense / payroll_expense / tax_expense / bank_fee -> counted
+#     because these are real cash-only expenses with no other source.
+_BUILTIN_PATTERNS: list[tuple[str, list[str], str, str]] = [
+    # ── Income side (delivery platform payouts) ──────────────────────────
+    # Already counted under rider_income_grab / rider_income_lineman from the
+    # CSV/XLSX uploads, so do NOT double-count here.
+    ("income", ["lineman", "lmn", "ไลน์แมน"],          "lineman_payout", "delivery_lineman"),
+    ("income", ["grab", "กราบ", "GrabFood"],            "grab_payout",    "delivery_grab"),
+    # Cash deposit from the POS drawer — same revenue as pos_sale.
+    ("income", ["cash dep", "cdm", "นำฝากเงินสด", "เงินสด", "เงินฝาก"],
+                                                       "pos_cash_deposit", "pos_cash"),
+    # ── Expense side (utilities) ─────────────────────────────────────────
+    ("expense", ["mea", "การไฟฟ้านครหลวง", "ค่าไฟ"],   "utility_expense", "utility_electricity"),
+    ("expense", ["pea", "การไฟฟ้าส่วนภูมิภาค"],       "utility_expense", "utility_electricity"),
+    ("expense", ["mwa", "การประปานครหลวง", "ค่าน้ำ"], "utility_expense", "utility_water"),
+    ("expense", ["pwa", "การประปาส่วนภูมิภาค"],       "utility_expense", "utility_water"),
+    ("expense", ["ais", "true", "dtac", "tot", "3bb", "อินเตอร์เน็ต", "internet"],
+                                                       "utility_expense", "utility_telecom"),
+    # ── Expense side (bank fees, taxes, payroll) ─────────────────────────
+    ("expense", ["ค่าธรรมเนียม", "bnk chrg", "bank fee", "ค่าธรรม"],
+                                                       "bank_fee",        "bank_fee"),
+    ("expense", ["ภาษี", "revenue dept", "สรรพากร"],   "tax_expense",     "tax"),
+    ("expense", ["payroll", "salary", "เงินเดือน"],   "payroll_expense", "payroll"),
+    # ── Expense side (transfers we don't count in P&L) ───────────────────
+    # ATM cash withdrawal — neutral money movement, not an expense by itself.
+    # If the cash is actually used for purchases, those are tracked via
+    # manual_entries / pos_cashflow / vendor_bills separately.
+    ("expense", ["atm", "ถอนเงิน", "ถอน"],            "cash_withdrawal", None),
+]
+
+
+def _try_builtin_pattern(direction: str, desc_lower: str) -> tuple[str, str] | None:
+    """Match transaction description against built-in patterns.
+
+    Returns (source_type, category_code) on match, or None to fall through
+    to DB rules. Matches are direction-aware so an "ATM" outflow doesn't
+    accidentally hit an inflow rule, etc.
+    """
+    for dir_, substrings, source_type, category_code in _BUILTIN_PATTERNS:
+        if dir_ != direction:
+            continue
+        if any(s.lower() in desc_lower for s in substrings):
+            return source_type, category_code or "bank_statement"
+    return None
+
+
 def _classify(row: dict, rules: list[dict]) -> dict:
     """
     Apply rule engine to a transaction row.
@@ -234,6 +289,17 @@ def _classify(row: dict, rules: list[dict]) -> dict:
             return {**row, "direction": direction, "amount": amount,
                     "category_code": "musician_fee", "source_type": "bank_statement",
                     "match_status": "auto"}
+
+    # Built-in patterns (delivery payouts, utilities, payroll, etc.) —
+    # consulted BEFORE the DB rule table so the common Thai-banking labels
+    # are classified consistently across deployments without TUM having to
+    # seed the rules table.
+    builtin = _try_builtin_pattern(direction, desc_lower)
+    if builtin is not None:
+        source_type, category_code = builtin
+        return {**row, "direction": direction, "amount": amount,
+                "category_code": category_code, "source_type": source_type,
+                "match_status": "auto"}
 
     # Apply rules by priority
     for rule in rules:

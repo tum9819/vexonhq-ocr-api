@@ -63,7 +63,10 @@ def cashflow_forecast(days: int = Query(30, ge=7, le=90, description="Forecast w
                 COUNT(DISTINCT entry_date) AS active_days
             FROM public.v_daybook
             WHERE entry_date BETWEEN %s AND %s
-              AND source NOT IN ('owner_capital','owner_advance','transfer_error')
+              AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
+                            'bank_statement', 'vendor_payment',
+                            'grab_payout', 'lineman_payout',
+                            'pos_cash_deposit', 'cash_withdrawal')
         """, (lookback_start.isoformat(), (today - timedelta(days=1)).isoformat()))
         row = cur.fetchone()
         total_inc = float(row[0] or 0)
@@ -80,7 +83,10 @@ def cashflow_forecast(days: int = Query(30, ge=7, le=90, description="Forecast w
                    COALESCE(SUM(CASE WHEN direction='expense' THEN amount ELSE 0 END), 0) AS exp
             FROM public.v_daybook
             WHERE entry_date BETWEEN %s AND %s
-              AND source NOT IN ('owner_capital','owner_advance','transfer_error')
+              AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
+                            'bank_statement', 'vendor_payment',
+                            'grab_payout', 'lineman_payout',
+                            'pos_cash_deposit', 'cash_withdrawal')
             GROUP BY entry_date
             ORDER BY entry_date
         """, (lookback_start.isoformat(), (today - timedelta(days=1)).isoformat()))
@@ -188,7 +194,10 @@ def cashflow_summary():
                 COALESCE(SUM(CASE WHEN direction='expense' THEN amount ELSE 0 END), 0) AS exp
             FROM public.v_daybook
             WHERE entry_date BETWEEN %s AND %s
-              AND source NOT IN ('owner_capital','owner_advance','transfer_error')
+              AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
+                            'bank_statement', 'vendor_payment',
+                            'grab_payout', 'lineman_payout',
+                            'pos_cash_deposit', 'cash_withdrawal')
         """, (month_start.isoformat(), today.isoformat()))
         row = cur.fetchone()
         mtd_income  = float(row[0] or 0)
