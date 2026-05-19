@@ -644,24 +644,30 @@ def invoice_items_suggest(q: str = "", limit: int = 10):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
+            # Group by the *normalized* product name (trim + collapse
+            # internal whitespace) so OCR variants like "เบียร์ช้าง 620 มล."
+            # vs "เบียร์ช้าง  620 มล. " consolidate into one suggestion
+            # row instead of polluting the dropdown with near-duplicates.
+            # Use mode() over the raw product_name to surface the
+            # most-common canonical spelling for display.
             cur.execute(
                 """
                 SELECT
-                    ii.product_name,
-                    COUNT(*)::int AS uses,
-                    mode() WITHIN GROUP (ORDER BY ii.unit)        AS common_unit,
-                    mode() WITHIN GROUP (ORDER BY ii.unit_price)  AS common_unit_price,
-                    MAX(vb.bill_date)                             AS last_used
+                    mode() WITHIN GROUP (ORDER BY ii.product_name) AS product_name,
+                    COUNT(*)::int                                  AS uses,
+                    mode() WITHIN GROUP (ORDER BY ii.unit)         AS common_unit,
+                    mode() WITHIN GROUP (ORDER BY ii.unit_price)   AS common_unit_price,
+                    MAX(vb.bill_date)                              AS last_used
                 FROM public.invoice_items ii
                 JOIN public.vendor_bills vb ON vb.id = ii.vendor_bill_id
                 WHERE vb.review_status = 'confirmed'
                   AND ii.product_name IS NOT NULL
-                  AND ii.product_name <> ''
+                  AND TRIM(ii.product_name) <> ''
                   AND ii.product_name ILIKE %s
-                GROUP BY ii.product_name
+                GROUP BY regexp_replace(TRIM(ii.product_name), '\\s+', ' ', 'g')
                 ORDER BY uses DESC,
                          MAX(vb.bill_date) DESC NULLS LAST,
-                         ii.product_name ASC
+                         mode() WITHIN GROUP (ORDER BY ii.product_name) ASC
                 LIMIT %s
                 """,
                 (f"%{q_norm}%", safe_limit),
