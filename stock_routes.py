@@ -170,13 +170,72 @@ def _query_inventory(
 # LINE-friendly formatters
 # ─────────────────────────────────────────────
 
+# Pack-size rules for the daily stock digest. Each tuple is
+#   (item_name_substring, bottles_per_pack, pack_label).
+# Order matters: more specific patterns must come BEFORE more general ones
+# (e.g. "เป๊ปซี่ เล็ก" before "เป๊ปซี่", "น้ำเปล่า 1.5" before "น้ำเปล่า").
+# Iteration stops at the first match.
+_PACK_RULES: list[tuple[str, int, str]] = [
+    # Soft drinks — use แพ็ค (retail pack) as label
+    ("เป๊ปซี่ เล็ก",   24, "แพ็ค"),
+    ("เป๊ปซี่",       12, "แพ็ค"),
+    ("มิรินด้า",     12, "แพ็ค"),
+    # Water — bottle size dictates pack size
+    ("น้ำเปล่า 1.5",   6, "แพ็ค"),  # 1.5L large bottle, 6 per pack
+    ("น้ำเปล่า 550",  12, "แพ็ค"),  # 550 ml bottle, 12 per pack
+    ("น้ำเปล่า",      12, "แพ็ค"),  # default for other water sizes
+    # Beer — keeps existing convention: 1 ลัง = 12 ขวด
+    ("เบียร์",        12, "ลัง"),
+]
+
+# Stored-unit aliases that the LINE digest treats as a multi-bottle pack
+# (so we can compute total bottles for display).
+_PACK_UNITS = {"ลัง", "แพ็ค", "pack", "case"}
+_BOTTLE_UNITS = {"ขวด", "btl", "bottle"}
+
+
 def _fmt_qty(item_name: str, qty: float, unit: str) -> str:
-    """Format quantity — add (X ลัง) for beer items (1 ลัง = 12 ขวด)."""
-    unit = unit or ""
-    if "เบียร์" in item_name and unit in ("ขวด", "btl") and qty >= 12:
-        lang = int(qty) // 12
-        return f"{qty:g} ขวด ({lang} ลัง)"
-    return f"{qty:g} {unit}".strip()
+    """Format quantity — annotate known SKUs with pack info.
+
+    Examples:
+        เบียร์สิงห์, 382 ขวด     -> "382 ขวด (31 ลัง)"
+        เป๊ปซี่,    34 ลัง       -> "408 ขวด (34 แพ็ค)"
+        เป๊ปซี่ เล็ก, 23 ขวด     -> "23 ขวด" (<24, no pack annotation)
+        น้ำเปล่า 1.5 ลิตร, 47 ขวด -> "47 ขวด (7 แพ็ค)"
+        มิรินด้า-ส้ม, 6 ขวด      -> "6 ขวด" (<12, no pack annotation)
+
+    For SKUs with no matching rule we fall back to "<qty> <unit>" unchanged,
+    so this is purely additive.
+    """
+    unit = (unit or "").strip()
+    # Find the first rule whose substring is in the item name.
+    pack_size = 0
+    pack_label = ""
+    for pattern, size, label in _PACK_RULES:
+        if pattern in item_name:
+            pack_size, pack_label = size, label
+            break
+
+    if not pack_size:
+        return f"{qty:g} {unit}".strip()
+
+    # Normalize qty -> bottles using the stored unit.
+    if unit in _BOTTLE_UNITS:
+        bottles = int(qty)
+    elif unit in _PACK_UNITS:
+        bottles = int(qty) * pack_size
+    else:
+        # Unknown unit (e.g. กระป๋อง, ลิตร) — leave alone.
+        return f"{qty:g} {unit}".strip()
+
+    if bottles <= 0:
+        return f"{qty:g} {unit}".strip()
+
+    packs = bottles // pack_size
+    if packs >= 1:
+        return f"{bottles} ขวด ({packs} {pack_label})"
+    # Less than one pack — just show bottles, no annotation.
+    return f"{bottles} ขวด"
 
 
 def format_stock_for_line(items: list[dict], snapshot_at: str, title: str = "📦 เช็ค Stock") -> str:
