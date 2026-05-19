@@ -675,230 +675,27 @@ def phase2_health():
 # ============================================================
 # SECTION D — P&L (Profit & Loss)
 # ============================================================
-
-@router.get("/pnl/daily")
-def pnl_daily(
-    from_date: date = Query(..., alias="from"),
-    to_date: date = Query(..., alias="to"),
-    branch: str = Query(DEFAULT_BRANCH),
-):
-    """Daily P&L for an arbitrary date range (max 366 days)."""
-    if (to_date - from_date).days > 366:
-        raise HTTPException(400, "Range too large (max 366 days)")
-    if to_date < from_date:
-        raise HTTPException(400, "to_date must be >= from_date")
-
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            # daily sales
-            cur.execute(
-                """SELECT sales_date, SUM(net_total)::numeric AS sales_net,
-                          SUM(bill_count)::int AS bills
-                   FROM public.pos_sales_daily
-                   WHERE branch_code = %s AND sales_date BETWEEN %s AND %s
-                   GROUP BY sales_date
-                   ORDER BY sales_date""",
-                (branch, from_date, to_date),
-            )
-            sales_map = {r[0]: (float(r[1] or 0), int(r[2] or 0)) for r in cur.fetchall()}
-
-            # daily expense
-            cur.execute(
-                """SELECT bill_date, SUM(amount)::numeric AS exp
-                   FROM public.vendor_bills
-                   WHERE review_status = 'confirmed'
-                     AND bill_date IS NOT NULL
-                     AND bill_date BETWEEN %s AND %s
-                   GROUP BY bill_date
-                   ORDER BY bill_date""",
-                (from_date, to_date),
-            )
-            exp_map = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
-
-            # build day-by-day rows (include zero-sales days)
-            rows = []
-            d = from_date
-            tot_sales = tot_bills = tot_exp = 0
-            while d <= to_date:
-                s_net, s_bills = sales_map.get(d, (0.0, 0))
-                exp = exp_map.get(d, 0.0)
-                profit = s_net - exp
-                margin = round(profit / s_net * 100, 1) if s_net else None
-                rows.append({
-                    "sales_date": d.isoformat(),
-                    "sales_net": s_net,
-                    "sales_bill_count": s_bills,
-                    "expense_total": exp,
-                    "gross_profit": profit,
-                    "gross_margin_pct": margin,
-                })
-                tot_sales += s_net; tot_bills += s_bills; tot_exp += exp
-                d = date.fromordinal(d.toordinal() + 1)
-
-            tot_profit = tot_sales - tot_exp
-            tot_margin = round(tot_profit / tot_sales * 100, 1) if tot_sales else None
-        return {
-            "from": from_date.isoformat(),
-            "to": to_date.isoformat(),
-            "branch_code": branch,
-            "rows": rows,
-            "totals": {
-                "sales_net": tot_sales,
-                "sales_bill_count": tot_bills,
-                "expense_total": tot_exp,
-                "gross_profit": tot_profit,
-                "gross_margin_pct": tot_margin,
-            },
-        }
-    finally:
-        conn.close()
-
-
-@router.get("/pnl/monthly")
-def pnl_monthly(
-    year: int = Query(2026, ge=2020, le=2099),
-    branch: str = Query(DEFAULT_BRANCH),
-):
-    """Monthly P&L for a full year (up to 12 rows)."""
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """SELECT date_trunc('month', sales_date)::date AS m,
-                          SUM(net_total)::numeric, SUM(bill_count)::int
-                   FROM public.pos_sales_daily
-                   WHERE branch_code = %s
-                     AND EXTRACT(YEAR FROM sales_date) = %s
-                   GROUP BY 1
-                   ORDER BY 1""",
-                (branch, year),
-            )
-            sales_map = {r[0]: (float(r[1] or 0), int(r[2] or 0)) for r in cur.fetchall()}
-
-            cur.execute(
-                """SELECT date_trunc('month', bill_date)::date AS m,
-                          SUM(amount)::numeric, count(*)::int
-                   FROM public.vendor_bills
-                   WHERE review_status = 'confirmed' AND bill_date IS NOT NULL
-                     AND EXTRACT(YEAR FROM bill_date) = %s
-                   GROUP BY 1
-                   ORDER BY 1""",
-                (year,),
-            )
-            exp_map = {r[0]: (float(r[1] or 0), int(r[2] or 0)) for r in cur.fetchall()}
-
-            months = sorted(set(sales_map) | set(exp_map))
-            rows = []
-            tot_s = tot_e = tot_sb = tot_eb = 0
-            for m in months:
-                s_net, s_b = sales_map.get(m, (0.0, 0))
-                e_tot, e_b = exp_map.get(m, (0.0, 0))
-                profit = s_net - e_tot
-                margin = round(profit / s_net * 100, 1) if s_net else None
-                rows.append({
-                    "month": m.strftime("%Y-%m"),
-                    "sales_net": s_net,
-                    "expense_total": e_tot,
-                    "gross_profit": profit,
-                    "gross_margin_pct": margin,
-                    "bill_count_sales": s_b,
-                    "bill_count_expense": e_b,
-                })
-                tot_s += s_net; tot_e += e_tot; tot_sb += s_b; tot_eb += e_b
-
-            tot_p = tot_s - tot_e
-            tot_m = round(tot_p / tot_s * 100, 1) if tot_s else None
-        return {
-            "year": year,
-            "branch_code": branch,
-            "rows": rows,
-            "totals": {
-                "sales_net": tot_s, "expense_total": tot_e,
-                "gross_profit": tot_p, "gross_margin_pct": tot_m,
-                "bill_count_sales": tot_sb, "bill_count_expense": tot_eb,
-            },
-        }
-    finally:
-        conn.close()
-
-
-@router.get("/pnl/by-category")
-def pnl_by_category(
-    month: Optional[str] = Query(None),
-    branch: str = Query(DEFAULT_BRANCH),
-):
-    """Expense breakdown by category for one month, with % of sales."""
-    period_month = _month_start(month)
-    pe = _next_month(period_month)
-    prev = _prev_month(period_month)
-    prev_end = _next_month(prev)
-
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            # this month's sales
-            cur.execute(
-                """SELECT COALESCE(SUM(net_total),0)::numeric
-                   FROM public.pos_sales_daily
-                   WHERE branch_code = %s
-                     AND sales_date >= %s AND sales_date < %s""",
-                (branch, period_month, pe),
-            )
-            sales_net = float(cur.fetchone()[0] or 0)
-
-            # this month's expense by category
-            cur.execute(
-                """SELECT vb.category_code,
-                          COALESCE(ec.name_th, vb.category_code) AS name_th,
-                          SUM(vb.amount)::numeric AS exp
-                   FROM public.vendor_bills vb
-                   LEFT JOIN public.expense_categories ec ON ec.code = vb.category_code
-                   WHERE vb.review_status = 'confirmed'
-                     AND vb.bill_date IS NOT NULL
-                     AND vb.bill_date >= %s AND vb.bill_date < %s
-                   GROUP BY vb.category_code, ec.name_th
-                   ORDER BY exp DESC""",
-                (period_month, pe),
-            )
-            curr_rows = [(r[0], r[1], float(r[2] or 0)) for r in cur.fetchall()]
-
-            # prev month for comparison
-            cur.execute(
-                """SELECT category_code, SUM(amount)::numeric
-                   FROM public.vendor_bills
-                   WHERE review_status = 'confirmed' AND bill_date IS NOT NULL
-                     AND bill_date >= %s AND bill_date < %s
-                   GROUP BY category_code""",
-                (prev, prev_end),
-            )
-            prev_map = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
-
-            total_exp = sum(r[2] for r in curr_rows if r[0])
-            uncategorized = sum(r[2] for r in curr_rows if not r[0])
-
-            categories = []
-            for code, name_th, exp in curr_rows:
-                if not code:
-                    continue
-                prev_amt = prev_map.get(code, 0)
-                vs_prev = round((exp - prev_amt) / prev_amt * 100, 1) if prev_amt else None
-                categories.append({
-                    "category_code": code,
-                    "name_th": name_th,
-                    "expense": exp,
-                    "pct_of_sales": round(exp / sales_net * 100, 2) if sales_net else None,
-                    "pct_of_expense": round(exp / total_exp * 100, 2) if total_exp else None,
-                    "vs_prev_month": vs_prev,
-                })
-        return {
-            "month": period_month.strftime("%Y-%m"),
-            "sales_net": sales_net,
-            "categories": categories,
-            "uncategorized_expense": uncategorized,
-        }
-    finally:
-        conn.close()
+# MOVED to pnl_routes.py (Session 23, commit 2026-05-19).
+#
+# This file used to define `/pnl/daily`, `/pnl/monthly`, and
+# `/pnl/by-category` reading directly from `pos_sales_daily` and
+# `vendor_bills` only — which meant any expense booked through
+# `bank_statement_entries` (payroll, rent, utility, vendor_purchase,
+# bank_fee, etc., after Phase 3 reclassification) was silently
+# excluded from the P&L page.
+#
+# `pnl_routes.py` (registered later in `main.py`) already defines the
+# canonical versions of all three endpoints. They query `v_daybook`
+# with the full Phase 1 exclusion list so every income/expense source
+# is counted exactly once. But because FastAPI matches the FIRST
+# registered route, the duplicates here were shadowing the new ones —
+# the /pnl page was still returning vendor_bill-only expenses.
+#
+# Deleting the duplicates is the safe minimum fix: route ownership
+# transfers cleanly to pnl_routes.py without changing the public API
+# contract (`{rows: [...], totals: {sales_net, expense_total,
+# gross_profit, gross_margin_pct, sales_bill_count, ...}}`).
+# ============================================================
 
 
 # ============================================================
