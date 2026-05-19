@@ -246,6 +246,10 @@ _BUILTIN_PATTERNS: list[tuple[str, list[str], str, str]] = [
     # ── Expense side (bank fees, taxes, payroll) ─────────────────────────
     ("expense", ["ค่าธรรมเนียม", "bnk chrg", "bank fee", "ค่าธรรม"],
                                                        "bank_fee",        "bank_fee"),
+    # Payment-gateway / QR-payment fees — KBank "เพื่อชำระ Ref" pattern with
+    # MPAY / 2C2P / LINE MAN Wongnai (QR by ttb). Counts as bank_fee in P&L.
+    ("expense", ["mpay", "2c2p", "ทูซีทูพี", "line man wongnai", "qr by ttb"],
+                                                       "bank_fee",        "payment_gateway_fee"),
     ("expense", ["ภาษี", "revenue dept", "สรรพากร"],   "tax_expense",     "tax"),
     ("expense", ["payroll", "salary", "เงินเดือน"],   "payroll_expense", "payroll"),
     # ── Expense side (transfers we don't count in P&L) ───────────────────
@@ -281,13 +285,16 @@ def _classify(row: dict, rules: list[dict]) -> dict:
     direction = "income" if row["credit"] > 0 else "expense"
     amount = row["credit"] if row["credit"] > 0 else row["debit"]
 
-    # Special: musician fee by amount pattern (expense to individual)
+    # Special: musician fee by amount pattern (expense to individual).
+    # source_type 'payroll_expense' so it counts in P&L (the previous
+    # 'bank_statement' tag put it in the excluded-from-P&L bucket — bug
+    # that hid ~฿20k/month of real performer payments).
     if direction == "expense" and int(amount) in MUSICIAN_AMOUNTS:
         # Check it's a transfer to a person (not a company/service)
         is_company = any(w in desc for w in ["บจก", "หจก", "บริษัท", "ห้าง", "ร้าน", "จำกัด"])
         if not is_company:
             return {**row, "direction": direction, "amount": amount,
-                    "category_code": "musician_fee", "source_type": "bank_statement",
+                    "category_code": "musician_fee", "source_type": "payroll_expense",
                     "match_status": "auto"}
 
     # Built-in patterns (delivery payouts, utilities, payroll, etc.) —
