@@ -176,14 +176,19 @@ def _query_inventory(
 # (e.g. "เป๊ปซี่ เล็ก" before "เป๊ปซี่", "น้ำเปล่า 1.5" before "น้ำเปล่า").
 # Iteration stops at the first match.
 _PACK_RULES: list[tuple[str, int, str]] = [
-    # Soft drinks — use แพ็ค (retail pack) as label
-    ("เป๊ปซี่ เล็ก",   24, "แพ็ค"),
-    ("เป๊ปซี่",       12, "แพ็ค"),
+    # Soft drinks — use แพ็ค (retail pack) as label.
+    # 1-litre bottle is bigger -> fewer per pack; check it BEFORE the
+    # generic "เป๊ปซี่" rule so the substring match doesn't shadow it.
+    ("เป๊ปซี่ 1 ลิตร", 12, "แพ็ค"),
+    ("เป๊ปซี่ 1ลิตร",  12, "แพ็ค"),  # tolerate missing space in OCR data
+    ("เป๊ปซี่",       24, "แพ็ค"),  # regular + เล็ก variants share this rate
     ("มิรินด้า",     12, "แพ็ค"),
     # Water — bottle size dictates pack size
     ("น้ำเปล่า 1.5",   6, "แพ็ค"),  # 1.5L large bottle, 6 per pack
     ("น้ำเปล่า 550",  12, "แพ็ค"),  # 550 ml bottle, 12 per pack
     ("น้ำเปล่า",      12, "แพ็ค"),  # default for other water sizes
+    # Soda water (bottle form) — TUM tracks by ลัง of 24, same as beer label.
+    ("โซดา",          24, "ลัง"),
     # Beer — keeps existing convention: 1 ลัง = 12 ขวด
     ("เบียร์",        12, "ลัง"),
 ]
