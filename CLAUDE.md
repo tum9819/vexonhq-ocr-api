@@ -19,10 +19,14 @@ Language: respond in Thai mixed with English, technical when needed. Keep things
    - *Commit*: produce a small focused commit message and hand the diff to TUM to push
 2. **Ask questions first** — when requirements are ambiguous (edge cases, UX, technical tradeoffs), ask before writing the spec. Don't guess.
 3. **Fix root cause. Never suppress errors. Never skip tests.** When something fails, explain *why* before fixing.
-4. **TUM pushes to GitHub.** Claude can stage files, edit, run tests, run pytest, run black/ruff — but **stop before `git commit/push`** and hand the diff to TUM with the exact PowerShell commands.
-5. **Verify column names against `information_schema.columns` before writing SQL.** AI tends to hallucinate column names. Every wrong SQL column has cost hours of debugging in past sessions.
-6. **Don't reflexively `git checkout HEAD -- .`** based on a single bash read showing truncation — PowerShell `git status` is source of truth. (This was a Cowork-on-Windows-mount quirk; less relevant when running Claude Code on Windows directly, but still: trust PowerShell.)
-7. **No emojis in code or commits.** Markdown docs and chat replies — only if user uses them first.
+4. **TUM pushes to GitHub.** Claude can stage files, edit, run tests, run pytest, run black/ruff, and commit locally — but **stop before `git push`** and hand the diff to TUM with the exact PowerShell commands.
+5. **Backup tag + local CI before every handoff.** Before sending TUM a `git push` command, ALWAYS:
+   (a) Tag `origin/main` as a rollback target: `git fetch origin && git tag backup-pre-<descriptor>-YYYY-MM-DD origin/main && git push origin <tag>` — gives TUM one-command revert (`git reset --hard <tag>`) if the push regresses.
+   (b) Run the full local check suite: `python -c "import ast; ast.parse(open(file, encoding='utf-8').read())"` on every touched .py file, plus `pytest tests/` if tests exist, plus a live endpoint probe (`Invoke-WebRequest` against staging or local uvicorn) when the change touches a route.
+   (c) State plainly in the handoff what was verified — e.g. "Backup tagged as `backup-pre-X-YYYY-MM-DD`, ast.parse + endpoint probe passed, ready to push." Never silently skip a step.
+6. **Verify column names against `information_schema.columns` before writing SQL.** AI tends to hallucinate column names. Every wrong SQL column has cost hours of debugging in past sessions.
+7. **Don't reflexively `git checkout HEAD -- .`** based on a single bash read showing truncation — PowerShell `git status` is source of truth. (This was a Cowork-on-Windows-mount quirk; less relevant when running Claude Code on Windows directly, but still: trust PowerShell.)
+8. **No emojis in code or commits.** Markdown docs and chat replies — only if user uses them first.
 
 ---
 
