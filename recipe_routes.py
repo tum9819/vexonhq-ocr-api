@@ -230,23 +230,41 @@ def import_ingredients_from_stock(branch_code: str = "thawi_watthana"):
 #        100  — normalised strings are identical
 #         50  — one name is a substring of the other (>= 3 chars)
 #         0   — no overlap (excluded)
-#   3. For each ingredient, pick the highest-score match. Ties broken by
+#   3. Length-ratio guard: the shorter normalised name must be ≥ 60% of
+#      the longer one. Prevents "ไก่" (3 chars) from matching the
+#      "สันในไก่^^^" (15) ingredient just because it's a substring.
+#   4. For each ingredient, pick the highest-score match. Ties broken by
 #      most recent `vendor_bills.bill_date`.
-#   4. Skip ingredients whose normalised name is < 3 chars (would
+#   5. Skip ingredients whose normalised name is < 3 chars (would
 #      false-match too aggressively).
-#   5. Skip rows where price hasn't changed (`ABS(old - new) < 0.001`).
+#   6. Skip rows where price hasn't changed (`ABS(old - new) < 0.001`).
 #
-# dry_run=true (default) returns the proposed updates without applying.
-# Pass dry_run=false to commit. TUM should always preview first.
+# Two-phase apply:
+#   - POST .../sync-from-invoices (no body) → dry-run, returns all
+#     proposals. Frontend renders with per-row checkbox.
+#   - POST .../sync-from-invoices with body {"ingredient_ids": [...]}
+#     → apply ONLY the ticked subset. Unit-mismatch rows are still
+#     skipped even if checked, to prevent accidental kg-vs-pack price
+#     updates.
+
+class IngredientSyncApply(BaseModel):
+    """Apply-mode body for /sync-from-invoices."""
+    ingredient_ids: List[str]
+
 
 @ingredient_router.post("/sync-from-invoices")
-def sync_ingredient_prices_from_invoices(dry_run: bool = True):
+def sync_ingredient_prices_from_invoices(
+    body: Optional[IngredientSyncApply] = None,
+    dry_run: bool = True,
+):
     """
     Match ingredients to invoice_items by fuzzy name and update
     `price_per_unit` to the most recent matching invoice's unit_price.
 
     Default mode is `dry_run=true` — returns proposed changes only.
-    Pass `dry_run=false` to apply.
+    Apply by sending body `{"ingredient_ids": [...]}` (subset of the
+    dry-run output that TUM has reviewed + ticked). The endpoint will
+    auto-flip into apply-mode when the body is present.
 
     Response:
         {
@@ -254,6 +272,7 @@ def sync_ingredient_prices_from_invoices(dry_run: bool = True):
             "dry_run":        bool,
             "proposed_count": int,
             "applied_count":  int,
+            "skipped_unit_mismatch": int,
             "proposed": [
                 {
                     "ingredient_id": uuid,
@@ -270,6 +289,12 @@ def sync_ingredient_prices_from_invoices(dry_run: bool = True):
             ]
         }
     """
+    # If a body with ingredient_ids was passed, we're in apply mode
+    # regardless of the query string (the body is the more authoritative
+    # signal). dry_run query param is only honoured when no body present.
+    if body is not None and body.ingredient_ids:
+        dry_run = False
+    apply_ids = set(body.ingredient_ids) if body is not None and body.ingredient_ids else None
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -329,6 +354,14 @@ def sync_ingredient_prices_from_invoices(dry_run: bool = True):
                     )
                     WHERE length(ing.name_norm) >= 3
                       AND length(ni.pname_norm) >= 3
+                      -- Length-ratio guard: prevent "ไก่" (3 chars) matching
+                      -- "สันในไก่^^^" (15 chars) just because the short name
+                      -- is a substring. The shorter side must be at least 60%
+                      -- of the longer one — keeps "เนื้อสไลซ์" ⊂ "เนื้อสไลซ์โปร"
+                      -- (73%) but rejects "ไก่" ⊂ "สันในไก่" (37%). Exact-name
+                      -- matches always pass this gate by definition (ratio 100%).
+                      AND LEAST(length(ing.name_norm), length(ni.pname_norm))::float
+                          / GREATEST(length(ing.name_norm), length(ni.pname_norm))::float >= 0.6
                     ORDER BY ing.id,
                         CASE WHEN ni.pname_norm = ing.name_norm THEN 100 ELSE 50 END DESC,
                         ni.bill_date DESC NULLS LAST,
@@ -377,10 +410,17 @@ def sync_ingredient_prices_from_invoices(dry_run: bool = True):
             applied = 0
             if not dry_run and proposed:
                 for p in proposed:
-                    # Skip unit mismatches in the apply pass — TUM has to
-                    # resolve those by hand. The dry-run response surfaces
-                    # them so he knows what to look at.
+                    # Skip unit mismatches even when explicitly ticked —
+                    # the warning exists for a reason and we never want
+                    # to silently turn ฿199/EACH into ฿199/กก. behind
+                    # TUM's back.
                     if p["unit_mismatch"]:
+                        continue
+                    # If apply_ids is set, only update rows TUM ticked.
+                    # If apply_ids is None (legacy query-string mode),
+                    # update everything that passed the unit-mismatch
+                    # filter — backwards-compatible with old clients.
+                    if apply_ids is not None and p["ingredient_id"] not in apply_ids:
                         continue
                     cur.execute(
                         """
