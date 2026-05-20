@@ -59,6 +59,11 @@ class IngredientCreate(BaseModel):
     pack_size: int = 1
     invoice_unit: Optional[str] = None
     unit_cost_source: Optional[str] = None   # 'manual' | 'invoice' | 'sales_estimate'
+    # Phase V3 — stable invoice alias. When set, the sync engine uses this
+    # text instead of `name` to match invoice_items.product_name. Lets TUM
+    # keep kitchen-friendly names ("เบียร์ช้างคลาสสิก") while the supplier
+    # invoice says something completely different ("เบียร์ช้าง 620 มล.").
+    invoice_match_name: Optional[str] = None
 
 class IngredientUpdate(BaseModel):
     name: Optional[str] = None
@@ -69,6 +74,7 @@ class IngredientUpdate(BaseModel):
     pack_size: Optional[int] = None
     invoice_unit: Optional[str] = None
     unit_cost_source: Optional[str] = None
+    invoice_match_name: Optional[str] = None
 
 class RecipeCreate(BaseModel):
     name: str
@@ -101,7 +107,7 @@ def list_ingredients():
             cur.execute("""
                 SELECT id, name, unit, price_per_unit, yield_pct, category,
                        source_item_id, created_at,
-                       pack_size, invoice_unit, unit_cost_source
+                       pack_size, invoice_unit, unit_cost_source, invoice_match_name
                 FROM public.ingredients
                 ORDER BY category NULLS LAST, name
             """)
@@ -130,12 +136,13 @@ def create_ingredient(body: IngredientCreate):
             cur.execute("""
                 INSERT INTO public.ingredients
                     (name, unit, price_per_unit, yield_pct, category,
-                     pack_size, invoice_unit, unit_cost_source)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                     pack_size, invoice_unit, unit_cost_source, invoice_match_name)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (
                 body.name, body.unit, body.price_per_unit, body.yield_pct, body.category,
                 pack_size, body.invoice_unit, source,
+                body.invoice_match_name or None,
             ))
             new_id = cur.fetchone()[0]
         conn.commit()
@@ -351,8 +358,13 @@ def sync_ingredient_prices_from_invoices(
                         i.price_per_unit AS old_price,
                         i.pack_size,
                         i.invoice_unit,
+                        i.invoice_match_name,
+                        -- Phase V3: use invoice_match_name as the lookup key
+                        -- when it is set; fall back to name otherwise.
+                        -- This lets TUM keep kitchen-friendly names while the
+                        -- supplier invoice uses a completely different string.
                         regexp_replace(
-                            LOWER(TRIM(COALESCE(i.name, ''))),
+                            LOWER(TRIM(COALESCE(i.invoice_match_name, i.name, ''))),
                             '[[:space:]\\.,;:]+',
                             '',
                             'g'
@@ -361,13 +373,14 @@ def sync_ingredient_prices_from_invoices(
                 ),
                 matched AS (
                     SELECT DISTINCT ON (ing.id)
-                        ing.id              AS ingredient_id,
-                        ing.name            AS ingredient_name,
-                        ing.unit            AS ingredient_unit,
-                        ing.old_price       AS old_price,
-                        ing.pack_size       AS pack_size,
-                        ing.invoice_unit    AS expected_invoice_unit,
-                        ni.product_name     AS source_product_name,
+                        ing.id                  AS ingredient_id,
+                        ing.name                AS ingredient_name,
+                        ing.unit                AS ingredient_unit,
+                        ing.old_price           AS old_price,
+                        ing.pack_size           AS pack_size,
+                        ing.invoice_unit        AS expected_invoice_unit,
+                        ing.invoice_match_name  AS invoice_match_name,
+                        ni.product_name         AS source_product_name,
                         ni.unit_price       AS raw_invoice_price,
                         ni.unit             AS source_unit,
                         ni.bill_date        AS bill_date,
@@ -388,8 +401,19 @@ def sync_ingredient_prices_from_invoices(
                       -- of the longer one — keeps "เนื้อสไลซ์" ⊂ "เนื้อสไลซ์โปร"
                       -- (73%) but rejects "ไก่" ⊂ "สันในไก่" (37%). Exact-name
                       -- matches always pass this gate by definition (ratio 100%).
-                      AND LEAST(length(ing.name_norm), length(ni.pname_norm))::float
-                          / GREATEST(length(ing.name_norm), length(ni.pname_norm))::float >= 0.6
+                      -- Length-ratio guard: the shorter side must be either
+                      --   (a) ≥ 60% of the longer side (catches near-equal names), OR
+                      --   (b) ≥ 6 characters long (a ≥ 6-char key is specific enough
+                      --       that a substring hit is almost certainly a real match,
+                      --       even when the invoice embeds extra info like size/year).
+                      -- This lets "SINGHA RESERVE" (12 chars) match
+                      -- "เบียร์ SINGHA RESERVE (12x620CC)" while still blocking
+                      -- "ไก่" (3 chars) from false-matching "สันในไก่".
+                      AND (
+                          LEAST(length(ing.name_norm), length(ni.pname_norm))::float
+                              / GREATEST(length(ing.name_norm), length(ni.pname_norm))::float >= 0.6
+                          OR LEAST(length(ing.name_norm), length(ni.pname_norm)) >= 6
+                      )
                     ORDER BY ing.id,
                         CASE WHEN ni.pname_norm = ing.name_norm THEN 100 ELSE 50 END DESC,
                         ni.bill_date DESC NULLS LAST,
@@ -402,6 +426,7 @@ def sync_ingredient_prices_from_invoices(
                     old_price,
                     pack_size,
                     expected_invoice_unit,
+                    invoice_match_name,
                     source_product_name,
                     raw_invoice_price,
                     source_unit,
