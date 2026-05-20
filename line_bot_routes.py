@@ -256,6 +256,7 @@ def _process_slip_from_line(image_bytes: bytes) -> tuple[str, dict, dict]:
         _upload_slip_to_storage,
         _match_slip,
         _resolve_and_persist_category,
+        _find_duplicate_slip,
     )
 
     # 1) Storage (best-effort)
@@ -297,6 +298,27 @@ def _process_slip_from_line(image_bytes: bytes) -> tuple[str, dict, dict]:
     new_id = str(uuid.uuid4())
     conn = _get_db_conn()
     try:
+        # Duplicate guard — if this slip was already uploaded (via web
+        # or an earlier LINE forward), return the existing slip ID
+        # rather than create a second row. Match by (ref_no) primary,
+        # (transfer_date, amount, recipient_name) secondary.
+        from datetime import datetime as _dt
+        try:
+            t_date_obj = _dt.strptime(transfer_date[:10], "%Y-%m-%d").date()
+        except ValueError:
+            t_date_obj = transfer_date  # type: ignore[assignment]
+
+        existing_id = _find_duplicate_slip(
+            conn,
+            t_date_obj,
+            amount,
+            parsed.get("ref_no"),
+            parsed.get("recipient_name"),
+        )
+        if existing_id:
+            log.info("LINE slip duplicate detected — existing id=%s", existing_id)
+            return existing_id, parsed, {"status": "duplicate", "existing_slip_id": existing_id}
+
         sku, conf = _classify_memo(conn, parsed.get("memo"))
         with conn.cursor() as cur:
             cur.execute(
@@ -378,6 +400,22 @@ def _format_slip_reply(parsed: dict, slip_id: str, match: dict) -> str:
     transfer_date = parsed.get("transfer_date") or "—"
 
     status = match.get("status", "unmatched")
+
+    # Duplicate path — TUM forwarded the same slip image twice.
+    # Show a clearer message + link back to the existing slip.
+    if status == "duplicate":
+        return "\n".join([
+            "♻️ สลิปนี้มีในระบบแล้ว",
+            "─" * 24,
+            f"📅 วันที่: {transfer_date}",
+            f"💰 จำนวน: {amt_str}",
+            f"👤 ผู้รับ: {recipient}",
+            f"📝 บันทึก: {memo}",
+            "─" * 24,
+            "ℹ️ ไม่ได้บันทึกซ้ำ — ใช้รายการเดิมต่อได้เลย",
+            f"🔑 Slip ID: {slip_id[:8]}",
+        ])
+
     if status == "matched_full":
         match_line = "🟢 จับคู่ครบ 3 ทาง (Slip ↔ Statement ↔ Invoice)"
     elif status == "matched_stmt":

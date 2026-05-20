@@ -228,6 +228,61 @@ def _run_slip_vision(image_bytes: bytes, mime_type: str) -> dict[str, Any]:
         return json.loads(cleaned)
 
 
+def _find_duplicate_slip(
+    conn,
+    transfer_date,
+    amount: float,
+    ref_no: Optional[str],
+    recipient_name: Optional[str],
+) -> Optional[str]:
+    """
+    Return slip_id of a pre-existing slip that matches the new upload's
+    signature, or None if this is a fresh slip.
+
+    A bank transfer's `ref_no` is the strongest globally-unique signal
+    (KBank never re-uses one), so we check that first. If ref_no is
+    missing or didn't catch anything, fall back to the
+    (transfer_date, amount, recipient_name) triple — the same fingerprint
+    that statement reconciliation uses.
+
+    Without this, TUM accidentally uploading the same screenshot twice
+    (or sending the slip from LINE after already running /slip/upload via
+    web) ends up creating two slip rows that fight over the same
+    statement — the first wins, the second is permanently 'unmatched'
+    even though the bank row exists. Detecting upfront avoids that.
+    """
+    with conn.cursor() as cur:
+        # Priority 1: ref_no — globally unique per bank transaction.
+        if ref_no and ref_no.strip():
+            cur.execute(
+                "SELECT id FROM public.slips WHERE ref_no = %s LIMIT 1",
+                (ref_no.strip(),),
+            )
+            row = cur.fetchone()
+            if row:
+                return str(row[0])
+
+        # Priority 2: (date, amount, recipient_name) fingerprint.
+        # Same-day same-amount to same person is virtually always the
+        # same transaction — collision risk is negligible for a small
+        # restaurant's daily volume.
+        cur.execute(
+            """
+            SELECT id FROM public.slips
+            WHERE transfer_date = %s
+              AND ABS(amount - %s) <= 0.01
+              AND COALESCE(recipient_name, '') = COALESCE(%s, '')
+            LIMIT 1
+            """,
+            (transfer_date, amount, recipient_name),
+        )
+        row = cur.fetchone()
+        if row:
+            return str(row[0])
+
+    return None
+
+
 def _classify_memo(conn, memo: Optional[str]) -> tuple[Optional[str], float]:
     """
     Map a slip memo → canonical SKU via the existing product_classifier.
@@ -609,6 +664,29 @@ async def slip_upload(file: UploadFile = File(...), request: Request = None):
     # ── 4) Classify memo → canonical SKU ──
     conn = get_db_conn()
     try:
+        # ── 4a) Duplicate check before insert. If TUM sent the same screenshot
+        #    twice (web + LINE, accidental re-send, etc.) we want to return
+        #    the existing slip rather than create a second row that fights
+        #    over the same statement.
+        existing_id = _find_duplicate_slip(
+            conn,
+            transfer_date_iso,
+            amount,
+            parsed.get("ref_no"),
+            parsed.get("recipient_name"),
+        )
+        if existing_id:
+            log.info("slip upload duplicate detected — returning existing id=%s", existing_id)
+            return {
+                "success":     True,
+                "slip_id":     existing_id,
+                "parsed":      parsed,
+                "preview_url": image_url,
+                "duplicate":   True,
+                "message":     "สลิปนี้มีในระบบแล้ว — ไม่ได้บันทึกซ้ำ",
+                "match":       {"status": "duplicate", "existing_slip_id": existing_id},
+            }
+
         sku, conf = _classify_memo(conn, parsed.get("memo"))
 
         # ── 5) Insert into slips ──
