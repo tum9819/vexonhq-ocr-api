@@ -178,6 +178,213 @@ def _save_invoice_from_line(parsed: dict, image_bytes: bytes) -> str:
     return invoice_id
 
 
+# ─────────────────────────────────────────────
+# Session 27 / Phase 2 — Slip vs Invoice routing
+# ─────────────────────────────────────────────
+# When TUM sends an image to the LINE bot it might be either:
+#   (a) a supplier invoice — existing flow, vendor_bills
+#   (b) a K+ transfer slip — Session 27 flow, slips table
+#
+# We run a tiny GPT-4o-mini Vision classification call (~$0.001) BEFORE
+# the full-blown OCR so we can route the image into the right pipeline.
+# Slips have a very distinctive layout ("โอนเงินสำเร็จ" header, single-
+# amount summary, memo field) so this is high-confidence cheap to do.
+
+_IMAGE_TYPE_CLASSIFIER_PROMPT = (
+    "Classify this image as exactly one of:\n"
+    '  "slip"    — a Thai bank-transfer confirmation (K+, SCB Easy,\n'
+    '              Krungthai NEXT, etc. — short summary screen showing\n'
+    '              "โอนเงินสำเร็จ" or "Transfer Successful" plus a single\n'
+    '              amount, sender + recipient).\n'
+    '  "invoice" — a supplier invoice / tax invoice / receipt / bill\n'
+    '              (multiple line items, vendor name, totals, VAT).\n'
+    '  "other"   — anything else.\n'
+    'Reply with pure JSON: {"type": "slip|invoice|other", "confidence": 0.95}'
+)
+
+
+def _classify_image_type(image_bytes: bytes) -> str:
+    """
+    Return "slip", "invoice", or "other". Defaults to "invoice" if the
+    classifier errors out — preserves existing behaviour for TUM's main
+    use case.
+    """
+    try:
+        from main import get_openai
+        import base64 as _b64
+
+        client = get_openai()
+        b64 = _b64.b64encode(image_bytes).decode("utf-8")
+        data_url = f"data:image/jpeg;base64,{b64}"
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": _IMAGE_TYPE_CLASSIFIER_PROMPT},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+            max_tokens=60,
+        )
+        raw = (resp.choices[0].message.content or "{}").strip()
+        parsed = json.loads(raw)
+        kind = str(parsed.get("type") or "").lower().strip()
+        if kind in ("slip", "invoice", "other"):
+            return kind
+    except Exception as e:
+        log.warning("image classifier failed (defaulting to invoice): %s", e)
+    return "invoice"
+
+
+def _process_slip_from_line(image_bytes: bytes) -> tuple[str, dict, dict]:
+    """
+    Run the slip pipeline against bytes downloaded from LINE Content API.
+    Returns (slip_id, parsed_ocr_dict, match_result_dict).
+
+    Mirrors POST /slip/upload but skips the FastAPI request layer. All
+    heavy lifting delegates to slip_routes helpers so the two entry
+    points stay in lockstep.
+    """
+    from slip_routes import (
+        _run_slip_vision,
+        _classify_memo,
+        _upload_slip_to_storage,
+        _match_slip,
+    )
+
+    # 1) Storage (best-effort)
+    image_url = None
+    try:
+        image_url = _upload_slip_to_storage(
+            image_bytes,
+            f"line-slip-{uuid.uuid4().hex[:8]}.jpg",
+            "image/jpeg",
+        )
+    except Exception:
+        log.exception("LINE slip storage upload failed (continuing)")
+
+    # 2) Vision
+    parsed = _run_slip_vision(image_bytes, "image/jpeg")
+    transfer_date = parsed.get("transfer_date")
+    amount = parsed.get("amount")
+    if not transfer_date or amount is None:
+        raise RuntimeError(
+            f"OCR ดึงข้อมูลไม่ครบ — date={transfer_date!r} amount={amount!r}"
+        )
+
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"OCR returned invalid amount {amount!r}")
+
+    fee = parsed.get("fee")
+    try:
+        fee = float(fee) if fee is not None else 0.0
+    except (TypeError, ValueError):
+        fee = 0.0
+
+    transfer_time = parsed.get("transfer_time")
+    if transfer_time and len(transfer_time) == 5:
+        transfer_time = transfer_time + ":00"
+
+    # 3) Insert + classify
+    new_id = str(uuid.uuid4())
+    conn = _get_db_conn()
+    try:
+        sku, conf = _classify_memo(conn, parsed.get("memo"))
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.slips
+                    (id, transfer_date, transfer_time, amount, fee,
+                     sender_name, sender_account, sender_bank,
+                     recipient_name, recipient_account, recipient_bank,
+                     memo, ref_no, raw_image_url, ocr_json,
+                     canonical_sku, canonical_confidence,
+                     source, created_by, updated_by)
+                VALUES
+                    (%s, %s, %s, %s, %s,
+                     %s, %s, %s,
+                     %s, %s, %s,
+                     %s, %s, %s, %s::jsonb,
+                     %s, %s,
+                     'line', 'line_bot', 'line_bot')
+                """,
+                (
+                    new_id,
+                    transfer_date,
+                    transfer_time,
+                    amount,
+                    fee,
+                    parsed.get("sender_name"),
+                    parsed.get("sender_account"),
+                    parsed.get("sender_bank"),
+                    parsed.get("recipient_name"),
+                    parsed.get("recipient_account"),
+                    parsed.get("recipient_bank"),
+                    parsed.get("memo"),
+                    parsed.get("ref_no"),
+                    image_url,
+                    json.dumps(parsed, ensure_ascii=False),
+                    sku,
+                    conf if conf > 0 else None,
+                ),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    # 4) Match
+    try:
+        match = _match_slip(new_id, "line_bot")
+    except Exception:
+        log.exception("LINE slip matcher failed for %s", new_id)
+        match = {"status": "error"}
+    return new_id, parsed, match
+
+
+def _format_slip_reply(parsed: dict, slip_id: str, match: dict) -> str:
+    """Pretty LINE reply for an ingested slip."""
+    amount = parsed.get("amount")
+    amt_str = f"฿{float(amount):,.2f}" if amount is not None else "ไม่ทราบ"
+    recipient = parsed.get("recipient_name") or "ไม่ทราบ"
+    memo = (parsed.get("memo") or "").strip() or "—"
+    transfer_date = parsed.get("transfer_date") or "—"
+
+    status = match.get("status", "unmatched")
+    if status == "matched_full":
+        match_line = "🟢 จับคู่ครบ 3 ทาง (Slip ↔ Statement ↔ Invoice)"
+    elif status == "matched_stmt":
+        match_line = "🔵 จับคู่ Statement สำเร็จ — ยังไม่มี Invoice"
+    elif status == "ambiguous":
+        n = match.get("candidates", 0)
+        match_line = f"🟡 พบ Statement {n} รายการ — โปรดเลือกในเว็บ"
+    elif status == "skipped":
+        match_line = "⚪ ข้ามจับคู่ — ข้อมูลสลิปไม่ครบ"
+    else:
+        match_line = "⚪ ยังไม่มี Statement ตรงกับสลิปนี้"
+
+    return "\n".join([
+        "💸 บันทึกสลิปโอนเงินแล้ว!",
+        "─" * 24,
+        f"📅 วันที่: {transfer_date}",
+        f"💰 จำนวน: {amt_str}",
+        f"👤 ผู้รับ: {recipient}",
+        f"📝 บันทึก: {memo}",
+        "─" * 24,
+        match_line,
+        f"🔑 Slip ID: {slip_id[:8]}",
+    ])
+
+
 def _format_ocr_reply(parsed: dict, invoice_id: str) -> str:
     """Format a friendly LINE reply summarising the OCR result."""
     vendor = parsed.get("vendor_name") or "ไม่ทราบร้าน"
@@ -1312,33 +1519,42 @@ def _process_one_event(event: dict) -> None:
         return
 
     # ────────────────────────────────────────
-    # 📷 IMAGE MESSAGE — Phase 13 OCR Bot
+    # 📷 IMAGE MESSAGE — Phase 13 OCR Bot + Session 27 Slip routing
     # ────────────────────────────────────────
     if msg_type == "image":
         message_id = msg.get("id", "")
         log.info("LINE webhook image: message_id=%s", message_id)
 
         try:
-            # 1. Acknowledge IMMEDIATELY (reply_token expires in 30s)
-            _reply_line(reply_token, "⏳ กำลัง OCR ใบกำกับ... รอสักครู่นะครับ")
+            # 1. Acknowledge IMMEDIATELY (reply_token expires in 30s).
+            #    Generic wording — we don't yet know if it's a slip or
+            #    invoice until the classifier runs.
+            _reply_line(reply_token, "⏳ กำลังประมวลผลรูป... รอสักครู่นะครับ")
 
             # 2. Download image from LINE
             image_bytes = _download_line_image(message_id)
 
-            # 3. OCR via GPT Vision (slow — 10-30s)
-            parsed = _ocr_invoice_image(image_bytes)
+            # 3. Cheap classifier: invoice vs slip (~$0.001, ~1s).
+            #    Defaults to 'invoice' on any error so the existing
+            #    flow keeps working if OpenAI hiccups.
+            image_type = _classify_image_type(image_bytes)
+            log.info("LINE image classified as %r", image_type)
 
-            # 4. Save to vendor_bills
-            invoice_id = _save_invoice_from_line(parsed, image_bytes)
-
-            # 5. Push result (reply_token already used above; use push)
-            reply = _format_ocr_reply(parsed, invoice_id)
-            _push_text(reply)
+            if image_type == "slip":
+                slip_id, parsed, match = _process_slip_from_line(image_bytes)
+                _push_text(_format_slip_reply(parsed, slip_id, match))
+            else:
+                # Invoice path (also covers "other" — fallback OCR is
+                # cheap enough; vendor_bills can be flagged + rejected
+                # from the review queue if it really isn't an invoice).
+                parsed = _ocr_invoice_image(image_bytes)
+                invoice_id = _save_invoice_from_line(parsed, image_bytes)
+                _push_text(_format_ocr_reply(parsed, invoice_id))
 
         except Exception as e:
-            log.error("LINE OCR flow failed: %s", e)
+            log.error("LINE image flow failed: %s", e)
             try:
-                _push_text(f"❌ OCR ล้มเหลว กรุณาลองใหม่\n({str(e)[:80]})")
+                _push_text(f"❌ ประมวลผลรูปไม่สำเร็จ กรุณาลองใหม่\n({str(e)[:80]})")
             except Exception:
                 pass
         return
@@ -1361,7 +1577,8 @@ def _process_one_event(event: dict) -> None:
             _reply_line(reply_token,
                 "🤖 VEXONHQ LINE Bot\n"
                 "─────────────────────────\n"
-                "📷 ส่งรูปใบกำกับ/บิล → OCR อัตโนมัติ\n\n"
+                "📷 ส่งรูปใบกำกับ/บิล → OCR อัตโนมัติ\n"
+                "💸 ส่งรูปสลิปโอนเงิน → บันทึก + จับคู่ Statement\n\n"
                 "💬 บันทึกค่าใช้จ่ายด่วน:\n"
                 "  ค่าน้ำมัน 450\n"
                 "  ค่าแก๊ส 350 บาท\n"
