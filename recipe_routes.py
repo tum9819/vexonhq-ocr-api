@@ -485,10 +485,33 @@ def sync_ingredient_prices_from_invoices(
                 # (e.g. 'ลัง' ⊂ 'ลังx12'). Same the other way: if the
                 # source is 'ลัง' and the ingredient expects 'ลัง12',
                 # still treat as a match.
+                # Canonical aliases: maps known English / shorthand units
+                # to their Thai equivalents so e.g. "each" == "ชิ้น" and
+                # "kilogram" == "กก." resolve to the same canonical string
+                # before the substring comparison.  Keys are already
+                # lower-cased because _u() lower-cases before calling here.
+                _UNIT_NORM: dict[str, str] = {
+                    "each":      "ชิ้น",
+                    "ea":        "ชิ้น",
+                    "pc":        "ชิ้น",
+                    "pcs":       "ชิ้น",
+                    "piece":     "ชิ้น",
+                    "pieces":    "ชิ้น",
+                    "unit":      "ชิ้น",
+                    "kilogram":  "กก.",
+                    "kg":        "กก.",
+                    "กิโล":      "กก.",
+                    "กิโลกรัม":  "กก.",
+                    "gram":      "กรัม",
+                    "g":         "กรัม",
+                }
+
                 def _unit_matches(a: str, b: str) -> bool:
                     if not a or not b:
                         return False
-                    return a == b or a in b or b in a
+                    na = _UNIT_NORM.get(a, a)
+                    nb = _UNIT_NORM.get(b, b)
+                    return na == nb or na in nb or nb in na
 
                 if _unit_matches(src_u, ing_u):
                     # Case A — same unit, no conversion
