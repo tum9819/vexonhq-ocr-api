@@ -950,6 +950,7 @@ def invoice_auto_classify(invoice_id: str, force: bool = False):
 def invoice_items_auto_classify_bulk(
     only_confirmed: bool = True,
     limit_bills: int = 200,
+    force_other: bool = False,
 ):
     """
     One-shot backfill of canonical_sku across many bills at once.
@@ -969,8 +970,14 @@ def invoice_items_auto_classify_bulk(
 
     Idempotent: rows that already have `canonical_sku` set are skipped.
     No `force` flag here on purpose — manual confirmations must not be
-    clobbered by a bulk run. If you do need to re-classify everything,
-    NULL the column first via SQL.
+    clobbered by a bulk run.
+
+    `force_other=true` (Session 27 / item Q): widen the scope to also
+    re-process rows where canonical_sku='other'. We never auto-pick
+    'other' over a real SKU — it's a "model gave up" signal — so
+    revisiting these rows after new SKUs (food categories) get seeded
+    is safe and idempotent. Rows where TUM manually pinned a real
+    SKU are still untouched.
 
     Returns counts + per-bill summary so the operator can see what
     actually changed.
@@ -982,19 +989,24 @@ def invoice_items_auto_classify_bulk(
             # GROUP BY vendor_bill_id so we touch each bill exactly once
             # — `_auto_classify_invoice_items` already does the per-row
             # WHERE filter inside.
-            sql = """
+            unfit_pred = (
+                "ii.canonical_sku IS NULL OR ii.canonical_sku = 'other'"
+                if force_other
+                else "ii.canonical_sku IS NULL"
+            )
+            sql = f"""
                 SELECT vb.id, vb.vendor_name, vb.bill_date,
-                       COUNT(*) FILTER (WHERE ii.canonical_sku IS NULL) AS unclassified
+                       COUNT(*) FILTER (WHERE {unfit_pred}) AS unclassified
                 FROM public.vendor_bills vb
                 JOIN public.invoice_items ii ON ii.vendor_bill_id = vb.id
-                WHERE ii.canonical_sku IS NULL
+                WHERE {unfit_pred}
             """
             params: list = []
             if only_confirmed:
                 sql += " AND vb.review_status = 'confirmed'"
-            sql += """
+            sql += f"""
                 GROUP BY vb.id, vb.vendor_name, vb.bill_date
-                HAVING COUNT(*) FILTER (WHERE ii.canonical_sku IS NULL) > 0
+                HAVING COUNT(*) FILTER (WHERE {unfit_pred}) > 0
                 ORDER BY vb.bill_date DESC NULLS LAST
                 LIMIT %s
             """
@@ -1012,7 +1024,11 @@ def invoice_items_auto_classify_bulk(
     for bill_id, vendor_name, bill_date, unclassified_count in bills_to_classify:
         bill_id_str = str(bill_id)
         try:
-            result = _auto_classify_invoice_items(bill_id_str, only_unclassified=True)
+            result = _auto_classify_invoice_items(
+                bill_id_str,
+                only_unclassified=True,
+                also_other=force_other,
+            )
         except Exception as exc:
             log.exception("bulk classify failed for bill %s", bill_id_str)
             errors.append({
@@ -2007,6 +2023,7 @@ def _auto_classify_invoice_items(
     invoice_id: str,
     *,
     only_unclassified: bool = True,
+    also_other: bool = False,
 ) -> dict:
     """
     Run the AI classifier on every line item of an invoice and write the
@@ -2021,6 +2038,12 @@ def _auto_classify_invoice_items(
     are skipped so TUM's manual confirmations aren't overwritten. Set
     `only_unclassified=False` to force a re-classification.
 
+    `also_other=True` (with `only_unclassified=True`) widens the scope
+    to include rows where canonical_sku='other' as if they were NULL.
+    Use case (Session 27 / item Q): after seeding food SKUs we want to
+    revisit items that previously fell through to 'other' without
+    overriding rows TUM manually pinned to a specific food SKU.
+
     Returns a dict with `classified`, `skipped`, and `results` so the
     caller can decide what to surface to the UI.
     """
@@ -2028,16 +2051,28 @@ def _auto_classify_invoice_items(
     try:
         with conn.cursor() as cur:
             if only_unclassified:
-                cur.execute(
-                    """
-                    SELECT id, product_name
-                    FROM public.invoice_items
-                    WHERE vendor_bill_id = %s
-                      AND canonical_sku IS NULL
-                    ORDER BY line_no, id
-                    """,
-                    (invoice_id,),
-                )
+                if also_other:
+                    cur.execute(
+                        """
+                        SELECT id, product_name
+                        FROM public.invoice_items
+                        WHERE vendor_bill_id = %s
+                          AND (canonical_sku IS NULL OR canonical_sku = 'other')
+                        ORDER BY line_no, id
+                        """,
+                        (invoice_id,),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT id, product_name
+                        FROM public.invoice_items
+                        WHERE vendor_bill_id = %s
+                          AND canonical_sku IS NULL
+                        ORDER BY line_no, id
+                        """,
+                        (invoice_id,),
+                    )
             else:
                 cur.execute(
                     """
