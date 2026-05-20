@@ -106,6 +106,15 @@ class SlipUpdate(BaseModel):
     notes:             Optional[str] = None
 
 
+class CategoryOverrideRequest(BaseModel):
+    """
+    Body for POST /slip/{id}/category — TUM overrides the auto-resolved
+    category. Pass `category_code = null` (or omit) to unlock and let
+    the resolver pick again on next match.
+    """
+    category_code: Optional[str] = None
+
+
 class ManualMatchRequest(BaseModel):
     statement_id: Optional[str] = None   # null → unlink statement
     invoice_id:   Optional[str] = None   # null → unlink invoice
@@ -338,7 +347,25 @@ def _resolve_and_persist_category(
 
     L1: matched_statement.category_code (verified)
     L2/L3: fall back to _classify_slip_category()
+
+    Respects the 'manual' lock: if the row currently has
+    category_source = 'manual', TUM has chosen the category himself
+    and we leave it alone. He can unlock via POST /slip/{id}/category
+    with category_code = null.
     """
+    # ── Manual override lock ──
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT category_source FROM public.slips WHERE id = %s",
+                (slip_id,),
+            )
+            row = cur.fetchone()
+            if row and row[0] == "manual":
+                return  # honour TUM's manual choice
+    except Exception:
+        log.exception("category lock check failed slip=%s", slip_id)
+
     category_code: Optional[str] = None
     source: Optional[str] = None
 
@@ -1224,6 +1251,101 @@ def slip_reject(slip_id: str, request: Request):
         conn.close()
     log.info("slip reject id=%s by %s", slip_id, actor)
     return {"success": True, "id": slip_id, "match_status": "rejected"}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# POST /slip/{id}/category — manual category override (Phase 6.5+)
+# ════════════════════════════════════════════════════════════════════════════
+
+@router.post("/slip/{slip_id}/category")
+def slip_override_category(
+    slip_id: str,
+    body: CategoryOverrideRequest,
+    request: Request,
+):
+    """
+    Manually pin a slip's accounting category, overriding whatever the
+    L1→L3 cascade resolved. Sets category_source='manual' so subsequent
+    rematch calls won't clobber the choice.
+
+    Pass category_code=null to clear the lock and let the auto-resolver
+    pick again on the next rematch.
+    """
+    actor = _current_username(request)
+    code = (body.category_code or "").strip() or None
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            if code is None:
+                # Unlock + re-run resolver immediately so TUM sees a fresh
+                # auto-pick rather than staring at a stale blank chip.
+                cur.execute(
+                    """
+                    UPDATE public.slips
+                    SET statement_category_code = NULL,
+                        category_source         = NULL,
+                        updated_by              = %s
+                    WHERE id = %s
+                    """,
+                    (actor, slip_id),
+                )
+                if cur.rowcount == 0:
+                    raise HTTPException(404, "slip not found")
+                conn.commit()
+            else:
+                cur.execute(
+                    """
+                    UPDATE public.slips
+                    SET statement_category_code = %s,
+                        category_source         = 'manual',
+                        updated_by              = %s
+                    WHERE id = %s
+                    RETURNING statement_category_code, category_source
+                    """,
+                    (code, actor, slip_id),
+                )
+                if cur.rowcount == 0:
+                    raise HTTPException(404, "slip not found")
+                conn.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    # If TUM cleared the lock, re-run the cascade so the response carries
+    # the freshly-resolved category instead of a momentary NULL.
+    if code is None:
+        try:
+            conn2 = get_db_conn()
+            try:
+                with conn2.cursor() as cur:
+                    cur.execute(
+                        "SELECT recipient_name, memo, matched_statement_id "
+                        "FROM public.slips WHERE id = %s",
+                        (slip_id,),
+                    )
+                    row = cur.fetchone()
+                if row:
+                    _resolve_and_persist_category(
+                        conn2, slip_id, row[0], row[1],
+                        str(row[2]) if row[2] else None,
+                    )
+            finally:
+                conn2.close()
+        except Exception:
+            log.exception("re-resolve after unlock failed slip=%s", slip_id)
+
+    log.info("slip category override id=%s by %s code=%r", slip_id, actor, code)
+    return {
+        "success":               True,
+        "slip_id":                slip_id,
+        "statement_category_code": code,
+        "category_source":        "manual" if code else None,
+    }
 
 
 # ════════════════════════════════════════════════════════════════════════════
