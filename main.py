@@ -65,6 +65,7 @@ from stock_routes import router as stock_router
 from recipe_routes import router as recipe_router, ingredient_router
 from tax_routes import router as tax_router
 from rules_routes import router as rules_router
+from slip_routes import router as slip_router
 from auth_routes import router as auth_router, verify_token
 from alerts_webhook_routes import router as alerts_router
 # === Phase 2: psycopg connection for POS bulk imports ===
@@ -147,6 +148,7 @@ app.include_router(ingredient_router)
 app.include_router(tax_router)
 app.include_router(alerts_router)
 app.include_router(rules_router)
+app.include_router(slip_router)
 # ============================================================
 # JWT Auth Middleware — protects all routes except public ones
 # NOTE: Must be added BEFORE CORSMiddleware so CORS is outermost.
