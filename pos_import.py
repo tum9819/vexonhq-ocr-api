@@ -995,6 +995,21 @@ WRITER_CONFIG = {
         conflict_cols=["drawer_code","txn_at","description","amount"],
         update_cols=["txn_date","txn_type","direction","branch_code","is_refund"]),
 
+    # Session 28 fix — missing entry caused 6 uploaded "ยอดขายตามสินค้า"
+    # files to insert 0 rows. The parser was running, returning rows
+    # correctly, but the dispatch loop ("cfg = WRITER_CONFIG.get(table)")
+    # falls through with a warning when the entry is absent. /recipes
+    # /import-from-menu read this table to populate the recipes master,
+    # so empty table = no menus auto-created.
+    # Dedup on (branch_code, period_start, product_name) — same menu in
+    # same month is the same row; re-importing updates aggregates.
+    "pos_sales_by_product": dict(
+        conflict_cols=["branch_code","period_start","product_name"],
+        update_cols=["period_end","sku","product_group","category",
+                     "avg_cost","avg_price","qty_sold","gross","cost_total",
+                     "item_discount","net_amount","profit","avg_profit",
+                     "source_import_id"]),
+
 }
 
 
