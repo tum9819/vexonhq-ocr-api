@@ -34,7 +34,7 @@ from typing import Any, Optional
 import cv2
 import pypdfium2 as pdfium
 import pytesseract
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from PIL import Image
@@ -69,6 +69,7 @@ from slip_routes import router as slip_router
 from store_context_routes import router as store_context_router
 from auth_routes import router as auth_router, verify_token
 from alerts_webhook_routes import router as alerts_router
+from auto_diagnose import try_diagnose
 # === Phase 2: psycopg connection for POS bulk imports ===
 # (Phase 1 uses supabase client for OCR flows — this is for high-volume
 #  executemany() inserts that need raw PG driver)
@@ -289,7 +290,7 @@ def health():
 
 
 @app.api_route("/health/deep", methods=["GET", "HEAD"])
-def health_deep():
+def health_deep(background_tasks: BackgroundTasks):
     """
     Deep health check — actually verifies dependencies (P0.1, Session 24).
 
@@ -376,6 +377,25 @@ def health_deep():
         "version": app.version,
         "checked_at": datetime.utcnow().isoformat() + "Z",
     }
+
+    # AI auto-diagnosis (P1.4 MVP, Session 24) — fires only when DB or
+    # Supabase check actually failed. Runs as BackgroundTask so it
+    # does NOT delay the 503 response Uptime Robot is waiting on.
+    # Rate-limited inside try_diagnose (10 min per error_type).
+    # Silently skipped if ANTHROPIC_API_KEY / DISCORD_OPS_WEBHOOK_URL
+    # env vars are not set, so the endpoint is safe to ship without
+    # them and TUM can set them in Coolify when ready.
+    if not db_ok:
+        # Pick a stable key so the rate limiter dedups on the same
+        # failure mode; different failure modes still get their own
+        # diagnosis.
+        if not checks["postgres"]["ok"]:
+            error_type = "postgres_failed"
+        elif not checks["supabase"]["ok"]:
+            error_type = "supabase_failed"
+        else:
+            error_type = "unknown_failure"
+        background_tasks.add_task(try_diagnose, error_type, body)
 
     if http_code != 200:
         return StarletteJSONResponse(status_code=http_code, content=body)

@@ -234,7 +234,18 @@ For per-feature changes: ask user whether to add a new pytest case to `tests/tes
 
 - **`GET /health/deep`** (public, accepts GET+HEAD) probes Postgres + Supabase with real queries — returns 200 healthy / 200 degraded / 503 unhealthy. Use this URL when adding new external monitors; `/health` only reports env-var flags.
 - **Uptime Robot** monitors `/health/deep` every 5 min and fires Discord `@everyone` alerts to TUM's `VEXONHQ Ops` server on DOWN + UP transitions.
+- **AI auto-diagnosis (`auto_diagnose.py`)** — when `/health/deep` reports 503, a FastAPI BackgroundTask calls Anthropic Claude Haiku with the failed check details and posts a Thai/English diagnosis to the same Discord channel ~5 s after Uptime Robot's own DOWN alert. Rate-limited to 1 diagnosis per error_type per 10 min. Skips silently if env vars aren't set, so the feature is opt-in via Coolify.
 - **`/alerts/uptime-webhook` → Telegram** (Session 19) is dormant: Uptime Robot free plan locks both Telegram and Webhook integrations. Keep the code; reactivate when either upgrading the plan or switching to self-hosted UptimeKuma.
+
+### Optional env vars for AI diagnosis (set in Coolify when ready)
+
+| Var | Source | Notes |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | console.anthropic.com → API Keys | Set spend cap $5/mo as safety net. Expect ~฿1-4/mo at our outage frequency. |
+| `DISCORD_OPS_WEBHOOK_URL` | Discord channel → Edit → Integrations → Webhooks → Copy URL | Same channel Uptime Robot posts to. Reuse the existing webhook. |
+| `ANTHROPIC_DIAGNOSE_MODEL` | optional override (default `claude-haiku-4-5`) | Upgrade to Sonnet only if Haiku diagnoses prove off-target. |
+
+Without these, `/health/deep` behavior is unchanged — diagnosis just no-ops with a warning log.
 
 ---
 
