@@ -385,7 +385,13 @@ def sync_ingredient_prices_from_invoices(
                         ni.unit             AS source_unit,
                         ni.bill_date        AS bill_date,
                         CASE
+                            -- Exact name match → always 100.
                             WHEN ni.pname_norm = ing.name_norm THEN 100
+                            -- invoice_match_name was set explicitly by TUM,
+                            -- meaning this is a confirmed alias not an
+                            -- auto-guessed substring. Treat as score 100 so
+                            -- the frontend auto-ticks it like an exact match.
+                            WHEN ing.invoice_match_name IS NOT NULL THEN 100
                             ELSE 50
                         END AS match_score
                     FROM normalized_ing ing
