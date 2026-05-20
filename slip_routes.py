@@ -975,6 +975,105 @@ def delete_slip(slip_id: str, request: Request):
 # POST /slip/{id}/match — re-run 3-way matcher
 # ════════════════════════════════════════════════════════════════════════════
 
+@router.post("/slips/rematch-all")
+def slips_rematch_all(
+    request: Request,
+    status: Optional[str] = Query(None, description="unmatched / matched_stmt / matched_full / needs_review / rejected — limit to one status"),
+    month:  Optional[str] = Query(None, description="YYYY-MM filter on transfer_date"),
+):
+    """
+    Bulk re-run the 3-way matcher + category cascade against every slip
+    that matches the (status, month) filter. Use case:
+
+      - TUM just imported a new KBank PDF → wants every unmatched slip
+        to retry the matcher (most will now find their statement row)
+      - TUM just edited a statement_rules row via /rules → wants every
+        slip to re-resolve its category cascade against the new rule
+
+    Idempotent. Per-slip errors are caught + counted instead of aborting
+    the whole batch.
+
+    Returns:
+        {
+            "success": True,
+            "processed":    int,   # slips iterated
+            "matched_full": int,   # status went to matched_full
+            "matched_stmt": int,
+            "unmatched":    int,
+            "needs_review": int,
+            "errors":       int,
+            "duration_ms":  int,
+        }
+    """
+    actor = _current_username(request)
+    import time
+    started = time.time()
+
+    # Build the same filter the list endpoint uses so the bulk button
+    # only re-processes the rows TUM is looking at.
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            sql = "SELECT id FROM public.slips WHERE 1=1"
+            params: list = []
+            if status:
+                sql += " AND match_status = %s"
+                params.append(status)
+            if month:
+                sql += " AND to_char(transfer_date, 'YYYY-MM') = %s"
+                params.append(month)
+            sql += " ORDER BY transfer_date DESC, created_at DESC"
+            cur.execute(sql, params)
+            ids = [str(r[0]) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    counters = {
+        "matched_full": 0, "matched_stmt": 0,
+        "unmatched":    0, "needs_review": 0,
+        "ambiguous":    0, "errors":       0,
+    }
+
+    for slip_id in ids:
+        try:
+            result = _match_slip(slip_id, actor)
+            counters[result.get("status", "errors")] = (
+                counters.get(result.get("status", "errors"), 0) + 1
+            )
+
+            # Refresh category cascade — same as the single-slip endpoint
+            conn2 = get_db_conn()
+            try:
+                with conn2.cursor() as cur:
+                    cur.execute(
+                        "SELECT recipient_name, memo, matched_statement_id "
+                        "FROM public.slips WHERE id = %s",
+                        (slip_id,),
+                    )
+                    row = cur.fetchone()
+                if row:
+                    _resolve_and_persist_category(
+                        conn2, slip_id, row[0], row[1],
+                        str(row[2]) if row[2] else None,
+                    )
+            finally:
+                conn2.close()
+        except Exception:
+            log.exception("rematch-all slip %s failed", slip_id)
+            counters["errors"] += 1
+
+    duration_ms = int((time.time() - started) * 1000)
+    log.info("rematch-all processed=%d %s by %s in %dms",
+             len(ids), counters, actor, duration_ms)
+
+    return {
+        "success":      True,
+        "processed":    len(ids),
+        **counters,
+        "duration_ms":  duration_ms,
+    }
+
+
 @router.post("/slip/{slip_id}/match")
 def slip_match(slip_id: str, request: Request):
     """
