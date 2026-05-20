@@ -226,6 +226,43 @@ app.add_middleware(
 
 
 # ============================================================
+# Global exception handler — ensures CORS headers on 500 responses
+# ============================================================
+# Session 27 incident: the c2417f65 CORS error AND the /recipes/ai-
+# suggest "Failed to fetch" turned out to share a root cause —
+# Starlette's middleware stack does NOT wrap responses for
+# exceptions raised inside route functions that aren't an
+# HTTPException subclass. The browser then sees a bare 500 with no
+# CORS headers and reports it as a CORS failure rather than the real
+# error.
+#
+# This catch-all handler intercepts every uncaught exception, logs
+# it with full traceback (so the failure is visible in Coolify
+# stdout), and returns a JSONResponse that goes through the normal
+# middleware stack — CORSMiddleware adds Access-Control-Allow-Origin
+# to the response, so the browser sees a proper 500 + readable
+# detail field.
+#
+# HTTPException + RequestValidationError keep their existing FastAPI
+# default handlers (they already get CORS headers correctly because
+# FastAPI builds the response inside the middleware stack).
+@app.exception_handler(Exception)
+async def _all_exceptions_handler(request: StarletteRequest, exc: Exception):
+    log.exception(
+        "unhandled exception on %s %s",
+        request.method,
+        request.url.path,
+    )
+    return StarletteJSONResponse(
+        status_code=500,
+        content={
+            "detail": f"internal server error: {type(exc).__name__}",
+            "message": str(exc)[:300],
+        },
+    )
+
+
+# ============================================================
 # Health endpoints
 # ============================================================
 @app.get("/")
