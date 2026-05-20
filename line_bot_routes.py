@@ -26,6 +26,7 @@ import hmac
 import json
 import logging
 import os
+import time
 import urllib.request
 import urllib.error
 import uuid
@@ -35,7 +36,16 @@ from typing import Optional
 import psycopg2
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
-from budget_routes import run_budget_alert_check as _budget_alert_check
+from budget_routes import run_budget_alert_check as _budget_alert_check_inner
+from cron_heartbeat import heartbeat as _heartbeat
+
+
+# Wrap the imported budget-alert function so APScheduler sees a
+# heartbeat-instrumented version. Keep the inner function untouched
+# (other callers can still import the bare version from budget_routes).
+@_heartbeat("daily_budget_alert")
+def _budget_alert_check():
+    return _budget_alert_check_inner()
 
 log = logging.getLogger("vexonhq-line")
 router = APIRouter(prefix="/line", tags=["line"])
@@ -61,8 +71,42 @@ def _get_db_conn():
 # LINE Push / Reply helpers
 # ─────────────────────────────────────────────
 
+def _send_telegram(text: str) -> bool:
+    """Best-effort Telegram fallback when LINE push fails. Returns True
+    on successful delivery. Silently no-ops if env vars not configured —
+    this is a fallback, not a primary channel."""
+    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    tg_chat  = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if not tg_token or not tg_chat:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
+        body = json.dumps({"chat_id": tg_chat, "text": text}).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()  # drain
+        log.info("Telegram fallback delivered (%d chars)", len(text))
+        return True
+    except Exception:
+        log.exception("Telegram fallback failed")
+        return False
+
+
 def _push_text(text: str) -> dict:
-    """Push a single text message to TUM's LINE."""
+    """Push a single text message to TUM's LINE.
+
+    Retry policy (P0.3):
+      • Network / timeout / 5xx → retry up to 3 times with exponential
+        backoff (1s, 4s)
+      • 4xx (config/auth/payload) → fail fast, no retry
+      • On terminal failure → try Telegram fallback, then raise 502 so
+        the caller's existing error handling fires (and TUM still sees
+        the alert through Telegram)
+    """
     token, user_id = _get_config()
 
     payload = json.dumps({
@@ -70,7 +114,7 @@ def _push_text(text: str) -> dict:
         "messages": [{"type": "text", "text": text}],
     }).encode("utf-8")
 
-    req = urllib.request.Request(
+    req_factory = lambda: urllib.request.Request(  # noqa: E731
         LINE_PUSH_URL,
         data=payload,
         headers={
@@ -80,16 +124,41 @@ def _push_text(text: str) -> dict:
         method="POST",
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        log.error("LINE API %s: %s", e.code, body)
-        raise HTTPException(502, f"LINE API error {e.code}: {body}")
-    except Exception as e:
-        log.exception("LINE push failed")
-        raise HTTPException(502, f"LINE push failed: {e}")
+    last_error_msg = ""
+    backoff_seconds = [0.0, 1.0, 4.0]  # 3 attempts total
+    for attempt, delay in enumerate(backoff_seconds, start=1):
+        if delay:
+            time.sleep(delay)
+        try:
+            with urllib.request.urlopen(req_factory(), timeout=10) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            last_error_msg = f"LINE API {e.code}: {body}"
+            if 400 <= e.code < 500:
+                # 4xx is non-retryable — config/auth/payload issue
+                log.error("LINE API %s (no retry): %s", e.code, body)
+                break
+            log.warning("LINE API %s (attempt %d/3, will retry): %s",
+                        e.code, attempt, body[:200])
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            last_error_msg = f"LINE push transport error: {e}"
+            log.warning("LINE push transport error (attempt %d/3): %s",
+                        attempt, e)
+        except Exception as e:
+            # Unknown — log and don't retry
+            log.exception("LINE push failed (unknown error)")
+            last_error_msg = f"LINE push failed: {e}"
+            break
+
+    # All retries exhausted (or 4xx fast-fail) — try Telegram fallback
+    fb_text = f"⚠️ LINE push failed — using Telegram fallback\n\n{text}"
+    fb_ok = _send_telegram(fb_text)
+    if fb_ok:
+        log.warning("LINE failed but Telegram fallback succeeded")
+    else:
+        log.error("LINE failed AND Telegram fallback unavailable/failed")
+    raise HTTPException(502, last_error_msg or "LINE push failed")
 
 
 def _reply_line(reply_token: str, text: str) -> None:
@@ -591,7 +660,9 @@ def _build_digest(target_date: date) -> str:
             )
             open_anomalies = int(cur.fetchone()[0])
         except Exception:
-            pass
+            # Table missing or schema drift — don't break the whole digest,
+            # but surface the failure so we can fix the underlying cause.
+            log.exception("digest: bill_anomalies count failed")
 
         # ── 4. Bank statement needs_review ──
         bank_needs_review = 0
@@ -601,7 +672,7 @@ def _build_digest(target_date: date) -> str:
             )
             bank_needs_review = int(cur.fetchone()[0])
         except Exception:
-            pass
+            log.exception("digest: bank_statement_entries count failed")
 
         net = income_total - expense_total
         margin = (net / income_total * 100) if income_total > 0 else 0.0
@@ -660,6 +731,7 @@ def _build_digest(target_date: date) -> str:
 # Scheduled job — runs daily at 06:00 Bangkok
 # ─────────────────────────────────────────────
 
+@_heartbeat("daily_line_digest")
 def _scheduled_daily_digest():
     """APScheduler job: send yesterday's digest to LINE at 06:00 Bangkok time."""
     yesterday = date.today() - timedelta(days=1)
@@ -676,6 +748,7 @@ def _scheduled_daily_digest():
 # Phase 20: AP Due Date Reminder — 09:00 Bangkok
 # ─────────────────────────────────────────────
 
+@_heartbeat("daily_ap_due_reminder")
 def _scheduled_ap_due_reminder():
     """APScheduler job: send AP due reminder to LINE at 09:00 Bangkok time."""
     log.info("Scheduled AP due reminder — running")
@@ -764,7 +837,7 @@ def _build_weekly_summary() -> str:
             ap_count = int(ap_row[0] or 0)
             ap_total = float(ap_row[1] or 0)
         except Exception:
-            pass
+            log.exception("weekly digest: ar_ap_entries query failed")
 
         be_year = week_end.year + 543
         sep = "─" * 26
@@ -792,6 +865,7 @@ def _build_weekly_summary() -> str:
         conn.close()
 
 
+@_heartbeat("weekly_summary")
 def _scheduled_weekly_summary():
     """APScheduler job: send weekly summary to LINE every Monday 08:00 Bangkok."""
     log.info("Scheduled weekly summary — running")
@@ -1612,7 +1686,9 @@ def _process_one_event(event: dict) -> None:
             try:
                 _push_text(f"❌ ประมวลผลรูปไม่สำเร็จ กรุณาลองใหม่\n({str(e)[:80]})")
             except Exception:
-                pass
+                # LINE push also failed — outer error is already logged,
+                # nothing more we can do. Debug log only to keep noise down.
+                log.debug("LINE error-notify push also failed", exc_info=True)
         return
 
     # ────────────────────────────────────────
@@ -1701,7 +1777,7 @@ def _process_one_event(event: dict) -> None:
             try:
                 _push_text(f"❌ เกิดข้อผิดพลาด: {str(e)[:80]}")
             except Exception:
-                pass
+                log.debug("LINE error-notify push also failed", exc_info=True)
         return
 
     # Slow intents (AI call) — ack with reply_line, push result later
@@ -1715,7 +1791,7 @@ def _process_one_event(event: dict) -> None:
             try:
                 _push_text(f"❌ เกิดข้อผิดพลาด: {str(e)[:80]}")
             except Exception:
-                pass
+                log.debug("LINE error-notify push also failed", exc_info=True)
         return
 
     # intent == "financial" or "other" → AI Search (Phase 11) — also slow
@@ -1733,7 +1809,7 @@ def _process_one_event(event: dict) -> None:
         try:
             _push_text(f"❌ เกิดข้อผิดพลาด กรุณาลองใหม่\n({str(e)[:80]})")
         except Exception:
-            pass
+            log.debug("LINE error-notify push also failed", exc_info=True)
 
 
 def _process_line_events(data: dict) -> None:

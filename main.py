@@ -51,6 +51,7 @@ from phase3a_anomaly_routes import router as phase3a_anomaly_router
 from pnl_routes import router as pnl_router
 from line_bot_routes import router as line_router
 from budget_routes import router as budget_router
+from cron_heartbeat import router as cron_health_router
 from export_routes import router as export_router
 from phase10_narrative_routes import router as narrative_router
 from phase11_search_routes import router as search_router
@@ -75,10 +76,59 @@ from auto_diagnose import try_diagnose
 #  executemany() inserts that need raw PG driver)
 
 import psycopg2
+import psycopg2.extensions
+
+# ────────────────────────────────────────────────────────────
+# Slow-query watcher (P2.2)
+# ────────────────────────────────────────────────────────────
+# Every cursor opened through get_db_conn() inherits this class. When
+# a query exceeds SLOW_QUERY_WARN_SEC, log a WARNING; when it exceeds
+# SLOW_QUERY_CRITICAL_SEC, log ERROR (Coolify log dashboard then
+# surfaces it visually).
+#
+# Implemented at the cursor layer so every caller benefits without
+# code changes — no need to thread a context-managed timer through 50+
+# call sites.
+
+SLOW_QUERY_WARN_SEC = float(os.environ.get("SLOW_QUERY_WARN_SEC", "3.0"))
+SLOW_QUERY_CRITICAL_SEC = float(os.environ.get("SLOW_QUERY_CRITICAL_SEC", "10.0"))
+
+_slow_query_log = logging.getLogger("vexon.slow_query")
+
+
+class SlowQueryWatchingCursor(psycopg2.extensions.cursor):
+    """psycopg2 cursor subclass that times every execute()."""
+
+    def execute(self, query, vars=None):
+        t0 = time.perf_counter()
+        try:
+            return super().execute(query, vars)
+        finally:
+            elapsed = time.perf_counter() - t0
+            if elapsed >= SLOW_QUERY_CRITICAL_SEC:
+                _slow_query_log.error(
+                    "CRITICAL slow query (%.2fs): %s",
+                    elapsed,
+                    (query.decode() if isinstance(query, (bytes, bytearray)) else str(query))[:300],
+                )
+            elif elapsed >= SLOW_QUERY_WARN_SEC:
+                _slow_query_log.warning(
+                    "slow query (%.2fs): %s",
+                    elapsed,
+                    (query.decode() if isinstance(query, (bytes, bytearray)) else str(query))[:300],
+                )
+
 
 def get_db_conn():
-    """Open a fresh psycopg v3 connection to Supabase Postgres."""
-    return psycopg2.connect(os.environ["DATABASE_URL"])
+    """Open a fresh psycopg v3 connection to Supabase Postgres.
+
+    Returns a connection whose default cursor factory logs warnings
+    for slow queries (≥3s) and errors for critical ones (≥10s).
+    """
+    return psycopg2.connect(
+        os.environ["DATABASE_URL"],
+        cursor_factory=SlowQueryWatchingCursor,
+    )
 
 # ============================================================
 # Config
@@ -89,7 +139,65 @@ SUPABASE_STORAGE_BUCKET = os.environ.get("SUPABASE_STORAGE_BUCKET", "uploads")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_VISION_MODEL = os.environ.get("OPENAI_VISION_MODEL", "gpt-4o")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# ────────────────────────────────────────────────────────────
+# Structured logging (P2.1)
+# ────────────────────────────────────────────────────────────
+# In production (LOG_FORMAT=json), emit each log record as a single
+# JSON line so Coolify / log aggregators can index by level, logger,
+# timestamp, etc. without regex parsing. In dev, keep the familiar
+# pipe-separated text format that's easy to read in a terminal.
+#
+# Activated by env var: LOG_FORMAT=json (Coolify) or unset (dev).
+
+class _JsonLogFormatter(logging.Formatter):
+    """Emit each log record as a single-line JSON object."""
+
+    _STANDARD = {
+        "name", "msg", "args", "levelname", "levelno", "pathname",
+        "filename", "module", "exc_info", "exc_text", "stack_info",
+        "lineno", "funcName", "created", "msecs", "relativeCreated",
+        "thread", "threadName", "processName", "process", "message",
+        "taskName",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        import json as _json
+        payload = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        # Pick up any custom fields the caller passed via extra={...}
+        for k, v in record.__dict__.items():
+            if k not in self._STANDARD and not k.startswith("_"):
+                try:
+                    _json.dumps(v)
+                    payload[k] = v
+                except (TypeError, ValueError):
+                    payload[k] = repr(v)
+        return _json.dumps(payload, ensure_ascii=False)
+
+
+_log_format = os.environ.get("LOG_FORMAT", "text").lower()
+_log_handler = logging.StreamHandler()
+if _log_format == "json":
+    _log_handler.setFormatter(_JsonLogFormatter())
+else:
+    _log_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    ))
+
+# Replace any existing handlers (Coolify's uvicorn parent may have
+# pre-installed one) — we want a single deterministic output stream.
+_root = logging.getLogger()
+for _h in list(_root.handlers):
+    _root.removeHandler(_h)
+_root.addHandler(_log_handler)
+_root.setLevel(logging.INFO)
+
 log = logging.getLogger("vexonhq-ocr")
 
 
@@ -134,6 +242,7 @@ app.include_router(phase3a_anomaly_router)
 app.include_router(pnl_router)
 app.include_router(line_router)
 app.include_router(budget_router)
+app.include_router(cron_health_router)
 app.include_router(export_router)
 app.include_router(narrative_router)
 app.include_router(search_router)
