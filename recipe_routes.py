@@ -468,9 +468,20 @@ def _calc_cost(cur, recipe_id: str) -> dict:
     total_cost = 0.0
     missing_price_count = 0
     for ri_id, qty, name, unit, price, yield_pct in items:
-        effective_yield = yield_pct / 100.0 if yield_pct > 0 else 1.0
-        price_f = float(price or 0)
-        item_cost = float(qty) * price_f / effective_yield
+        # IMPORTANT: psycopg2 returns Postgres NUMERIC columns as
+        # decimal.Decimal, not float. The original code did
+        # `yield_pct / 100.0` which raises TypeError when yield_pct is
+        # Decimal because Decimal/float division isn't supported. The
+        # bug stayed hidden as long as no recipe had any
+        # recipe_ingredients rows — the loop body never executed. Once
+        # TUM started linking via the AI flow, every /recipes list call
+        # 500-ed. Cast everything to float up-front so the rest of the
+        # arithmetic is plain Python floats.
+        qty_f       = float(qty or 0)
+        price_f     = float(price or 0)
+        yield_f     = float(yield_pct or 100)
+        effective_yield = yield_f / 100.0 if yield_f > 0 else 1.0
+        item_cost = qty_f * price_f / effective_yield
         total_cost += item_cost
         # Count ingredients that contributed zero to the total — these
         # silently make GP% misleading because the cost calc is incomplete.
@@ -482,9 +493,9 @@ def _calc_cost(cur, recipe_id: str) -> dict:
             "id": str(ri_id),
             "ingredient_name": name,
             "unit": unit,
-            "qty_used": float(qty),
+            "qty_used": qty_f,
             "price_per_unit": price_f,
-            "yield_pct": float(yield_pct),
+            "yield_pct": yield_f,
             "item_cost": round(item_cost, 2),
             "missing_price": price_f <= 0,
         })
