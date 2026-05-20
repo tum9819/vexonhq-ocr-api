@@ -911,6 +911,7 @@ def invoice_auto_classify(invoice_id: str, force: bool = False):
     Response includes the per-row classification so the frontend can
     refresh the table without a second round-trip.
     """
+    _validate_uuid_param("invoice_id", invoice_id)
     sb = get_supabase()
     bill = sb.table("vendor_bills").select("id").eq("id", invoice_id).execute()
     if not bill.data:
@@ -1059,6 +1060,7 @@ def invoice_items_auto_classify_bulk(
 @app.get("/invoice/{invoice_id}")
 def invoice_detail(invoice_id: str):
     """Full invoice detail: header + items + pages + warnings."""
+    _validate_uuid_param("invoice_id", invoice_id)
     sb = get_supabase()
 
     bill = sb.table("vendor_bills").select("*").eq("id", invoice_id).execute()
@@ -1112,6 +1114,40 @@ def _current_username(request: Request) -> Optional[str]:
     return getattr(request.state, "username", None)
 
 
+def _validate_uuid_param(name: str, value: str) -> None:
+    """
+    Raise HTTPException(400) if `value` isn't a syntactically-valid UUID.
+
+    Background — Session 27 incident:
+      TUM pasted a truncated invoice ID from his LINE chat
+      (e.g. "c2417f65...") into the browser URL bar. The literal "..."
+      survived to the backend, which passed it straight to Supabase's
+      `eq("id", value)` filter. Postgres rejected it with
+      `InvalidTextRepresentation`, which the supabase-py client raised
+      as an uncaught exception. FastAPI's default 500 handler runs
+      INSIDE the middleware stack, but Starlette has a known quirk
+      where an exception raised inside the route function CAN bypass
+      the outer CORSMiddleware's header injection — leaving the
+      browser to report it as a CORS error ("No 'Access-Control-Allow-
+      Origin' header") rather than the real 500.
+
+    Catching the bad input early as a 400 HTTPException makes
+    FastAPI's normal exception handler run, which is wrapped by
+    CORSMiddleware correctly — so the browser sees a clean 400 with
+    CORS headers and the user gets a useful error message.
+
+    Use as the first line of every endpoint whose path captures a
+    UUID — /invoice/{id}*, /slip/{id}*, /rules/*/{id}, etc.
+    """
+    try:
+        uuid.UUID(str(value))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(
+            400,
+            f"invalid {name} (expected UUID): {value!r}",
+        )
+
+
 @app.patch("/invoice/{invoice_id}")
 def invoice_edit(invoice_id: str, update: InvoiceUpdate, request: Request):
     """
@@ -1126,6 +1162,7 @@ def invoice_edit(invoice_id: str, update: InvoiceUpdate, request: Request):
         partially deleted on failure).
     """
     # Pydantic v1: .dict(); v2: .model_dump()  — main.py uses v1 elsewhere.
+    _validate_uuid_param("invoice_id", invoice_id)
     update_dict = update.dict()
     items_payload = update_dict.pop("items", None)
     header_payload = {k: v for k, v in update_dict.items() if v is not None}
@@ -1214,6 +1251,7 @@ def invoice_confirm(
     request: Request,
     body: Optional[ConfirmRequest] = None,
 ):
+    _validate_uuid_param("invoice_id", invoice_id)
     # Prefer JWT-derived username (trustworthy) over client-supplied
     # `reviewed_by` (legacy + tamperable). Falls back to client value
     # only when middleware didn't populate state.username (shouldn't
@@ -1374,6 +1412,7 @@ def invoice_match_statement(invoice_id: str, request: Request):
     PDF (so the matching row didn't exist at confirm time) or when the
     initial auto-match was ambiguous and he wants to retry after editing.
     """
+    _validate_uuid_param("invoice_id", invoice_id)
     actor = _current_username(request)
     sb = get_supabase()
     bill = sb.table("vendor_bills").select("id").eq("id", invoice_id).execute()
@@ -1385,6 +1424,7 @@ def invoice_match_statement(invoice_id: str, request: Request):
 
 @app.post("/invoice/{invoice_id}/reject")
 def invoice_reject(invoice_id: str, body: RejectRequest, request: Request):
+    _validate_uuid_param("invoice_id", invoice_id)
     reviewer = _current_username(request) or body.reviewed_by
     sb = get_supabase()
     now_iso = datetime.utcnow().isoformat()

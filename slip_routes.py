@@ -85,6 +85,23 @@ def _current_username(request: Request) -> Optional[str]:
     return getattr(request.state, "username", None)
 
 
+def _validate_uuid_param(name: str, value: str) -> None:
+    """
+    Raise HTTPException(400) if `value` isn't a syntactically-valid UUID.
+    Mirror of main._validate_uuid_param — kept local so this module can
+    be unit-tested standalone. See the docstring in main.py for the
+    full Session 27 rationale (truncated IDs pasted from LINE chat
+    surfacing as CORS errors).
+    """
+    try:
+        uuid.UUID(str(value))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(
+            400,
+            f"invalid {name} (expected UUID): {value!r}",
+        )
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Models
 # ════════════════════════════════════════════════════════════════════════════
@@ -901,6 +918,7 @@ def list_slips(
 
 @router.get("/slip/{slip_id}")
 def get_slip(slip_id: str):
+    _validate_uuid_param("slip_id", slip_id)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -961,6 +979,7 @@ def get_slip(slip_id: str):
 
 @router.patch("/slip/{slip_id}")
 def patch_slip(slip_id: str, body: SlipUpdate, request: Request):
+    _validate_uuid_param("slip_id", slip_id)
     actor = _current_username(request)
     updates: list[tuple[str, Any]] = []
     payload = body.model_dump(exclude_unset=True)
@@ -1057,6 +1076,7 @@ def patch_slip(slip_id: str, body: SlipUpdate, request: Request):
 
 @router.delete("/slip/{slip_id}")
 def delete_slip(slip_id: str, request: Request):
+    _validate_uuid_param("slip_id", slip_id)
     actor = _current_username(request)
     conn = get_db_conn()
     try:
@@ -1187,6 +1207,7 @@ def slip_match(slip_id: str, request: Request):
     the category cascade so an L2/L3-guessed category gets promoted to
     L1 ("verified") once the bank statement row catches up.
     """
+    _validate_uuid_param("slip_id", slip_id)
     actor = _current_username(request)
     result = _match_slip(slip_id, actor)
     if result.get("status") == "not_found":
@@ -1231,6 +1252,11 @@ def slip_manual_match(slip_id: str, body: ManualMatchRequest, request: Request):
     Passing `null` for either field unlinks it (and we recompute match_status
     based on what's still linked).
     """
+    _validate_uuid_param("slip_id", slip_id)
+    if body.statement_id is not None:
+        _validate_uuid_param("statement_id", body.statement_id)
+    if body.invoice_id is not None:
+        _validate_uuid_param("invoice_id", body.invoice_id)
     actor = _current_username(request)
 
     conn = get_db_conn()
@@ -1304,6 +1330,7 @@ def slip_manual_match(slip_id: str, body: ManualMatchRequest, request: Request):
 
 @router.post("/slip/{slip_id}/reject")
 def slip_reject(slip_id: str, request: Request):
+    _validate_uuid_param("slip_id", slip_id)
     actor = _current_username(request)
     conn = get_db_conn()
     try:
@@ -1349,6 +1376,7 @@ def slip_override_category(
     Pass category_code=null to clear the lock and let the auto-resolver
     pick again on the next rematch.
     """
+    _validate_uuid_param("slip_id", slip_id)
     actor = _current_username(request)
     code = (body.category_code or "").strip() or None
 
