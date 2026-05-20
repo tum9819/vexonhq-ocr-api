@@ -212,6 +212,200 @@ def import_ingredients_from_stock(branch_code: str = "thawi_watthana"):
         conn.close()
 
 
+# ── Auto-sync ingredient prices from invoice_items (Session 28) ──────
+#
+# Background: TUM uploads supplier invoices weekly. Each `invoice_items`
+# row has a `product_name` + `unit_price` recorded by OCR. The
+# `ingredients` table has a `price_per_unit` column that TUM previously
+# had to type in by hand — error-prone + tedious.
+#
+# This endpoint walks confirmed invoice_items, matches them to
+# ingredients by fuzzy name, and updates the ingredient's price to the
+# most recent matching invoice's unit_price.
+#
+# Matching strategy (intentionally conservative — wrong matches are
+# worse than missing matches):
+#   1. Both names are normalised (lowercase + collapse whitespace/punctuation)
+#   2. Match score:
+#        100  — normalised strings are identical
+#         50  — one name is a substring of the other (>= 3 chars)
+#         0   — no overlap (excluded)
+#   3. For each ingredient, pick the highest-score match. Ties broken by
+#      most recent `vendor_bills.bill_date`.
+#   4. Skip ingredients whose normalised name is < 3 chars (would
+#      false-match too aggressively).
+#   5. Skip rows where price hasn't changed (`ABS(old - new) < 0.001`).
+#
+# dry_run=true (default) returns the proposed updates without applying.
+# Pass dry_run=false to commit. TUM should always preview first.
+
+@ingredient_router.post("/sync-from-invoices")
+def sync_ingredient_prices_from_invoices(dry_run: bool = True):
+    """
+    Match ingredients to invoice_items by fuzzy name and update
+    `price_per_unit` to the most recent matching invoice's unit_price.
+
+    Default mode is `dry_run=true` — returns proposed changes only.
+    Pass `dry_run=false` to apply.
+
+    Response:
+        {
+            "success":        True,
+            "dry_run":        bool,
+            "proposed_count": int,
+            "applied_count":  int,
+            "proposed": [
+                {
+                    "ingredient_id": uuid,
+                    "ingredient_name": str,
+                    "ingredient_unit": str,
+                    "old_price":       float | None,
+                    "new_price":       float,
+                    "source_product_name": str,
+                    "source_unit":     str | None,
+                    "bill_date":       iso date | None,
+                    "match_score":     int (100|50),
+                    "unit_mismatch":   bool   # warn flag
+                }
+            ]
+        }
+    """
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH normalized_ii AS (
+                    SELECT
+                        ii.id,
+                        ii.product_name,
+                        ii.unit_price,
+                        ii.unit,
+                        vb.bill_date,
+                        regexp_replace(
+                            LOWER(TRIM(COALESCE(ii.product_name, ''))),
+                            '[[:space:]\\.,;:]+',
+                            '',
+                            'g'
+                        ) AS pname_norm
+                    FROM public.invoice_items ii
+                    JOIN public.vendor_bills vb ON vb.id = ii.vendor_bill_id
+                    WHERE vb.review_status = 'confirmed'
+                      AND ii.unit_price IS NOT NULL
+                      AND ii.unit_price > 0
+                ),
+                normalized_ing AS (
+                    SELECT
+                        i.id,
+                        i.name,
+                        i.unit,
+                        i.price_per_unit AS old_price,
+                        regexp_replace(
+                            LOWER(TRIM(COALESCE(i.name, ''))),
+                            '[[:space:]\\.,;:]+',
+                            '',
+                            'g'
+                        ) AS name_norm
+                    FROM public.ingredients i
+                ),
+                matched AS (
+                    SELECT DISTINCT ON (ing.id)
+                        ing.id              AS ingredient_id,
+                        ing.name            AS ingredient_name,
+                        ing.unit            AS ingredient_unit,
+                        ing.old_price       AS old_price,
+                        ni.product_name     AS source_product_name,
+                        ni.unit_price       AS new_price,
+                        ni.unit             AS source_unit,
+                        ni.bill_date        AS bill_date,
+                        CASE
+                            WHEN ni.pname_norm = ing.name_norm THEN 100
+                            ELSE 50
+                        END AS match_score
+                    FROM normalized_ing ing
+                    JOIN normalized_ii ni ON (
+                        ni.pname_norm LIKE '%%' || ing.name_norm || '%%'
+                        OR ing.name_norm LIKE '%%' || ni.pname_norm || '%%'
+                    )
+                    WHERE length(ing.name_norm) >= 3
+                      AND length(ni.pname_norm) >= 3
+                    ORDER BY ing.id,
+                        CASE WHEN ni.pname_norm = ing.name_norm THEN 100 ELSE 50 END DESC,
+                        ni.bill_date DESC NULLS LAST,
+                        ni.unit_price DESC
+                )
+                SELECT
+                    ingredient_id,
+                    ingredient_name,
+                    ingredient_unit,
+                    old_price,
+                    source_product_name,
+                    new_price,
+                    source_unit,
+                    bill_date,
+                    match_score
+                FROM matched
+                WHERE old_price IS NULL
+                   OR old_price = 0
+                   OR ABS(old_price - new_price) > 0.001
+                ORDER BY match_score DESC, ingredient_name
+                """
+            )
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+
+            proposed = []
+            for r in rows:
+                d = dict(zip(cols, r))
+                d["ingredient_id"] = str(d["ingredient_id"])
+                if d.get("old_price") is not None:
+                    d["old_price"] = float(d["old_price"])
+                d["new_price"] = float(d["new_price"])
+                if d.get("bill_date") is not None:
+                    d["bill_date"] = d["bill_date"].isoformat()
+                # Warn (don't block) when units don't match — TUM should
+                # eyeball before accepting. e.g. ingredient "เนื้อ (กก.)"
+                # vs invoice "เนื้อ (แพ็ค)" implies a per-pack-not-per-kg
+                # price; conversion isn't safe to do automatically.
+                d["unit_mismatch"] = bool(
+                    d.get("source_unit")
+                    and d.get("ingredient_unit")
+                    and d["source_unit"].strip().lower() != d["ingredient_unit"].strip().lower()
+                )
+                proposed.append(d)
+
+            applied = 0
+            if not dry_run and proposed:
+                for p in proposed:
+                    # Skip unit mismatches in the apply pass — TUM has to
+                    # resolve those by hand. The dry-run response surfaces
+                    # them so he knows what to look at.
+                    if p["unit_mismatch"]:
+                        continue
+                    cur.execute(
+                        """
+                        UPDATE public.ingredients
+                        SET price_per_unit = %s,
+                            updated_at     = NOW()
+                        WHERE id = %s
+                        """,
+                        (p["new_price"], p["ingredient_id"]),
+                    )
+                    applied += 1
+                conn.commit()
+
+        return {
+            "success":        True,
+            "dry_run":        dry_run,
+            "proposed_count": len(proposed),
+            "applied_count":  applied,
+            "skipped_unit_mismatch": sum(1 for p in proposed if p["unit_mismatch"]),
+            "proposed":       proposed,
+        }
+    finally:
+        conn.close()
+
+
 # ── Recipe Endpoints ─────────────────────────────────────────
 
 def _calc_cost(cur, recipe_id: str) -> dict:
@@ -232,20 +426,34 @@ def _calc_cost(cur, recipe_id: str) -> dict:
 
     breakdown = []
     total_cost = 0.0
+    missing_price_count = 0
     for ri_id, qty, name, unit, price, yield_pct in items:
         effective_yield = yield_pct / 100.0 if yield_pct > 0 else 1.0
-        item_cost = float(qty) * float(price) / effective_yield
+        price_f = float(price or 0)
+        item_cost = float(qty) * price_f / effective_yield
         total_cost += item_cost
+        # Count ingredients that contributed zero to the total — these
+        # silently make GP% misleading because the cost calc is incomplete.
+        # The UI surfaces a warning so TUM knows the GP% isn't trustworthy
+        # until those ingredients get a price (via /ingredients sync).
+        if price_f <= 0:
+            missing_price_count += 1
         breakdown.append({
             "id": str(ri_id),
             "ingredient_name": name,
             "unit": unit,
             "qty_used": float(qty),
-            "price_per_unit": float(price),
+            "price_per_unit": price_f,
             "yield_pct": float(yield_pct),
             "item_cost": round(item_cost, 2),
+            "missing_price": price_f <= 0,
         })
-    return {"breakdown": breakdown, "total_cost": round(total_cost, 2)}
+    return {
+        "breakdown":            breakdown,
+        "total_cost":           round(total_cost, 2),
+        "missing_price_count":  missing_price_count,
+        "cost_incomplete":      missing_price_count > 0,
+    }
 
 
 @router.get("")
@@ -271,9 +479,11 @@ def list_recipes():
                     **rec,
                     "id": str(rec["id"]),
                     "created_at": rec["created_at"].isoformat() if rec.get("created_at") else None,
-                    "cost_per_dish": cost,
-                    "gp_pct": gp_pct,
-                    "ingredient_count": len(cost_data["breakdown"]),
+                    "cost_per_dish":         cost,
+                    "gp_pct":                gp_pct,
+                    "ingredient_count":      len(cost_data["breakdown"]),
+                    "missing_price_count":   cost_data["missing_price_count"],
+                    "cost_incomplete":       cost_data["cost_incomplete"],
                 })
         return {"recipes": result, "count": len(result)}
     finally:
