@@ -255,6 +255,7 @@ def _process_slip_from_line(image_bytes: bytes) -> tuple[str, dict, dict]:
         _classify_memo,
         _upload_slip_to_storage,
         _match_slip,
+        _resolve_and_persist_category,
     )
 
     # 1) Storage (best-effort)
@@ -348,6 +349,23 @@ def _process_slip_from_line(image_bytes: bytes) -> tuple[str, dict, dict]:
     except Exception:
         log.exception("LINE slip matcher failed for %s", new_id)
         match = {"status": "error"}
+
+    # 5) Category cascade (statement→memo→recipient) — see slip_routes for design
+    try:
+        conn2 = _get_db_conn()
+        try:
+            _resolve_and_persist_category(
+                conn2,
+                new_id,
+                parsed.get("recipient_name"),
+                parsed.get("memo"),
+                match.get("statement_id") if isinstance(match, dict) else None,
+            )
+        finally:
+            conn2.close()
+    except Exception:
+        log.exception("LINE slip category resolve failed for %s", new_id)
+
     return new_id, parsed, match
 
 

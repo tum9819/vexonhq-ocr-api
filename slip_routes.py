@@ -244,6 +244,141 @@ def _classify_memo(conn, memo: Optional[str]) -> tuple[Optional[str], float]:
         return None, 0.0
 
 
+def _classify_slip_category(
+    conn,
+    recipient_name: Optional[str],
+    memo: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Classify a slip → accounting category via the shared `statement_rules`
+    table. Returns (category_code, source) where source is one of:
+      - "memo_keyword"     — memo matched a rule_type='keyword' row
+      - "recipient_name"   — recipient_name matched a rule_type='name' row
+      - None               — no rule matched
+
+    Priority (intentional cascade — see Session 27 design doc):
+      L2: memo keyword       (intent TUM typed himself; highest priority
+                              specific keywords like "ค่าน้ำประปา" sit at
+                              priority 100 so they override less-specific
+                              name rules when present)
+      L3: recipient_name     (fallback for slips with no memo or whose
+                              memo wasn't recognised — e.g. when TUM is
+                              paying กาญจนา for rent without typing
+                              "ค่าเช่า" in the memo, the name rule
+                              "กาญจนา → rent" still fires)
+
+    L1 (matched_statement.category_code) is NOT handled here — the caller
+    resolves that and only falls to this function when the slip is
+    unmatched OR when the matched statement has no category_code of its
+    own.
+
+    The DB query restricts to direction='expense' because slips are
+    always outgoing transfers in TUM's model.
+    """
+    # ── L2: memo keyword match ───────────────────────────────────────────
+    if memo and memo.strip():
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT category_code
+                    FROM public.statement_rules
+                    WHERE rule_type   = 'keyword'
+                      AND direction   = 'expense'
+                      AND %s ILIKE '%%' || match_value || '%%'
+                    ORDER BY priority DESC, char_length(match_value) DESC
+                    LIMIT 1
+                    """,
+                    (memo.strip(),),
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    return row[0], "memo_keyword"
+        except Exception:
+            log.exception("memo keyword classification failed for %r",
+                          memo[:60] if memo else "")
+
+    # ── L3: recipient_name name-match ────────────────────────────────────
+    if recipient_name and recipient_name.strip():
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT category_code
+                    FROM public.statement_rules
+                    WHERE rule_type   = 'name'
+                      AND direction   = 'expense'
+                      AND %s ILIKE '%%' || match_value || '%%'
+                    ORDER BY priority DESC, char_length(match_value) DESC
+                    LIMIT 1
+                    """,
+                    (recipient_name.strip(),),
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    return row[0], "recipient_name"
+        except Exception:
+            log.exception("recipient name classification failed for %r",
+                          recipient_name[:60] if recipient_name else "")
+
+    return None, None
+
+
+def _resolve_and_persist_category(
+    conn,
+    slip_id: str,
+    recipient_name: Optional[str],
+    memo: Optional[str],
+    matched_statement_id: Optional[str],
+) -> None:
+    """
+    Compute the slip's category via the L1→L3 cascade and persist it on
+    the slip row. Called from slip_upload (post-insert) and _match_slip
+    (post-statement-link). Idempotent — safe to call repeatedly.
+
+    L1: matched_statement.category_code (verified)
+    L2/L3: fall back to _classify_slip_category()
+    """
+    category_code: Optional[str] = None
+    source: Optional[str] = None
+
+    # ── L1: inherit from matched statement, if any ───────────────────────
+    if matched_statement_id:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT category_code FROM public.bank_statement_entries WHERE id = %s",
+                    (matched_statement_id,),
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    category_code = row[0]
+                    source = "statement"
+        except Exception:
+            log.exception("L1 statement category lookup failed slip=%s", slip_id)
+
+    # ── L2/L3 fallback ───────────────────────────────────────────────────
+    if not category_code:
+        category_code, source = _classify_slip_category(conn, recipient_name, memo)
+
+    # ── Persist ──
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE public.slips
+                SET statement_category_code = %s,
+                    category_source         = %s
+                WHERE id = %s
+                """,
+                (category_code, source, slip_id),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        log.exception("persist category failed slip=%s", slip_id)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Three-way matcher
 # ════════════════════════════════════════════════════════════════════════════
@@ -506,7 +641,48 @@ async def slip_upload(file: UploadFile = File(...), request: Request = None):
         log.exception("3-way match failed for slip %s — leaving as 'unmatched'", new_id)
         match_result = {"status": "error"}
 
-    log.info("slip upload id=%s by %s match=%s", new_id, actor, match_result.get("status"))
+    # ── 7) Resolve + persist statement_category_code (L1→L3 cascade) ──
+    #    L1: matched statement (if any)
+    #    L2: memo keyword rule
+    #    L3: recipient name rule
+    try:
+        conn2 = get_db_conn()
+        try:
+            _resolve_and_persist_category(
+                conn2,
+                new_id,
+                parsed.get("recipient_name"),
+                parsed.get("memo"),
+                match_result.get("statement_id") if isinstance(match_result, dict) else None,
+            )
+        finally:
+            conn2.close()
+    except Exception:
+        log.exception("category resolve failed slip=%s", new_id)
+
+    # Read the resolved category back so the response carries it.
+    resolved_category = None
+    resolved_source = None
+    try:
+        conn3 = get_db_conn()
+        try:
+            with conn3.cursor() as cur:
+                cur.execute(
+                    "SELECT statement_category_code, category_source "
+                    "FROM public.slips WHERE id = %s",
+                    (new_id,),
+                )
+                r = cur.fetchone()
+                if r:
+                    resolved_category, resolved_source = r[0], r[1]
+        finally:
+            conn3.close()
+    except Exception:
+        log.exception("category readback failed slip=%s", new_id)
+
+    log.info("slip upload id=%s by %s match=%s category=%s/%s",
+             new_id, actor, match_result.get("status"),
+             resolved_category, resolved_source)
     return {
         "success":      True,
         "slip_id":      new_id,
@@ -514,6 +690,8 @@ async def slip_upload(file: UploadFile = File(...), request: Request = None):
         "preview_url":  image_url,
         "canonical_sku":        sku,
         "canonical_confidence": conf,
+        "statement_category_code": resolved_category,
+        "category_source":         resolved_source,
         "match":        match_result,
     }
 
@@ -539,6 +717,7 @@ def list_slips(
                        s.sender_name, s.recipient_name, s.recipient_bank,
                        s.memo, s.ref_no, s.raw_image_url,
                        s.canonical_sku, s.canonical_confidence,
+                       s.statement_category_code, s.category_source,
                        s.matched_statement_id, s.matched_invoice_id,
                        s.match_status, s.source,
                        s.created_by, s.created_at,
@@ -627,6 +806,7 @@ def get_slip(slip_id: str):
                        s.recipient_name, s.recipient_account, s.recipient_bank,
                        s.memo, s.ref_no, s.raw_image_url, s.ocr_json,
                        s.canonical_sku, s.canonical_confidence,
+                       s.statement_category_code, s.category_source,
                        s.matched_statement_id, s.matched_invoice_id,
                        s.match_status, s.source,
                        s.created_by, s.created_at,
@@ -739,6 +919,29 @@ def patch_slip(slip_id: str, body: SlipUpdate, request: Request):
         except Exception:
             log.exception("auto re-match after PATCH failed slip=%s", slip_id)
 
+    # If memo, recipient_name, or canonical_sku changed → re-resolve the
+    # category cascade (memo / recipient feed L2/L3 lookups).
+    if any(k in payload for k in ("memo", "recipient_name", "amount", "transfer_date")):
+        try:
+            conn2 = get_db_conn()
+            try:
+                with conn2.cursor() as cur:
+                    cur.execute(
+                        "SELECT recipient_name, memo, matched_statement_id "
+                        "FROM public.slips WHERE id = %s",
+                        (slip_id,),
+                    )
+                    row = cur.fetchone()
+                if row:
+                    _resolve_and_persist_category(
+                        conn2, slip_id, row[0], row[1],
+                        str(row[2]) if row[2] else None,
+                    )
+            finally:
+                conn2.close()
+        except Exception:
+            log.exception("category re-resolve after PATCH failed slip=%s", slip_id)
+
     log.info("slip patch id=%s by %s fields=%s", slip_id, actor, list(payload.keys()))
     return {"success": True, "id": slip_id, "updated_fields": list(payload.keys())}
 
@@ -776,12 +979,37 @@ def delete_slip(slip_id: str, request: Request):
 def slip_match(slip_id: str, request: Request):
     """
     Re-run the matcher (useful after TUM imports a statement PDF that
-    landed AFTER this slip was uploaded). Idempotent.
+    landed AFTER this slip was uploaded). Idempotent. Also re-resolves
+    the category cascade so an L2/L3-guessed category gets promoted to
+    L1 ("verified") once the bank statement row catches up.
     """
     actor = _current_username(request)
     result = _match_slip(slip_id, actor)
     if result.get("status") == "not_found":
         raise HTTPException(404, "slip not found")
+
+    # Refresh category — if the slip just got linked to a statement, L1
+    # supersedes whatever L2/L3 had guessed at upload time.
+    try:
+        conn2 = get_db_conn()
+        try:
+            with conn2.cursor() as cur:
+                cur.execute(
+                    "SELECT recipient_name, memo, matched_statement_id "
+                    "FROM public.slips WHERE id = %s",
+                    (slip_id,),
+                )
+                row = cur.fetchone()
+            if row:
+                _resolve_and_persist_category(
+                    conn2, slip_id, row[0], row[1],
+                    str(row[2]) if row[2] else None,
+                )
+        finally:
+            conn2.close()
+    except Exception:
+        log.exception("category re-resolve after /match failed slip=%s", slip_id)
+
     return {"success": True, "match": result}
 
 
