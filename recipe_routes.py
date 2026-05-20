@@ -52,6 +52,13 @@ class IngredientCreate(BaseModel):
     price_per_unit: float = 0.0
     yield_pct: float = 100.0
     category: Optional[str] = None
+    # Phase V — pack-size aware cost. pack_size is how many `unit` are in
+    # one `invoice_unit` (e.g. 12 ขวด in 1 ลัง). Default 1 = "no conversion".
+    # invoice_unit=NULL means the supplier invoices in the same unit as
+    # the ingredient (no conversion path).
+    pack_size: int = 1
+    invoice_unit: Optional[str] = None
+    unit_cost_source: Optional[str] = None   # 'manual' | 'invoice' | 'sales_estimate'
 
 class IngredientUpdate(BaseModel):
     name: Optional[str] = None
@@ -59,6 +66,9 @@ class IngredientUpdate(BaseModel):
     price_per_unit: Optional[float] = None
     yield_pct: Optional[float] = None
     category: Optional[str] = None
+    pack_size: Optional[int] = None
+    invoice_unit: Optional[str] = None
+    unit_cost_source: Optional[str] = None
 
 class RecipeCreate(BaseModel):
     name: str
@@ -89,7 +99,9 @@ def list_ingredients():
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT id, name, unit, price_per_unit, yield_pct, category, source_item_id, created_at
+                SELECT id, name, unit, price_per_unit, yield_pct, category,
+                       source_item_id, created_at,
+                       pack_size, invoice_unit, unit_cost_source
                 FROM public.ingredients
                 ORDER BY category NULLS LAST, name
             """)
@@ -105,14 +117,26 @@ def list_ingredients():
 
 @ingredient_router.post("")
 def create_ingredient(body: IngredientCreate):
+    # Defensive: pack_size must be >= 1 (CHECK constraint enforces this
+    # too, but catching here gives a friendlier 400 error message than
+    # a Postgres constraint violation).
+    pack_size = max(1, int(body.pack_size or 1))
+    source = (body.unit_cost_source or 'manual').strip().lower()
+    if source not in {'manual', 'invoice', 'sales_estimate'}:
+        raise HTTPException(400, f"unit_cost_source must be 'manual'/'invoice'/'sales_estimate', got '{source}'")
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO public.ingredients (name, unit, price_per_unit, yield_pct, category)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO public.ingredients
+                    (name, unit, price_per_unit, yield_pct, category,
+                     pack_size, invoice_unit, unit_cost_source)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
-            """, (body.name, body.unit, body.price_per_unit, body.yield_pct, body.category))
+            """, (
+                body.name, body.unit, body.price_per_unit, body.yield_pct, body.category,
+                pack_size, body.invoice_unit, source,
+            ))
             new_id = cur.fetchone()[0]
         conn.commit()
         return {"id": str(new_id), "status": "created"}
@@ -325,6 +349,8 @@ def sync_ingredient_prices_from_invoices(
                         i.name,
                         i.unit,
                         i.price_per_unit AS old_price,
+                        i.pack_size,
+                        i.invoice_unit,
                         regexp_replace(
                             LOWER(TRIM(COALESCE(i.name, ''))),
                             '[[:space:]\\.,;:]+',
@@ -339,8 +365,10 @@ def sync_ingredient_prices_from_invoices(
                         ing.name            AS ingredient_name,
                         ing.unit            AS ingredient_unit,
                         ing.old_price       AS old_price,
+                        ing.pack_size       AS pack_size,
+                        ing.invoice_unit    AS expected_invoice_unit,
                         ni.product_name     AS source_product_name,
-                        ni.unit_price       AS new_price,
+                        ni.unit_price       AS raw_invoice_price,
                         ni.unit             AS source_unit,
                         ni.bill_date        AS bill_date,
                         CASE
@@ -372,39 +400,102 @@ def sync_ingredient_prices_from_invoices(
                     ingredient_name,
                     ingredient_unit,
                     old_price,
+                    pack_size,
+                    expected_invoice_unit,
                     source_product_name,
-                    new_price,
+                    raw_invoice_price,
                     source_unit,
                     bill_date,
                     match_score
                 FROM matched
-                WHERE old_price IS NULL
-                   OR old_price = 0
-                   OR ABS(old_price - new_price) > 0.001
                 ORDER BY match_score DESC, ingredient_name
                 """
             )
             rows = cur.fetchall()
             cols = [d[0] for d in cur.description]
 
+            # ── Phase V: pack-size aware price calculation ──────────────────
+            # The CTE above returns the RAW invoice unit_price (e.g. ฿683
+            # for a ลัง of ช้าง). We translate to per-ingredient-unit cost
+            # here in Python so the logic is easier to read + audit.
+            #
+            # Three cases:
+            #   (A) source_unit == ingredient.unit
+            #       → no conversion; new_price = raw
+            #   (B) source_unit == ingredient.invoice_unit and pack_size > 1
+            #       → CONVERT; new_price = raw / pack_size
+            #   (C) neither
+            #       → unit_mismatch=True, won't apply automatically
+            #
+            # The "skip unchanged" filter from the old SQL `WHERE old_price...`
+            # moved into Python because the comparison is now against the
+            # CONVERTED price, not the raw one.
+            def _u(s: Optional[str]) -> str:
+                return (s or "").strip().lower()
+
             proposed = []
             for r in rows:
                 d = dict(zip(cols, r))
                 d["ingredient_id"] = str(d["ingredient_id"])
-                if d.get("old_price") is not None:
-                    d["old_price"] = float(d["old_price"])
-                d["new_price"] = float(d["new_price"])
+                old_price = float(d["old_price"]) if d.get("old_price") is not None else None
+                raw_price = float(d["raw_invoice_price"])
+                pack_size = int(d.get("pack_size") or 1)
+                src_u  = _u(d.get("source_unit"))
+                ing_u  = _u(d.get("ingredient_unit"))
+                exp_u  = _u(d.get("expected_invoice_unit"))
+
+                # Decide the conversion case.
+                #
+                # Why substring-match on the invoice unit:
+                # The OCR sometimes returns the bare pack word ('ลัง')
+                # and sometimes embeds the pack count ('ลังx12'). The
+                # latter is *better* OCR but breaks plain equality. We
+                # accept either when expected_invoice_unit ⊂ source_unit
+                # (e.g. 'ลัง' ⊂ 'ลังx12'). Same the other way: if the
+                # source is 'ลัง' and the ingredient expects 'ลัง12',
+                # still treat as a match.
+                def _unit_matches(a: str, b: str) -> bool:
+                    if not a or not b:
+                        return False
+                    return a == b or a in b or b in a
+
+                if _unit_matches(src_u, ing_u):
+                    # Case A — same unit, no conversion
+                    new_price = raw_price
+                    conversion_applied = False
+                    unit_mismatch = False
+                elif exp_u and _unit_matches(src_u, exp_u) and pack_size > 1:
+                    # Case B — invoice is the pack, ingredient is the unit
+                    new_price = raw_price / pack_size
+                    conversion_applied = True
+                    unit_mismatch = False
+                elif not src_u or not ing_u:
+                    # Missing unit info on one side — treat as compatible.
+                    new_price = raw_price
+                    conversion_applied = False
+                    unit_mismatch = False
+                else:
+                    # Case C — incompatible units, can't auto-convert
+                    new_price = raw_price
+                    conversion_applied = False
+                    unit_mismatch = True
+
+                # Skip unchanged rows (same ABS<0.001 filter as before, but
+                # against the CONVERTED price).
+                if old_price is not None and old_price > 0 and abs(old_price - new_price) <= 0.001:
+                    continue
+
+                d["old_price"]            = old_price
+                d["raw_invoice_price"]    = raw_price
+                d["new_price"]            = round(new_price, 2)
+                d["pack_size"]            = pack_size
+                d["conversion_applied"]   = conversion_applied
+                d["unit_mismatch"]        = unit_mismatch
+                # Keep the legacy field name for the frontend (preview
+                # table reads `new_price`). Drop the raw alias from the
+                # response root if it's redundant.
                 if d.get("bill_date") is not None:
                     d["bill_date"] = d["bill_date"].isoformat()
-                # Warn (don't block) when units don't match — TUM should
-                # eyeball before accepting. e.g. ingredient "เนื้อ (กก.)"
-                # vs invoice "เนื้อ (แพ็ค)" implies a per-pack-not-per-kg
-                # price; conversion isn't safe to do automatically.
-                d["unit_mismatch"] = bool(
-                    d.get("source_unit")
-                    and d.get("ingredient_unit")
-                    and d["source_unit"].strip().lower() != d["ingredient_unit"].strip().lower()
-                )
                 proposed.append(d)
 
             applied = 0
@@ -425,8 +516,9 @@ def sync_ingredient_prices_from_invoices(
                     cur.execute(
                         """
                         UPDATE public.ingredients
-                        SET price_per_unit = %s,
-                            updated_at     = NOW()
+                        SET price_per_unit   = %s,
+                            unit_cost_source = 'invoice',
+                            updated_at       = NOW()
                         WHERE id = %s
                         """,
                         (p["new_price"], p["ingredient_id"]),
