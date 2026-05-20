@@ -791,7 +791,19 @@ def ai_link_ingredients(
         for i in all_ingredients
     )
 
-    system_prompt = (
+    # Build the store-level context block from the store_context table.
+    # This pulls TUM-curated knowledge (brand profile, menu structure,
+    # customer behavior, atmosphere, structured menu JSON) and embeds it
+    # before the per-call instructions. Failure to load context falls
+    # through silently — AI still works, just less informed.
+    try:
+        from store_context_routes import build_context_prompt
+        store_context = build_context_prompt()
+    except Exception:
+        logger.exception("store_context load failed — proceeding without it")
+        store_context = ""
+
+    system_prompt_intro = (
         "คุณเป็นผู้ช่วยเชฟร้านปิ้งย่าง+บาร์ดนตรี Mara Station\n"
         "─────────────────────────────────────────────\n"
         "**บริบทร้าน (สำคัญมาก ห้ามพลาด):**\n"
@@ -816,8 +828,23 @@ def ai_link_ingredients(
         "• อย่าใส่ข้าวเปล่า/น้ำเปล่า/ผัก สำหรับเมนู ฿10-50 (ไม้เดี่ยว/แก้วเดี่ยว)\n"
         "• อย่าเดาเครื่องปรุง (น้ำจิ้ม ซอส) — เป็น overhead ไม่นับต่อจาน\n"
         "\n"
+        "**ใช้ข้อมูลจาก STORE CONTEXT ด้านล่างเป็นแหล่งความจริงหลัก:**\n"
+        "• section `menu_knowledge` บอกหมวดสินค้า + customer behavior\n"
+        "• section `menu_structured` (JSON) คือ menu list + ingredient_keywords จริงจากร้าน\n"
+        "• ถ้าเมนูใน prompt user ตรงกับ entry ใน menu_structured → ใช้ ingredient_keywords ตรงๆ\n"
+        "\n"
         "ตอบเป็น JSON array เท่านั้น ห้ามมีข้อความอื่น"
     )
+
+    if store_context:
+        system_prompt = (
+            f"━━━━━━━━ STORE CONTEXT ━━━━━━━━\n"
+            f"{store_context}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{system_prompt_intro}"
+        )
+    else:
+        system_prompt = system_prompt_intro
     user_prompt = f"""เมนู: {recipe_name}
 ราคาขาย: ฿{selling_price:.0f}
 
