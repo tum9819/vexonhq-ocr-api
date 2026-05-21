@@ -1,5 +1,5 @@
 """
-Discord Interactions Endpoint (P1.4 v2, Session 29).
+Discord Interactions Endpoint (P1.4 v2 + v3, Sessions 29 + 31).
 
 When the user clicks an inline button on a Discord message posted by
 our Bot, Discord POSTs a signed JSON payload to the URL configured as
@@ -11,16 +11,25 @@ Endpoints:
   POST /alerts/discord-interaction
         - public path (auth = Ed25519 signature on headers)
         - handles PING (type=1) verification + button clicks (type=3)
+        - Two buttons supported (v3, Session 31):
+          • custom_id="restart_service" → ack type=6, BackgroundTask
+            calls Coolify restart, edits original message
+          • custom_id="show_patch"      → ack type=5 ("Bot is thinking"),
+            BackgroundTask fetches Coolify logs, asks Claude Haiku for
+            unified-diff suggestion, posts follow-up message
 
   GET  /alerts/discord-restart-test?secret=<ALERTS_WEBHOOK_SECRET>
-        - manual trigger: posts a test message with a Restart button
-          so TUM can validate end-to-end without waiting for a real
+        - manual trigger: posts a test message with BOTH buttons so
+          TUM can validate end-to-end without waiting for a real
           /health/deep failure.
 
 Discord 3-second rule: the interaction response must hit Discord within
 3 seconds of the click or Discord shows "This interaction failed". For
-restart we send the deferred response (type=6) immediately and finish
-the actual Coolify call + message edit on a BackgroundTask.
+restart we send type=6 (DEFERRED_UPDATE_MESSAGE) immediately and finish
+the actual Coolify call + message edit on a BackgroundTask. For Show
+patch we send type=5 (DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE) so TUM sees
+"Bot is thinking..." while Claude generates the diff, then we post the
+diff as a follow-up message in the same channel.
 """
 
 from __future__ import annotations
@@ -49,7 +58,8 @@ INTERACTION_MESSAGE_COMPONENT = 3
 # Discord interaction response types
 RESPONSE_PONG = 1
 RESPONSE_CHANNEL_MESSAGE = 4
-RESPONSE_DEFERRED_UPDATE_MESSAGE = 6
+RESPONSE_DEFERRED_CHANNEL_MESSAGE = 5  # v3: shows "Bot is thinking..."
+RESPONSE_DEFERRED_UPDATE_MESSAGE = 6   # v2: silent ack, edit original
 
 
 # ──────────────────────────────────────────────────────────
@@ -104,6 +114,108 @@ def _do_restart_and_update(
 
 
 # ──────────────────────────────────────────────────────────
+# Background handler — Show patch (v3, Session 31)
+# ──────────────────────────────────────────────────────────
+def _do_show_patch_and_followup(
+    application_id: str,
+    interaction_token: str,
+) -> None:
+    """
+    Fetch Coolify stdout tail → call Claude Haiku → post follow-up.
+
+    Triggered after a click on the 🩹 Show patch button. The interaction
+    has already been acked with type=5 (so the user sees "Bot is
+    thinking..."); this BackgroundTask does the heavy lifting and posts
+    the diff (or environmental explanation) as a follow-up message.
+
+    Designed to never raise — failures surface back to the operator as
+    an error follow-up message, not as an HTTP error.
+    """
+    try:
+        if not di.is_coolify_configured():
+            di.send_followup_message(
+                application_id,
+                interaction_token,
+                "❌ Show patch skipped: COOLIFY_API_TOKEN / UUID not "
+                "configured on backend.",
+            )
+            return
+
+        # 1) Fetch the tail of Coolify stdout
+        try:
+            logs = di.coolify_fetch_logs(di.COOLIFY_BACKEND_APP_UUID)
+        except di.CoolifyLogFetchError as e:
+            log.error("show_patch: Coolify logs fetch failed: %s", e)
+            di.send_followup_message(
+                application_id,
+                interaction_token,
+                f"❌ Couldn't fetch Coolify logs: {str(e)[:300]}",
+            )
+            return
+
+        if not logs.strip():
+            di.send_followup_message(
+                application_id,
+                interaction_token,
+                "ℹ️ Coolify logs are empty — nothing to diagnose. "
+                "Check Coolify dashboard 'Logs' tab manually.",
+            )
+            return
+
+        # 2) Ask Claude Haiku for a patch suggestion. Import here to
+        # keep auto_diagnose import lazy (avoids cycles if it ever
+        # imports discord_interactions in the future).
+        try:
+            from auto_diagnose import suggest_patch_from_logs
+        except Exception:
+            log.exception("show_patch: failed to import suggest_patch_from_logs")
+            di.send_followup_message(
+                application_id,
+                interaction_token,
+                "❌ Patch suggestion unavailable: auto_diagnose module "
+                "not importable.",
+            )
+            return
+
+        diagnosis = suggest_patch_from_logs(logs)
+        if not diagnosis:
+            di.send_followup_message(
+                application_id,
+                interaction_token,
+                "❌ Claude Haiku didn't return a diagnosis (API error or "
+                "ANTHROPIC_API_KEY not set — see server logs).",
+            )
+            return
+
+        # 3) Post the diff as a follow-up. Header tag mirrors the
+        # auto_diagnose header so operator can scan the channel and
+        # tell sources apart.
+        header = "🩹 **Patch suggestion** (Claude Haiku)\n\n"
+        di.send_followup_message(
+            application_id,
+            interaction_token,
+            header + diagnosis,
+        )
+    except Exception:
+        log.exception(
+            "_do_show_patch_and_followup: unexpected failure "
+            "(application_id=%s)",
+            application_id,
+        )
+        # Best-effort error follow-up — if even this fails, the user
+        # sees a stuck "Bot is thinking..." until Discord's 15-min TTL.
+        try:
+            di.send_followup_message(
+                application_id,
+                interaction_token,
+                "❌ Show patch encountered an unexpected error — see "
+                "server logs for the traceback.",
+            )
+        except Exception:
+            pass
+
+
+# ──────────────────────────────────────────────────────────
 # POST /alerts/discord-interaction
 # ──────────────────────────────────────────────────────────
 @router.post("/discord-interaction")
@@ -144,13 +256,12 @@ async def discord_interaction(
     if itype == INTERACTION_MESSAGE_COMPONENT:
         data = payload.get("data") or {}
         custom_id = data.get("custom_id") or ""
+        application_id = payload.get("application_id") or di.DISCORD_APP_ID
+        interaction_token = payload.get("token") or ""
 
         if custom_id == di.CUSTOM_ID_RESTART_SERVICE:
-            application_id = payload.get("application_id") or di.DISCORD_APP_ID
-            interaction_token = payload.get("token") or ""
-
-            # Ack within 3 s — Discord shows "Bot is thinking..." then
-            # we edit the message asynchronously when restart completes.
+            # type=6: silent ack, BackgroundTask edits original message
+            # to show "Restart queued at HH:MM" + strip buttons.
             background_tasks.add_task(
                 _do_restart_and_update,
                 application_id,
@@ -158,6 +269,19 @@ async def discord_interaction(
             )
             return JSONResponse(
                 {"type": RESPONSE_DEFERRED_UPDATE_MESSAGE}
+            )
+
+        if custom_id == di.CUSTOM_ID_SHOW_PATCH:
+            # type=5: shows "Bot is thinking..." while Claude Haiku
+            # reads Coolify logs + drafts a patch. Original message
+            # stays untouched so Restart button remains clickable.
+            background_tasks.add_task(
+                _do_show_patch_and_followup,
+                application_id,
+                interaction_token,
+            )
+            return JSONResponse(
+                {"type": RESPONSE_DEFERRED_CHANNEL_MESSAGE}
             )
 
         # Unknown button — respond visibly so TUM can see the misconfig.
@@ -210,9 +334,12 @@ def discord_restart_test(secret: str = Query("")):
             "DISCORD_OPS_CHANNEL_ID in Coolify",
         )
 
-    result = di.send_message_with_restart_button(
-        "🧪 **Manual test** — Restart button (P1.4 v2)\n\n"
-        "Click the button below to verify Coolify restart works end-to-end."
+    result = di.send_message_with_diagnosis_buttons(
+        "🧪 **Manual test** — Diagnosis buttons (P1.4 v3)\n\n"
+        "Click **🔁 Restart service** to verify Coolify restart works "
+        "end-to-end.\n"
+        "Click **🩹 Show patch** to verify Coolify-logs fetch + "
+        "Claude Haiku patch suggestion."
     )
     if result is None:
         raise HTTPException(502, "Discord Bot POST failed — see server logs")

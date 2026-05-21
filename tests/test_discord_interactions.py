@@ -1,9 +1,22 @@
 """
-Unit tests for the Discord interactions endpoint (P1.4 v2, Session 29).
+Unit tests for the Discord interactions endpoint (P1.4 v2 + v3,
+Sessions 29 + 31).
 
 These tests DO NOT hit the network. They use PyNaCl to locally sign
 test payloads, FastAPI TestClient to drive the route, and monkeypatch
-to mock out Coolify + Discord HTTP calls.
+to mock out Coolify + Discord + Anthropic HTTP calls.
+
+Coverage:
+  TestVerifySignature              — 5 signature-verify cases (v2)
+  TestDiscordInteractionRoute      — 6 button-click handler cases
+                                     (PING, unsigned, bad sig, restart
+                                     success, restart fail, show_patch
+                                     dispatch, unknown custom_id)
+  TestDiscordRestartTestEndpoint   — 3 manual-probe cases
+  TestDiagnosisButtons             — 1 component shape test (v3)
+  TestSendFollowupMessage          — 2 follow-up helper cases (v3)
+  TestCoolifyFetchLogs             — 4 log-fetch parser cases (v3)
+  TestShowPatchBackgroundTask      — 3 BackgroundTask end-to-end cases (v3)
 
 Run:
     pip install pytest pynacl httpx
@@ -292,6 +305,11 @@ class TestDiscordRestartTestEndpoint:
         send_mock = MagicMock(
             return_value={"id": "msg-1", "channel_id": "chan-1"}
         )
+        # discord_routes.py uses send_message_with_diagnosis_buttons (v3);
+        # patch both names since the alias maps the legacy name through.
+        monkeypatch.setattr(
+            di, "send_message_with_diagnosis_buttons", send_mock
+        )
         monkeypatch.setattr(
             di, "send_message_with_restart_button", send_mock
         )
@@ -310,3 +328,312 @@ class TestDiscordRestartTestEndpoint:
             "channel_id": "chan-1",
         }
         send_mock.assert_called_once()
+
+
+# ──────────────────────────────────────────────────────────
+# v3 (Session 31) — Diagnosis buttons component shape
+# ──────────────────────────────────────────────────────────
+class TestDiagnosisButtons:
+    def test_two_buttons_in_action_row(self):
+        components = di._diagnosis_buttons()
+        # Single Action Row
+        assert len(components) == 1
+        row = components[0]
+        assert row["type"] == 1  # Action Row
+
+        buttons = row["components"]
+        assert len(buttons) == 2
+
+        # Restart = Primary
+        assert buttons[0]["type"] == 2
+        assert buttons[0]["style"] == 1
+        assert buttons[0]["custom_id"] == di.CUSTOM_ID_RESTART_SERVICE
+        assert "Restart" in buttons[0]["label"]
+
+        # Show patch = Secondary
+        assert buttons[1]["type"] == 2
+        assert buttons[1]["style"] == 2
+        assert buttons[1]["custom_id"] == di.CUSTOM_ID_SHOW_PATCH
+        assert "patch" in buttons[1]["label"].lower()
+
+    def test_restart_button_alias_still_callable(self, monkeypatch):
+        """Backward-compat: auto_diagnose.py calls the v2 name."""
+        monkeypatch.setattr(di, "is_bot_configured", lambda: True)
+
+        # Capture what URL/payload would be POSTed
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):  # noqa: ARG001
+            captured["url"] = req.full_url
+            captured["body"] = req.data
+
+            class FakeResp:
+                def read(self):
+                    return b'{"id": "m1", "channel_id": "c1"}'
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+            return FakeResp()
+
+        monkeypatch.setattr(di.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(di, "DISCORD_BOT_TOKEN", "t")
+        monkeypatch.setattr(di, "DISCORD_OPS_CHANNEL_ID", "ch")
+
+        # Old name still works — alias points at the new function
+        assert di.send_message_with_restart_button is di.send_message_with_diagnosis_buttons
+        result = di.send_message_with_restart_button("hello")
+        assert result == {"id": "m1", "channel_id": "c1"}
+
+        sent = json.loads(captured["body"].decode())
+        # Components should be the new 2-button shape
+        assert len(sent["components"][0]["components"]) == 2
+
+
+# ──────────────────────────────────────────────────────────
+# v3 (Session 31) — send_followup_message helper
+# ──────────────────────────────────────────────────────────
+class TestSendFollowupMessage:
+    def test_posts_to_webhook_path(self, monkeypatch):
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):  # noqa: ARG001
+            captured["url"] = req.full_url
+            captured["method"] = req.get_method()
+            captured["body"] = req.data
+
+            class FakeResp:
+                status = 200
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+            return FakeResp()
+
+        monkeypatch.setattr(di.urllib.request, "urlopen", fake_urlopen)
+
+        ok = di.send_followup_message(
+            "app-id-123",
+            "interaction-token-xyz",
+            "patch content",
+        )
+
+        assert ok is True
+        assert captured["method"] == "POST"
+        assert "webhooks/app-id-123/interaction-token-xyz" in captured["url"]
+        # follow-up POSTs to the bare /webhooks/{id}/{token} path —
+        # NOT /messages/@original (that's edit_message_via_token)
+        assert "/messages/@original" not in captured["url"]
+        body = json.loads(captured["body"].decode())
+        assert body["content"] == "patch content"
+
+    def test_missing_token_returns_false(self):
+        assert di.send_followup_message("", "tok", "x") is False
+        assert di.send_followup_message("app", "", "x") is False
+
+
+# ──────────────────────────────────────────────────────────
+# v3 (Session 31) — coolify_fetch_logs parser
+# ──────────────────────────────────────────────────────────
+class TestCoolifyFetchLogs:
+    def _make_urlopen(self, body: bytes):
+        """Build a fake urlopen that returns `body` from .read()."""
+        def fake_urlopen(req, timeout=None):  # noqa: ARG001
+            class FakeResp:
+                def read(self):
+                    return body
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+            return FakeResp()
+
+        return fake_urlopen
+
+    def test_plain_text_response_tailed(self, monkeypatch):
+        monkeypatch.setattr(di, "COOLIFY_API_TOKEN", "test-token")
+        # 300 lines — should be tailed to last 200 by default
+        lines = [f"line {i}" for i in range(300)]
+        body = "\n".join(lines).encode("utf-8")
+        monkeypatch.setattr(
+            di.urllib.request, "urlopen", self._make_urlopen(body)
+        )
+
+        result = di.coolify_fetch_logs("uuid", tail_lines=200)
+        result_lines = result.splitlines()
+        assert len(result_lines) == 200
+        # Last 200 lines preserved → line 100..299
+        assert result_lines[0] == "line 100"
+        assert result_lines[-1] == "line 299"
+
+    def test_json_with_logs_key(self, monkeypatch):
+        monkeypatch.setattr(di, "COOLIFY_API_TOKEN", "test-token")
+        payload = json.dumps({"logs": "a\nb\nc"}).encode()
+        monkeypatch.setattr(
+            di.urllib.request, "urlopen", self._make_urlopen(payload)
+        )
+
+        result = di.coolify_fetch_logs("uuid", tail_lines=100)
+        assert result == "a\nb\nc"
+
+    def test_http_error_raises(self, monkeypatch):
+        monkeypatch.setattr(di, "COOLIFY_API_TOKEN", "test-token")
+
+        def fake_urlopen(req, timeout=None):  # noqa: ARG001
+            raise di.urllib.error.HTTPError(
+                req.full_url, 404, "Not Found",
+                hdrs=None, fp=None,  # type: ignore[arg-type]
+            )
+
+        # urllib.error.HTTPError needs a fp to .read() — wrap to mimic
+        class FakeFp:
+            def read(self):
+                return b"Application not found"
+
+        def fake_urlopen_404(req, timeout=None):  # noqa: ARG001
+            err = di.urllib.error.HTTPError(
+                req.full_url, 404, "Not Found", hdrs=None, fp=None,  # type: ignore[arg-type]
+            )
+            err.read = lambda: b"Application not found"  # type: ignore[method-assign]
+            raise err
+
+        monkeypatch.setattr(
+            di.urllib.request, "urlopen", fake_urlopen_404
+        )
+
+        with pytest.raises(di.CoolifyLogFetchError) as exc_info:
+            di.coolify_fetch_logs("uuid")
+        assert "404" in str(exc_info.value)
+
+    def test_empty_token_raises(self, monkeypatch):
+        monkeypatch.setattr(di, "COOLIFY_API_TOKEN", "")
+        with pytest.raises(di.CoolifyLogFetchError):
+            di.coolify_fetch_logs("uuid")
+
+
+# ──────────────────────────────────────────────────────────
+# v3 (Session 31) — Show patch end-to-end via interaction route
+# ──────────────────────────────────────────────────────────
+class TestShowPatchBackgroundTask:
+    def test_show_patch_dispatches_logs_fetch_and_claude(
+        self, app_with_router, keypair, monkeypatch
+    ):
+        sk, _ = keypair
+
+        logs_mock = MagicMock(
+            return_value="Traceback: ZeroDivisionError\n  File 'menu_routes.py', line 1234"
+        )
+        # Patch suggest_patch_from_logs in auto_diagnose (lazy-imported
+        # inside _do_show_patch_and_followup)
+        import auto_diagnose
+        patch_mock = MagicMock(return_value="**สาเหตุ** — divide by zero...")
+        followup_mock = MagicMock(return_value=True)
+        monkeypatch.setattr(di, "coolify_fetch_logs", logs_mock)
+        monkeypatch.setattr(di, "send_followup_message", followup_mock)
+        monkeypatch.setattr(di, "is_coolify_configured", lambda: True)
+        monkeypatch.setattr(
+            auto_diagnose, "suggest_patch_from_logs", patch_mock
+        )
+
+        body_obj = {
+            "type": 3,
+            "data": {"custom_id": "show_patch"},
+            "application_id": "test-app-id-123",
+            "token": "test-interaction-token",
+        }
+        body = json.dumps(body_obj).encode("utf-8")
+        headers = _sign_body(sk, body)
+
+        client = TestClient(app_with_router)
+        r = client.post(
+            "/alerts/discord-interaction", content=body, headers=headers
+        )
+
+        assert r.status_code == 200, r.text
+        # type=5: DEFERRED_CHANNEL_MESSAGE (shows "Bot is thinking...")
+        assert r.json() == {"type": 5}
+
+        # BackgroundTask ran: fetched logs → asked Claude → posted follow-up
+        logs_mock.assert_called_once_with("test-backend-uuid")
+        patch_mock.assert_called_once()
+        followup_mock.assert_called_once()
+        sent_content = followup_mock.call_args.args[2]
+        assert "Patch suggestion" in sent_content
+        assert "divide by zero" in sent_content
+
+    def test_show_patch_logs_fetch_failure_posts_error(
+        self, app_with_router, keypair, monkeypatch
+    ):
+        sk, _ = keypair
+
+        def boom(_uuid):
+            raise di.CoolifyLogFetchError(
+                "Coolify logs API 502: gateway down"
+            )
+
+        followup_mock = MagicMock(return_value=True)
+        monkeypatch.setattr(di, "coolify_fetch_logs", boom)
+        monkeypatch.setattr(di, "send_followup_message", followup_mock)
+        monkeypatch.setattr(di, "is_coolify_configured", lambda: True)
+
+        body_obj = {
+            "type": 3,
+            "data": {"custom_id": "show_patch"},
+            "application_id": "app",
+            "token": "tok",
+        }
+        body = json.dumps(body_obj).encode("utf-8")
+        headers = _sign_body(sk, body)
+
+        client = TestClient(app_with_router)
+        r = client.post(
+            "/alerts/discord-interaction", content=body, headers=headers
+        )
+
+        assert r.status_code == 200
+        assert r.json() == {"type": 5}
+        followup_mock.assert_called_once()
+        err_msg = followup_mock.call_args.args[2]
+        assert "Couldn't fetch Coolify logs" in err_msg
+        assert "gateway down" in err_msg
+
+    def test_show_patch_empty_logs_posts_info(
+        self, app_with_router, keypair, monkeypatch
+    ):
+        sk, _ = keypair
+
+        monkeypatch.setattr(
+            di, "coolify_fetch_logs", MagicMock(return_value="   \n\n")
+        )
+        followup_mock = MagicMock(return_value=True)
+        monkeypatch.setattr(di, "send_followup_message", followup_mock)
+        monkeypatch.setattr(di, "is_coolify_configured", lambda: True)
+
+        body_obj = {
+            "type": 3,
+            "data": {"custom_id": "show_patch"},
+            "application_id": "app",
+            "token": "tok",
+        }
+        body = json.dumps(body_obj).encode("utf-8")
+        headers = _sign_body(sk, body)
+
+        client = TestClient(app_with_router)
+        r = client.post(
+            "/alerts/discord-interaction", content=body, headers=headers
+        )
+
+        assert r.status_code == 200
+        assert r.json() == {"type": 5}
+        followup_mock.assert_called_once()
+        msg = followup_mock.call_args.args[2]
+        assert "Coolify logs are empty" in msg

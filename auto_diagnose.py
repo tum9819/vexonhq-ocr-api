@@ -108,30 +108,74 @@ If the error is ambiguous, say so honestly — do not invent a cause.
 Output as Discord-flavored markdown. NO preamble, NO sign-off.
 """
 
+# v3 (Session 31) — Show patch prompt. Asks Claude to read Coolify
+# stdout tail and either suggest a unified diff or honestly say "no
+# code patch applies, this looks environmental."
+PATCH_SYSTEM_PROMPT = """You are an SRE assistant for VEXONHQ, a Thai restaurant accounting system (Python FastAPI backend on Coolify, deployed via Nixpacks).
 
-def _call_claude(check_results: dict[str, Any]) -> Optional[str]:
+You receive the last ~200 lines of Coolify container stdout. Your task:
+
+1. Read carefully. Find the most recent exception traceback or ERROR line.
+2. If the failure points at a specific file/line/function in the application code:
+   - Output a UNIFIED DIFF that fixes the most likely bug
+   - Use the actual filename from the traceback (e.g. "menu_routes.py:1234")
+   - Include 2-3 lines of context before and after the change
+   - Keep the diff short — focus on the root-cause line, not stylistic edits
+3. If the failure is environmental (env var missing, DB down, network, OOM, image build issue, deploy timeout):
+   - Output a short paragraph explaining the cause
+   - Suggest the right non-code action (restart, env update, DB check, snapshot rollback)
+   - DO NOT invent a code patch for an environmental problem
+4. If the logs show no failure at all (all healthy / quiet):
+   - Say so plainly. Suggest checking the /health/deep monitor history instead.
+
+Output format (Discord-flavored markdown, max ~1700 chars to leave headroom):
+
+**สาเหตุที่น่าจะเป็น**
+<one short paragraph in Thai+English, point at the specific log line if possible>
+
+[Either a diff block, an environmental explanation, or "no actionable issue"]
+
+If a diff: wrap in triple-backtick `diff` fence:
+```diff
+--- a/<file>.py
++++ b/<file>.py
+@@ -<old_line>,<count> +<new_line>,<count> @@
+ ... context ...
+- removed line
++ added line
+ ... context ...
+```
+
+**หมายเหตุ** (optional, only if needed: side-effects / testing notes / edge cases)
+
+NEVER fabricate a diff. If logs don't pinpoint a file+line, choose the environmental or "no actionable issue" path. Honest uncertainty beats false certainty.
+"""
+
+
+def _anthropic_call(
+    system_prompt: str,
+    user_msg: str,
+    max_tokens: int = 600,
+    timeout: int = 20,
+) -> Optional[str]:
     """
-    Send check results to Claude Haiku, return diagnosis text.
+    Low-level Anthropic Messages API caller — used by both the
+    health-check diagnosis path (v2) and the Show-patch path (v3).
 
-    Returns None on any error (logged, never raised — this runs as
-    BackgroundTask and must not crash the response).
+    Returns concatenated assistant text on success, None on any error
+    (logged, never raised — this runs as BackgroundTask and must not
+    crash the response).
     """
     if not ANTHROPIC_API_KEY:
         log.warning(
-            "auto_diagnose: ANTHROPIC_API_KEY not set — skipping diagnosis"
+            "auto_diagnose: ANTHROPIC_API_KEY not set — skipping call"
         )
         return None
 
-    user_msg = (
-        "Here are the /health/deep check results from VEXONHQ backend:\n\n"
-        f"```json\n{json.dumps(check_results, indent=2, ensure_ascii=False)}\n```\n\n"
-        "Diagnose the most likely cause and suggest the safest next action."
-    )
-
     payload = {
         "model": ANTHROPIC_MODEL,
-        "max_tokens": 600,
-        "system": DIAGNOSIS_SYSTEM_PROMPT,
+        "max_tokens": max_tokens,
+        "system": system_prompt,
         "messages": [{"role": "user", "content": user_msg}],
     }
     body = json.dumps(payload).encode("utf-8")
@@ -148,7 +192,7 @@ def _call_claude(check_results: dict[str, Any]) -> Optional[str]:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         # Anthropic response shape: {"content": [{"type":"text","text":"..."}]}
         blocks = data.get("content", [])
@@ -161,6 +205,63 @@ def _call_claude(check_results: dict[str, Any]) -> Optional[str]:
     except Exception:
         log.exception("auto_diagnose: Anthropic API call failed")
         return None
+
+
+def _call_claude(check_results: dict[str, Any]) -> Optional[str]:
+    """
+    Send /health/deep check results to Claude Haiku — returns diagnosis.
+    """
+    user_msg = (
+        "Here are the /health/deep check results from VEXONHQ backend:\n\n"
+        f"```json\n{json.dumps(check_results, indent=2, ensure_ascii=False)}\n```\n\n"
+        "Diagnose the most likely cause and suggest the safest next action."
+    )
+    return _anthropic_call(DIAGNOSIS_SYSTEM_PROMPT, user_msg, max_tokens=600)
+
+
+def suggest_patch_from_logs(coolify_logs: str) -> Optional[str]:
+    """
+    Send the Coolify stdout tail to Claude Haiku — returns suggested
+    unified diff (or environmental explanation, or "no actionable issue").
+
+    v3 (Session 31) — backs the 🩹 Show patch button.
+
+    `coolify_logs` is expected to already be tailed (last N lines) by
+    `discord_interactions.coolify_fetch_logs`. We trim further if the
+    string is too large for a single Anthropic request (rough budget:
+    ~30k chars / ~8k input tokens leaves room for the system prompt +
+    700-token response).
+
+    Cost rough estimate: ~฿1-3 per call at Haiku 4.5 pricing for ~5k
+    input + 700 output tokens. Same Anthropic spend cap as v2 ($5/mo)
+    applies — UR free plan polls every 5 min so worst-case TUM clicks
+    Show patch ~10x/month = ~฿10-30 ceiling.
+    """
+    # Guard against accidental huge logs (e.g. someone bumps tail_lines
+    # to 5000 via env var). Anthropic input limit is generous but we
+    # don't need full container life history for diagnosis.
+    MAX_LOG_CHARS = 30000
+    if len(coolify_logs) > MAX_LOG_CHARS:
+        # Keep the tail — most recent lines are most diagnostic
+        coolify_logs = coolify_logs[-MAX_LOG_CHARS:]
+        truncate_note = (
+            f"\n\n(Note: logs were truncated to the last {MAX_LOG_CHARS} chars "
+            f"to fit context window.)"
+        )
+    else:
+        truncate_note = ""
+
+    user_msg = (
+        "Here are the last lines of Coolify stdout for vexonhq-ocr-api "
+        "(Python FastAPI backend):\n\n"
+        f"```\n{coolify_logs}\n```\n"
+        f"{truncate_note}\n\n"
+        "Suggest a unified-diff patch for the most likely code-level bug, "
+        "OR explain if this looks environmental (and suggest the right "
+        "non-code action), OR say plainly if no actionable issue is "
+        "visible."
+    )
+    return _anthropic_call(PATCH_SYSTEM_PROMPT, user_msg, max_tokens=900)
 
 
 # ──────────────────────────────────────────────────────────────────

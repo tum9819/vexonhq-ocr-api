@@ -47,6 +47,7 @@ Required env vars (production = Coolify env, local = `.env`):
 | `COOLIFY_API_TOKEN` | (required when bot is set) Coolify dashboard → Keys & Tokens → API tokens. Lets the Restart button call back to Coolify |
 | `COOLIFY_BACKEND_APP_UUID` | (required when bot is set) UUID of `vexonhq-ocr-api` in Coolify (visible in app URL) |
 | `COOLIFY_API_BASE_URL` | (optional) override Coolify API base — default `http://178.128.31.76:8000` |
+| `COOLIFY_LOG_TAIL_LINES` | (optional, P1.4 v3) how many Coolify stdout lines to send to Claude Haiku when 🩹 Show patch is clicked — default `200`, min `20` |
 | `LOG_FORMAT` | `json` for structured logging, anything else for human text (default) |
 | `SLOW_QUERY_WARN_SEC` | Slow query WARNING threshold in seconds (default `3.0`) |
 | `SLOW_QUERY_CRITICAL_SEC` | Slow query ERROR threshold in seconds (default `10.0`) |
