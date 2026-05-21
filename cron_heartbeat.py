@@ -125,13 +125,16 @@ def heartbeat(job_id: str) -> Callable[[F], F]:
 # /cron/health endpoint
 # ─────────────────────────────────────────────
 
-@router.get("/health")
+@router.api_route("/health", methods=["GET", "HEAD"])
 def cron_health():
     """Return per-job heartbeat state. Flags jobs whose last_run_at
     is more than 2× expected_interval_hours ago as 'stale'.
 
     Returns 200 (healthy) or 503 (any stale) so Uptime Robot can poll
-    this directly and alert without parsing the body.
+    this directly and alert without parsing the body. HEAD method is
+    accepted because Uptime Robot free plan only supports HEAD requests;
+    Starlette strips the body but preserves the status code, which is
+    all the monitor needs.
     """
     from fastapi.responses import JSONResponse
 
