@@ -1576,6 +1576,56 @@ except Exception as e:
     log.error("Failed to register daily_stock_digest job: %s", e)
 
 
+# P2.4 (Session 31): weekly DigitalOcean auto-snapshot rotation.
+# Fires Sunday 03:00 Asia/Bangkok (= 20:00 Saturday UTC). The rotation
+# itself takes ~5-10 min as DO copies the droplet image, but our HTTP
+# call to /droplets/{id}/actions returns immediately with an "in-progress"
+# action — we don't block waiting for it.
+@_heartbeat("weekly_do_snapshot")
+def _scheduled_do_snapshot_rotation():
+    """APScheduler job: trigger DO auto-snapshot rotation weekly."""
+    log.info("Scheduled DO snapshot rotation running")
+    try:
+        from do_snapshot_routes import (
+            rotate_auto_snapshots,
+            is_do_configured,
+        )
+        if not is_do_configured():
+            log.warning(
+                "DO snapshot rotation skipped — DO_API_TOKEN not configured"
+            )
+            return
+        report = rotate_auto_snapshots()
+        log.info(
+            "DO snapshot rotation OK: created=%s kept=%s deleted=%s errors=%s",
+            report.get("created"),
+            report.get("kept"),
+            report.get("deleted"),
+            report.get("errors"),
+        )
+    except Exception as e:
+        log.error("Scheduled DO snapshot rotation FAILED: %s", e)
+        raise  # heartbeat decorator records the failure
+
+
+try:
+    _scheduler.add_job(
+        _scheduled_do_snapshot_rotation,
+        trigger="cron",
+        day_of_week="sun",
+        hour=3,
+        minute=0,
+        id="weekly_do_snapshot",
+        replace_existing=True,
+    )
+    log.info(
+        "Weekly DO snapshot rotation scheduler started — "
+        "fires Sunday 03:00 Asia/Bangkok"
+    )
+except Exception as e:
+    log.error("Failed to register weekly_do_snapshot job: %s", e)
+
+
 
 def _verify_signature(body: bytes, signature: str) -> bool:
     secret = os.environ.get("LINE_CHANNEL_SECRET", "")

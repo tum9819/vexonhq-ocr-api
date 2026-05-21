@@ -151,6 +151,10 @@ AUTHED_ROUTES = [
     ("GET", "/alerts/discord-interaction"),
     # Manual test trigger — GET without ?secret → 401 (auth fail = route exists)
     ("GET", "/alerts/discord-restart-test"),
+
+    # DO snapshot rotation (Session 31 P2.4) — GET without ?secret → 401
+    ("GET", "/snapshots/status"),
+    ("GET", "/snapshots/auto-rotate"),
 ]
 
 

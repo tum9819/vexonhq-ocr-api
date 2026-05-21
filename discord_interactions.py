@@ -222,6 +222,50 @@ def send_message_with_diagnosis_buttons(text: str) -> Optional[dict[str, Any]]:
 send_message_with_restart_button = send_message_with_diagnosis_buttons
 
 
+def send_simple_message(text: str) -> Optional[dict[str, Any]]:
+    """
+    POST a plain text message to the ops channel — no buttons (Session 31).
+
+    Used by non-interactive notifications like the weekly DO snapshot
+    rotation report. Same auth/transport as send_message_with_diagnosis_buttons
+    but `components` is omitted so the message is informational only.
+
+    Returns Discord's JSON response on success, None on failure or
+    missing config. Never raises.
+    """
+    if not is_bot_configured():
+        log.warning(
+            "send_simple_message: bot not configured — skipping"
+        )
+        return None
+
+    url = f"{DISCORD_API_BASE}/channels/{DISCORD_OPS_CHANNEL_ID}/messages"
+    payload = {"content": text[:1900]}
+    body = json.dumps(payload).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+            "User-Agent": "VEXONHQ-OpsBot (vexonhq.com, 1.0)",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:300]
+        log.error("send_simple_message: Discord %s: %s", e.code, detail)
+        return None
+    except Exception:
+        log.exception("send_simple_message: Discord POST failed")
+        return None
+
+
 def send_followup_message(
     application_id: str,
     interaction_token: str,

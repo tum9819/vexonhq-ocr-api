@@ -48,6 +48,10 @@ Required env vars (production = Coolify env, local = `.env`):
 | `COOLIFY_BACKEND_APP_UUID` | (required when bot is set) UUID of `vexonhq-ocr-api` in Coolify (visible in app URL) |
 | `COOLIFY_API_BASE_URL` | (optional) override Coolify API base — default `http://178.128.31.76:8000` |
 | `COOLIFY_LOG_TAIL_LINES` | (optional, P1.4 v3) how many Coolify stdout lines to send to Claude Haiku when 🩹 Show patch is clicked — default `200`, min `20` |
+| `DO_API_TOKEN` | (optional, P2.4) DigitalOcean Personal Access Token (read+write). Required for weekly auto-snapshot rotation. Create at cloud.digitalocean.com/account/api/tokens with scopes: `droplet:read`, `image:read`, `image:delete` |
+| `DO_DROPLET_NAME` | (optional, P2.4) name of the droplet to snapshot — default `vexonhq-core` |
+| `DO_SNAPSHOT_PREFIX` | (optional, P2.4) prefix for auto-rotated snapshots — default `vexonhq-auto-`. NEVER touches snapshots with other prefixes (e.g. `vexonhq-clean-base`, `vexonhq-session*`) |
+| `DO_SNAPSHOT_MAX_KEEP` | (optional, P2.4) how many auto-prefixed snapshots to retain after rotation — default `1`. Bump to `2` for extra rollback safety (+~$1.80/mo per slot) |
 | `LOG_FORMAT` | `json` for structured logging, anything else for human text (default) |
 | `SLOW_QUERY_WARN_SEC` | Slow query WARNING threshold in seconds (default `3.0`) |
 | `SLOW_QUERY_CRITICAL_SEC` | Slow query ERROR threshold in seconds (default `10.0`) |
