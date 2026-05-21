@@ -281,6 +281,13 @@ The frontend repo also has all docs under `Documents\Claude\Projects\MaraStation
 
 5. **Coolify auto-deploy via Webhook works reliably.** Previous "CORS commits weren't deployed" hypothesis (Session 17/18) was wrong — deploys went through; CORS errors were a side-effect of unhandled exceptions in endpoints that hadn't been tested end-to-end.
 
+6. **Coolify v4 application UUID = URL subdomain prefix** (Session 29 debug). For `vexonhq-ocr-api` the public URL is `https://b4zhad8qkoxjushdq8465056.178.128.31.76.sslip.io` → application UUID is **`b4zhad8qkoxjushdq8465056`** (24 chars before the first dot). The string `iwa8jm7gvjqi3awnslk924a4` visible in the dashboard breadcrumb `vexonhq-ocr-api:main-iwa8jm7gvjqi3awnslk924a4` is a Docker image tag suffix, NOT the API UUID. Cost ~30 min of "Application not found" debug. To verify: `curl -H "Authorization: Bearer $COOLIFY_API_TOKEN" http://178.128.31.76:8000/api/v1/applications/<UUID>` returns the app JSON on success, 404 on wrong UUID.
+
+7. **Discord Bot Token ≠ Client Secret** (Session 29 debug). Both look like "secret strings" in the Developer Portal but live in different tabs and have different formats:
+   - **Bot Token** (Bot tab → "Reset Token") — ~70 chars, 2 dots `.`, starts with base64 of App ID (e.g., `MTUwNjgzOTA...`). Used with `Authorization: Bot <token>` header.
+   - **Client Secret** (OAuth2 tab) — 32 chars, no dots, random alphanumeric. Used only for OAuth2 authorization-code flow. **NOT** for Bot API.
+   Quick verify of an env-set token: `python -c "import os; t=os.environ['DISCORD_BOT_TOKEN']; print(len(t), t.count('.'))"` should print `~71 2`. If it prints `32 0` you have the Client Secret by mistake.
+
 ---
 
 ## Session protocol (when wrapping a coding session)
