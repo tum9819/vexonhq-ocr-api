@@ -1547,6 +1547,7 @@ def _handle_reorder_list() -> str:
 
 
 # Phase 67 (Session 16): Daily comprehensive low-stock digest — 07:00 BKK
+@_heartbeat("daily_stock_digest")
 def _scheduled_daily_stock_digest():
     """APScheduler job: push reorder list to LINE at 07:00 Bangkok time."""
     log.info("Scheduled daily stock digest running")
