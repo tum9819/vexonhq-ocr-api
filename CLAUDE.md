@@ -288,6 +288,20 @@ The frontend repo also has all docs under `Documents\Claude\Projects\MaraStation
    - **Client Secret** (OAuth2 tab) — 32 chars, no dots, random alphanumeric. Used only for OAuth2 authorization-code flow. **NOT** for Bot API.
    Quick verify of an env-set token: `python -c "import os; t=os.environ['DISCORD_BOT_TOKEN']; print(len(t), t.count('.'))"` should print `~71 2`. If it prints `32 0` you have the Client Secret by mistake.
 
+8. **Uptime Robot free plan is HEAD-only** (Session 30 discovery). GET is paid-plan locked (Solo+, ~$7/mo). Free-plan monitors can only send HTTP HEAD requests. Backend endpoints intended for free-plan monitoring MUST register HEAD as an accepted method — `@router.get("/path")` returns 405 to HEAD and the monitor will read it as down forever. Pattern:
+   ```python
+   # WRONG — UR free plan returns 405 Method Not Allowed
+   @router.get("/health")
+   def cron_health(): ...
+
+   # RIGHT — accepts both GET (humans + curl) and HEAD (Uptime Robot)
+   @router.api_route("/health", methods=["GET", "HEAD"])
+   def cron_health(): ...
+   ```
+   FastAPI / Starlette handle HEAD automatically when both methods are listed: the function body still runs (so the status code is computed) but the response body is stripped before send. Status-code-based monitoring works exactly as intended.
+   Endpoints already on this pattern: `/health/deep` (Session 24, `main.py:403`), `/cron/health` (Session 30, `cron_heartbeat.py:128`).
+   Other free-plan limits worth knowing: 5-min minimum interval, single region (auto), no SSL/Domain checks, no Slack/Telegram/Webhook integrations. **Discord integration IS free** (native).
+
 ---
 
 ## Session protocol (when wrapping a coding session)
