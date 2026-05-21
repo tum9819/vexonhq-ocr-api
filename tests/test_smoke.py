@@ -144,6 +144,13 @@ AUTHED_ROUTES = [
     # the middleware prefix — only /line/webhook stays public for LINE
     # Messaging API callbacks)
     ("GET", "/line/scheduler/status"),
+
+    # Discord Interactions endpoint (Session 29 P1.4 v2)
+    # — POST-only; GET should return 405 (route exists, wrong method).
+    # — A 404 here means discord_routes.py wasn't registered.
+    ("GET", "/alerts/discord-interaction"),
+    # Manual test trigger — GET without ?secret → 401 (auth fail = route exists)
+    ("GET", "/alerts/discord-restart-test"),
 ]
 
 

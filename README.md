@@ -39,7 +39,14 @@ Required env vars (production = Coolify env, local = `.env`):
 | `ANTHROPIC_API_KEY` | AI Link / recipe AI / `/health/deep` auto-diagnosis |
 | `LINE_CHANNEL_TOKEN` + `LINE_CHANNEL_SECRET` + `LINE_USER_ID` | LINE bot |
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | (optional) Telegram fallback when LINE push fails |
-| `DISCORD_OPS_WEBHOOK_URL` | (optional) auto-diagnosis posts here on outage |
+| `DISCORD_OPS_WEBHOOK_URL` | (optional) auto-diagnosis posts here on outage — P1.4 MVP plain-text channel |
+| `DISCORD_BOT_TOKEN` | (optional) Bot token from Developer Portal → Bot → Reset Token. When set, auto-diagnosis switches to Bot API + inline Restart button (P1.4 v2) |
+| `DISCORD_APP_PUBLIC_KEY` | (required when bot is set) hex public key from Developer Portal → General Information → Public Key. Used to verify Ed25519 signature on `/alerts/discord-interaction` |
+| `DISCORD_APP_ID` | (required when bot is set) Application ID. Used in interaction-response PATCH URL |
+| `DISCORD_OPS_CHANNEL_ID` | (required when bot is set) channel ID where the bot posts (right-click channel → Copy ID with Developer Mode on) |
+| `COOLIFY_API_TOKEN` | (required when bot is set) Coolify dashboard → Keys & Tokens → API tokens. Lets the Restart button call back to Coolify |
+| `COOLIFY_BACKEND_APP_UUID` | (required when bot is set) UUID of `vexonhq-ocr-api` in Coolify (visible in app URL) |
+| `COOLIFY_API_BASE_URL` | (optional) override Coolify API base — default `http://178.128.31.76:8000` |
 | `LOG_FORMAT` | `json` for structured logging, anything else for human text (default) |
 | `SLOW_QUERY_WARN_SEC` | Slow query WARNING threshold in seconds (default `3.0`) |
 | `SLOW_QUERY_CRITICAL_SEC` | Slow query ERROR threshold in seconds (default `10.0`) |

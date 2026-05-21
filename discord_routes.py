@@ -1,0 +1,224 @@
+"""
+Discord Interactions Endpoint (P1.4 v2, Session 29).
+
+When the user clicks an inline button on a Discord message posted by
+our Bot, Discord POSTs a signed JSON payload to the URL configured as
+"Interactions Endpoint URL" in the Application's Developer Portal.
+This module exposes that endpoint and routes the click to the right
+handler.
+
+Endpoints:
+  POST /alerts/discord-interaction
+        - public path (auth = Ed25519 signature on headers)
+        - handles PING (type=1) verification + button clicks (type=3)
+
+  GET  /alerts/discord-restart-test?secret=<ALERTS_WEBHOOK_SECRET>
+        - manual trigger: posts a test message with a Restart button
+          so TUM can validate end-to-end without waiting for a real
+          /health/deep failure.
+
+Discord 3-second rule: the interaction response must hit Discord within
+3 seconds of the click or Discord shows "This interaction failed". For
+restart we send the deferred response (type=6) immediately and finish
+the actual Coolify call + message edit on a BackgroundTask.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from typing import Any
+
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
+
+import discord_interactions as di
+
+log = logging.getLogger("discord_routes")
+
+router = APIRouter(prefix="/alerts", tags=["alerts", "discord"])
+
+ALERTS_WEBHOOK_SECRET = os.environ.get("ALERTS_WEBHOOK_SECRET", "")
+
+# Discord interaction types (subset we care about)
+INTERACTION_PING = 1
+INTERACTION_MESSAGE_COMPONENT = 3
+
+# Discord interaction response types
+RESPONSE_PONG = 1
+RESPONSE_CHANNEL_MESSAGE = 4
+RESPONSE_DEFERRED_UPDATE_MESSAGE = 6
+
+
+# ──────────────────────────────────────────────────────────
+# Background handler — runs after we ack the click
+# ──────────────────────────────────────────────────────────
+def _do_restart_and_update(
+    application_id: str,
+    interaction_token: str,
+) -> None:
+    """
+    Call Coolify restart, then edit the original message to reflect outcome.
+
+    Designed to never raise — failures are logged and surfaced back to
+    the operator via the Discord message edit, not via HTTP error.
+    """
+    try:
+        if not di.is_coolify_configured():
+            di.edit_message_via_token(
+                application_id,
+                interaction_token,
+                "❌ Restart skipped: COOLIFY_API_TOKEN / UUID not configured "
+                "on backend.",
+            )
+            return
+
+        try:
+            result = di.coolify_restart(di.COOLIFY_BACKEND_APP_UUID)
+        except di.CoolifyRestartError as e:
+            log.error("restart: Coolify API failed: %s", e)
+            di.edit_message_via_token(
+                application_id,
+                interaction_token,
+                f"❌ Restart failed: {str(e)[:200]}",
+            )
+            return
+
+        deployment_uuid = result.get("deployment_uuid") or "(unknown)"
+        when = time.strftime("%H:%M:%S")
+        di.edit_message_via_token(
+            application_id,
+            interaction_token,
+            f"✅ Restart queued at {when} — deployment `{deployment_uuid}`. "
+            f"Coolify is rolling the container; expect health to recover "
+            f"in ~20-30s.",
+        )
+    except Exception:
+        # Defensive — BackgroundTask exceptions are silent server errors
+        log.exception(
+            "_do_restart_and_update: unexpected failure (application_id=%s)",
+            application_id,
+        )
+
+
+# ──────────────────────────────────────────────────────────
+# POST /alerts/discord-interaction
+# ──────────────────────────────────────────────────────────
+@router.post("/discord-interaction")
+async def discord_interaction(
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Receive a Discord interaction (PING or button click).
+
+    Auth: Ed25519 signature on headers X-Signature-Ed25519 and
+    X-Signature-Timestamp, verified against DISCORD_APP_PUBLIC_KEY.
+    Wrong signature -> 401. Missing PyNaCl or unset public key -> 401
+    (treated identically to a bad sig — fail-closed).
+    """
+    raw_body = await request.body()
+    signature_hex = request.headers.get("X-Signature-Ed25519", "")
+    timestamp = request.headers.get("X-Signature-Timestamp", "")
+
+    if not di.verify_signature(
+        di.DISCORD_APP_PUBLIC_KEY,
+        signature_hex,
+        timestamp,
+        raw_body,
+    ):
+        raise HTTPException(401, "Invalid request signature")
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(400, "Malformed JSON body")
+
+    itype = payload.get("type")
+    if itype == INTERACTION_PING:
+        # Developer Portal saves the endpoint only if we PONG correctly.
+        return JSONResponse({"type": RESPONSE_PONG})
+
+    if itype == INTERACTION_MESSAGE_COMPONENT:
+        data = payload.get("data") or {}
+        custom_id = data.get("custom_id") or ""
+
+        if custom_id == di.CUSTOM_ID_RESTART_SERVICE:
+            application_id = payload.get("application_id") or di.DISCORD_APP_ID
+            interaction_token = payload.get("token") or ""
+
+            # Ack within 3 s — Discord shows "Bot is thinking..." then
+            # we edit the message asynchronously when restart completes.
+            background_tasks.add_task(
+                _do_restart_and_update,
+                application_id,
+                interaction_token,
+            )
+            return JSONResponse(
+                {"type": RESPONSE_DEFERRED_UPDATE_MESSAGE}
+            )
+
+        # Unknown button — respond visibly so TUM can see the misconfig.
+        return JSONResponse(
+            {
+                "type": RESPONSE_CHANNEL_MESSAGE,
+                "data": {
+                    "content": (
+                        f"⚠️ Unsupported component custom_id: "
+                        f"`{custom_id[:64]}`"
+                    ),
+                },
+            }
+        )
+
+    # Any other interaction type (modal submit etc.) — acknowledge gracefully
+    log.info("discord_interaction: unhandled interaction type=%s", itype)
+    return JSONResponse(
+        {
+            "type": RESPONSE_CHANNEL_MESSAGE,
+            "data": {"content": "Unsupported interaction type"},
+        }
+    )
+
+
+# ──────────────────────────────────────────────────────────
+# GET /alerts/discord-restart-test — manual end-to-end probe
+# ──────────────────────────────────────────────────────────
+@router.get("/discord-restart-test")
+def discord_restart_test(secret: str = Query("")):
+    """
+    Post a one-off test message with a Restart button.
+
+    Use this after Coolify env vars + Discord Application + Interactions
+    Endpoint URL are all configured, to verify the end-to-end loop
+    (Bot posts → click → backend acks → Coolify restart → message edits)
+    without waiting for a real /health/deep outage.
+    """
+    if not ALERTS_WEBHOOK_SECRET:
+        raise HTTPException(
+            500, "ALERTS_WEBHOOK_SECRET env var not configured on backend"
+        )
+    if secret != ALERTS_WEBHOOK_SECRET:
+        raise HTTPException(401, "Invalid secret query param")
+
+    if not di.is_bot_configured():
+        raise HTTPException(
+            500,
+            "Bot not configured — set DISCORD_BOT_TOKEN + "
+            "DISCORD_OPS_CHANNEL_ID in Coolify",
+        )
+
+    result = di.send_message_with_restart_button(
+        "🧪 **Manual test** — Restart button (P1.4 v2)\n\n"
+        "Click the button below to verify Coolify restart works end-to-end."
+    )
+    if result is None:
+        raise HTTPException(502, "Discord Bot POST failed — see server logs")
+
+    return {
+        "ok": True,
+        "discord_message_id": result.get("id"),
+        "channel_id": result.get("channel_id"),
+    }

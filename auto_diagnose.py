@@ -36,6 +36,11 @@ import urllib.error
 import urllib.request
 from typing import Any, Optional
 
+try:
+    import discord_interactions as _di  # P1.4 v2 — Bot API send path
+except Exception:  # pragma: no cover — module ships in same repo
+    _di = None  # type: ignore[assignment]
+
 log = logging.getLogger("auto_diagnose")
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -163,11 +168,27 @@ def _call_claude(check_results: dict[str, Any]) -> Optional[str]:
 # ──────────────────────────────────────────────────────────────────
 def _post_to_discord(text: str) -> bool:
     """
-    Post a message to the VEXONHQ Ops Discord channel via webhook.
+    Post a message to the VEXONHQ Ops Discord channel.
+
+    P1.4 v2 (Session 29): if the Discord Bot is configured
+    (DISCORD_BOT_TOKEN + DISCORD_OPS_CHANNEL_ID), post via the Bot API
+    so the message can carry an inline Restart button. Falls back to
+    the P1.4 MVP plain channel webhook (DISCORD_OPS_WEBHOOK_URL) when
+    the Bot isn't configured — same behaviour as before, no regression.
 
     Returns True on success, False otherwise. Never raises — this is
     the final step of a background task; we just log and move on.
     """
+    # P1.4 v2 — preferred: Bot API + inline Restart button
+    if _di is not None and _di.is_bot_configured():
+        result = _di.send_message_with_restart_button(text)
+        if result is not None:
+            return True
+        log.warning(
+            "auto_diagnose: bot send failed — falling back to webhook"
+        )
+
+    # P1.4 MVP fallback — plain channel webhook (no button)
     if not DISCORD_OPS_WEBHOOK_URL:
         log.warning(
             "auto_diagnose: DISCORD_OPS_WEBHOOK_URL not set — skipping post"
