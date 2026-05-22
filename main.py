@@ -334,6 +334,10 @@ app.add_middleware(
         # Coolify self-host frontend (Session 16 migration)
         "http://r7plics0ljl0lxwr6r8zdun0.178.128.31.76.sslip.io",
         "https://r7plics0ljl0lxwr6r8zdun0.178.128.31.76.sslip.io",
+        # Custom domain (Session 32 marastation.com migration)
+        "https://app.marastation.com",
+        "https://marastation.com",
+        "https://www.marastation.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
