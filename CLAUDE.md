@@ -191,7 +191,7 @@ curl http://localhost:8000/health
 2. `git diff` — review what changed (must be small + focused)
 3. Hand the diff + commit message to TUM in PowerShell-paste form (TUM commits + pushes)
 4. Coolify watches `tum9819/vexonhq-ocr-api` on `main` and auto-deploys via Webhook (Nixpacks, ~20-30s)
-5. After deploy: `curl https://b4zhad8qkoxjushdq8465056.178.128.31.76.sslip.io/health` should return 200
+5. After deploy: `curl https://api.marastation.com/health` should return 200
 
 If auto-deploy doesn't trigger, manual: Coolify dashboard → `vexonhq-ocr-api` → Deploy button.
 
@@ -222,7 +222,7 @@ The smoke suite includes `_request_with_retry()` that retries 502/503/504 + Conn
 
 Direct pytest invocation (if you prefer):
 ```powershell
-$env:BACKEND_URL = "https://b4zhad8qkoxjushdq8465056.178.128.31.76.sslip.io"
+$env:BACKEND_URL = "https://api.marastation.com"
 pytest tests/test_smoke.py -v
 ```
 

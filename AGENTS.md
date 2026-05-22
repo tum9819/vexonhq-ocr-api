@@ -157,8 +157,8 @@ frontend repo under `C:\Users\rapee\VEXONHQ\docs\`.
 
 - **VPS**: `vexonhq-core` on DigitalOcean (SGP1, IP `178.128.31.76`)
 - **Coolify**: `http://178.128.31.76:8000/`
-- **Backend URL**: `https://b4zhad8qkoxjushdq8465056.178.128.31.76.sslip.io`
-- **Backend UUID**: `b4zhad8qkoxjushdq8465056` (Coolify API)
+- **Backend URL**: `https://api.marastation.com` (Session 32 migration; sslip.io fallback still resolves)
+- **Backend UUID**: `b4zhad8qkoxjushdq8465056` (Coolify API — derived from original sslip subdomain prefix)
 - **Database**: Supabase Cloud Free, project `mara-ai-prod`, Tokyo region
 - **Snapshots**: keep 3 max. `$0.06/GB/month`. Total cap ~$5/month.
 - **Auto-heal pipeline**: L3 (Restart) + L3.5 (Show patch) shipped Sessions 29 + 31. See `CLAUDE.md` and `docs/01_PROJECT/ROADMAP.md`.

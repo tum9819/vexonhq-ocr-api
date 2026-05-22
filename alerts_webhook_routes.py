@@ -23,7 +23,7 @@ Setup steps (one-time):
   6. Hit /alerts/test-telegram?secret=<your-secret> in browser — Telegram should
      receive a test message confirming setup works
   7. In Uptime Robot dashboard → Integrations → Webhooks → Add:
-       URL: https://b4zhad8qkoxjushdq8465056.../alerts/uptime-webhook?secret=<your-secret>
+       URL: https://api.marastation.com/alerts/uptime-webhook?secret=<your-secret>
        Method: POST
        Content-Type: application/x-www-form-urlencoded  (Uptime Robot default)
   8. Attach this integration to your /health monitor
@@ -152,7 +152,7 @@ async def uptime_webhook(request: Request, secret: str = Query("")):
         f"*Monitor:* {monitor_name}",
     ]
     if monitor_url:
-        # Escape underscores for Markdown (sslip.io URLs have many)
+        # Escape underscores for Markdown (defensive for URLs with snake_case path segments)
         safe_url = monitor_url.replace("_", "\\_")
         lines.append(f"*URL:* `{safe_url}`")
     if alert_details:

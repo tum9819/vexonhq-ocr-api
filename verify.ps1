@@ -45,7 +45,7 @@ if ($Smoke) {
     Write-Host "[2/2] Live smoke tests against deployed backend..." -ForegroundColor Yellow
 
     if (-not $env:BACKEND_URL) {
-        Write-Host "  BACKEND_URL not set - defaulting to production sslip.io URL" -ForegroundColor Gray
+        Write-Host "  BACKEND_URL not set - defaulting to https://api.marastation.com" -ForegroundColor Gray
     } else {
         Write-Host "  BACKEND_URL = $env:BACKEND_URL" -ForegroundColor Gray
     }

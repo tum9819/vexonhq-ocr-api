@@ -2,7 +2,7 @@
 
 FastAPI backend powering [VEXONHQ](https://github.com/tum9819/VEXONHQ) — a Thai SMB ops platform that runs invoice OCR, P&L, recipe costing, LINE bot, slip matching, and cashflow tooling for a music-bar / grill restaurant (Mara Station).
 
-Production deploys to DigitalOcean via Coolify auto-build on every push to `main`. Live URL: `https://b4zhad8qkoxjushdq8465056.178.128.31.76.sslip.io`
+Production deploys to DigitalOcean via Coolify auto-build on every push to `main`. Live URL: `https://api.marastation.com` (Session 32 migration). Previous sslip.io URL still resolves until Phase 4 cleanup retires it.
 
 ---
 

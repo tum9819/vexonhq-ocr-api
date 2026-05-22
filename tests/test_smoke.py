@@ -24,10 +24,11 @@ A 404 here = REGRESSION — the endpoint was deleted or renamed.
 Usage
 -----
     pip install pytest requests
-    $env:BACKEND_URL = "https://b4zhad8qkoxjushdq8465056.178.128.31.76.sslip.io"
+    $env:BACKEND_URL = "https://api.marastation.com"
     pytest tests/test_smoke.py -v
 
-If BACKEND_URL is unset, defaults to the production sslip.io URL above.
+If BACKEND_URL is unset, defaults to the production marastation.com URL above.
+(Session 32 migration — previous default was sslip.io fallback URL).
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ import requests
 
 BACKEND_URL = os.environ.get(
     "BACKEND_URL",
-    "https://b4zhad8qkoxjushdq8465056.178.128.31.76.sslip.io",
+    "https://api.marastation.com",
 ).rstrip("/")
 
 DEFAULT_TIMEOUT = 20  # seconds; live /health/deep can take ~1s + network
