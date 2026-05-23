@@ -187,4 +187,23 @@ if ing_id not in valid_ingredient_ids:
     continue
 ```
 
-*Last updated: Session 34, 2026-05-23.*
+**10. detect-only and other async endpoints must NOT call blocking I/O directly.** (Session 36, 2026-05-23)
+```python
+# ❌ BAD — blocks uvicorn event loop; server appears "ค้าง" for 10-30 s on large XLSXs
+@router.post("/detect-only")
+async def detect_only(file: UploadFile = File(...)):
+    content = await file.read()
+    _, rtype = read_and_detect(content, file.filename or "")  # pd.read_excel() × 3 in event loop
+
+# ✅ GOOD — moves blocking work to thread pool; event loop stays responsive
+import asyncio
+@router.post("/detect-only")
+async def detect_only(file: UploadFile = File(...)):
+    content = await file.read()
+    _, rtype = await asyncio.to_thread(read_and_detect, content, file.filename or "")
+```
+Rule: any `async def` endpoint that calls sync, CPU/IO-heavy functions (pandas, openpyxl, cv2, etc.)
+MUST use `asyncio.to_thread()` or `BackgroundTasks`. The actual import endpoint `/pos/import`
+already does this correctly via `background_tasks.add_task()`.
+
+*Last updated: Session 36, 2026-05-23.*

@@ -28,6 +28,7 @@ import uuid
 from datetime import date, datetime
 from typing import Any, Optional
 
+import asyncio
 import threading
 
 import pandas as pd
@@ -1029,12 +1030,18 @@ class ImportResponse(BaseModel):
 
 @router.post("/detect-only")
 async def detect_only(file: UploadFile = File(...)):
-    """Dry-run: detect report type without saving to DB."""
+    """Dry-run: detect report type without saving to DB.
+
+    asyncio.to_thread() moves the blocking pd.read_excel() work off the
+    uvicorn event loop so other requests stay responsive while a large file
+    (> 1 MB) is being parsed.  Previously this ran synchronously and blocked
+    the entire server for 10-30 s on large bill_detail XLSXs.
+    """
     content = await file.read()
     if not content:
         raise HTTPException(400, "Empty file")
     try:
-        _, rtype = read_and_detect(content, file.filename or "")
+        _, rtype = await asyncio.to_thread(read_and_detect, content, file.filename or "")
         return {"report_type": rtype, "filename": file.filename}
     except HTTPException:
         raise
