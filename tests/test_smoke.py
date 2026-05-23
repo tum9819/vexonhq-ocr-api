@@ -54,6 +54,9 @@ PUBLIC_ROUTES = [
     ("GET", "/health"),
     ("GET", "/health/deep"),
     ("GET", "/openapi.json"),
+    # Session 33 Item A_new — public menu data for marastation-web
+    # (no JWT; returns recipes with selling_price > 0)
+    ("GET", "/menu/public"),
 ]
 
 # ──────────────────────────────────────────────────────────

@@ -64,6 +64,7 @@ from supplier_routes import router as supplier_router
 from cashflow_routes import router as cashflow_router
 from stock_routes import router as stock_router
 from recipe_routes import router as recipe_router, ingredient_router
+from menu_public_routes import router as menu_public_router
 from tax_routes import router as tax_router
 from rules_routes import router as rules_router
 from slip_routes import router as slip_router
@@ -258,6 +259,7 @@ app.include_router(cashflow_router)
 app.include_router(stock_router)
 app.include_router(recipe_router)
 app.include_router(ingredient_router)
+app.include_router(menu_public_router)
 app.include_router(tax_router)
 app.include_router(alerts_router)
 app.include_router(discord_router)
@@ -276,7 +278,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse as StarletteJSONResponse
 
-PUBLIC_PATHS = {"/", "/health", "/health/deep", "/cron/health", "/auth/login", "/auth/logout", "/docs", "/openapi.json", "/redoc", "/ap/due-reminder", "/stock/alert", "/alerts/uptime-webhook", "/alerts/test-telegram", "/alerts/discord-interaction", "/alerts/discord-restart-test", "/line/webhook", "/snapshots/status", "/snapshots/auto-rotate"}
+PUBLIC_PATHS = {"/", "/health", "/health/deep", "/cron/health", "/auth/login", "/auth/logout", "/docs", "/openapi.json", "/redoc", "/ap/due-reminder", "/stock/alert", "/alerts/uptime-webhook", "/alerts/test-telegram", "/alerts/discord-interaction", "/alerts/discord-restart-test", "/line/webhook", "/snapshots/status", "/snapshots/auto-rotate", "/menu/public"}
 
 class JWTAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: StarletteRequest, call_next):

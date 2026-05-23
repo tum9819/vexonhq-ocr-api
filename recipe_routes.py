@@ -81,12 +81,18 @@ class RecipeCreate(BaseModel):
     selling_price: float = 0.0
     category: Optional[str] = None
     notes: Optional[str] = None
+    # Session 33 Item A_new — public-facing fields surfaced via /menu/public.
+    # NULL ↔ admin UI left blank → public site shows placeholder/empty.
+    description: Optional[str] = None
+    image_url: Optional[str] = None
 
 class RecipeUpdate(BaseModel):
     name: Optional[str] = None
     selling_price: Optional[float] = None
     category: Optional[str] = None
     notes: Optional[str] = None
+    description: Optional[str] = None
+    image_url: Optional[str] = None
 
 class RecipeIngredientAdd(BaseModel):
     ingredient_id: str
@@ -659,7 +665,8 @@ def list_recipes():
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT id, name, selling_price, category, notes, created_at
+                SELECT id, name, selling_price, category, notes,
+                       description, image_url, created_at
                 FROM public.recipes
                 ORDER BY category NULLS LAST, name
             """)
@@ -693,10 +700,14 @@ def create_recipe(body: RecipeCreate):
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO public.recipes (name, selling_price, category, notes)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO public.recipes
+                    (name, selling_price, category, notes, description, image_url)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 RETURNING id
-            """, (body.name, body.selling_price, body.category, body.notes))
+            """, (
+                body.name, body.selling_price, body.category, body.notes,
+                body.description, body.image_url,
+            ))
             new_id = cur.fetchone()[0]
         conn.commit()
         return {"id": str(new_id), "status": "created"}
@@ -745,7 +756,8 @@ def get_recipe(recipe_id: str):
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT id, name, selling_price, category, notes, created_at
+                SELECT id, name, selling_price, category, notes,
+                       description, image_url, created_at
                 FROM public.recipes WHERE id = %s
             """, (recipe_id,))
             row = cur.fetchone()
