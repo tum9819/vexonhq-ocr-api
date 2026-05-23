@@ -598,6 +598,149 @@ def sync_ingredient_prices_from_invoices(
         conn.close()
 
 
+def _auto_sync_ingredient_prices() -> dict:
+    """Apply price sync from all confirmed invoices for ingredients where
+    unit_cost_source='invoice'. Called non-fatally when a vendor bill is
+    confirmed — never overwrites prices TUM has entered manually."""
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH normalized_ii AS (
+                    SELECT
+                        ii.id,
+                        ii.product_name,
+                        ii.unit_price,
+                        ii.unit,
+                        vb.bill_date,
+                        regexp_replace(
+                            LOWER(TRIM(COALESCE(ii.product_name, ''))),
+                            '[[:space:]\\.,;:]+',
+                            '',
+                            'g'
+                        ) AS pname_norm
+                    FROM public.invoice_items ii
+                    JOIN public.vendor_bills vb ON vb.id = ii.vendor_bill_id
+                    WHERE vb.review_status = 'confirmed'
+                      AND ii.unit_price IS NOT NULL
+                      AND ii.unit_price > 0
+                ),
+                normalized_ing AS (
+                    SELECT
+                        i.id,
+                        i.name,
+                        i.unit,
+                        i.price_per_unit AS old_price,
+                        i.pack_size,
+                        i.invoice_unit,
+                        i.invoice_match_name,
+                        regexp_replace(
+                            LOWER(TRIM(COALESCE(i.invoice_match_name, i.name, ''))),
+                            '[[:space:]\\.,;:]+',
+                            '',
+                            'g'
+                        ) AS name_norm
+                    FROM public.ingredients i
+                    WHERE i.unit_cost_source = 'invoice'
+                ),
+                matched AS (
+                    SELECT DISTINCT ON (ing.id)
+                        ing.id               AS ingredient_id,
+                        ing.name             AS ingredient_name,
+                        ing.unit             AS ingredient_unit,
+                        ing.old_price        AS old_price,
+                        ing.pack_size        AS pack_size,
+                        ing.invoice_unit     AS expected_invoice_unit,
+                        ni.unit_price        AS raw_invoice_price,
+                        ni.unit              AS source_unit
+                    FROM normalized_ing ing
+                    JOIN normalized_ii ni ON (
+                        ni.pname_norm LIKE '%%' || ing.name_norm || '%%'
+                        OR ing.name_norm LIKE '%%' || ni.pname_norm || '%%'
+                    )
+                    WHERE length(ing.name_norm) >= 3
+                      AND length(ni.pname_norm) >= 3
+                      AND (
+                          LEAST(length(ing.name_norm), length(ni.pname_norm))::float
+                              / GREATEST(length(ing.name_norm), length(ni.pname_norm))::float >= 0.6
+                          OR LEAST(length(ing.name_norm), length(ni.pname_norm)) >= 6
+                      )
+                    ORDER BY ing.id,
+                        CASE WHEN ni.pname_norm = ing.name_norm THEN 100 ELSE 50 END DESC,
+                        ni.bill_date DESC NULLS LAST,
+                        ni.unit_price DESC
+                )
+                SELECT * FROM matched ORDER BY ingredient_name
+                """
+            )
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+
+            _UNIT_NORM: dict[str, str] = {
+                "each": "ชิ้น", "ea": "ชิ้น", "pc": "ชิ้น", "pcs": "ชิ้น",
+                "piece": "ชิ้น", "pieces": "ชิ้น", "unit": "ชิ้น",
+                "kilogram": "กก.", "kg": "กก.", "กิโล": "กก.", "กิโลกรัม": "กก.",
+                "gram": "กรัม", "g": "กรัม",
+            }
+
+            def _u(s: Optional[str]) -> str:
+                return (s or "").strip().lower()
+
+            def _unit_matches(a: str, b: str) -> bool:
+                if not a or not b:
+                    return False
+                na = _UNIT_NORM.get(a, a)
+                nb = _UNIT_NORM.get(b, b)
+                return na == nb or na in nb or nb in na
+
+            applied = 0
+            updated = []
+            for r in rows:
+                d = dict(zip(cols, r))
+                old_price = float(d["old_price"]) if d.get("old_price") is not None else None
+                raw_price = float(d["raw_invoice_price"])
+                pack_size = int(d.get("pack_size") or 1)
+                src_u = _u(d.get("source_unit"))
+                ing_u = _u(d.get("ingredient_unit"))
+                exp_u = _u(d.get("expected_invoice_unit"))
+
+                if _unit_matches(src_u, ing_u):
+                    new_price = raw_price
+                elif exp_u and _unit_matches(src_u, exp_u) and pack_size > 1:
+                    new_price = raw_price / pack_size
+                elif not src_u or not ing_u:
+                    new_price = raw_price
+                else:
+                    continue  # unit mismatch — skip
+
+                new_price = round(new_price, 2)
+                if old_price is not None and old_price > 0 and abs(old_price - new_price) <= 0.001:
+                    continue  # unchanged
+
+                cur.execute(
+                    """
+                    UPDATE public.ingredients
+                    SET price_per_unit   = %s,
+                        unit_cost_source = 'invoice',
+                        updated_at       = NOW()
+                    WHERE id = %s
+                    """,
+                    (new_price, d["ingredient_id"]),
+                )
+                updated.append({"name": d["ingredient_name"], "old": old_price, "new": new_price})
+                applied += 1
+
+            conn.commit()
+        log.info("auto-sync ingredient prices: applied=%d updates=%s", applied, updated)
+        return {"applied_count": applied, "updated": updated}
+    except Exception:
+        log.exception("auto-sync ingredient prices failed (non-fatal)")
+        return {"applied_count": 0, "updated": []}
+    finally:
+        conn.close()
+
+
 # ── Recipe Endpoints ─────────────────────────────────────────
 
 def _calc_cost(cur, recipe_id: str) -> dict:
@@ -1072,6 +1215,12 @@ qty_used = ปริมาณต่อ 1 จาน/แก้ว/ไม้ ใช
     applied = 0
     skipped = 0
     if apply:
+        # Guard: AI occasionally returns Thai text (e.g. "ไม่มี ID") instead
+        # of a real UUID when it can't find a match — causes psycopg2
+        # InvalidTextRepresentation on the INSERT. Validate against the known
+        # ingredient IDs fetched above; anything outside that set is silently
+        # skipped and counted as skipped.
+        valid_ingredient_ids = {i["id"] for i in all_ingredients}
         conn2 = get_db_conn()
         try:
             with conn2.cursor() as cur:
@@ -1079,6 +1228,10 @@ qty_used = ปริมาณต่อ 1 จาน/แก้ว/ไม้ ใช
                     ing_id = s.get("ingredient_id")
                     qty    = float(s.get("qty_used") or 0)
                     if not ing_id or qty <= 0:
+                        continue
+                    if ing_id not in valid_ingredient_ids:
+                        logger.warning("ai-link: skipping invalid ingredient_id %r for recipe %s", ing_id, recipe_id)
+                        skipped += 1
                         continue
                     if ing_id in already_linked:
                         skipped += 1

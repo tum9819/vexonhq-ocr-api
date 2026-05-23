@@ -63,7 +63,7 @@ from inventory_forecast_routes import router as inventory_forecast_router
 from supplier_routes import router as supplier_router
 from cashflow_routes import router as cashflow_router
 from stock_routes import router as stock_router
-from recipe_routes import router as recipe_router, ingredient_router
+from recipe_routes import router as recipe_router, ingredient_router, _auto_sync_ingredient_prices
 from menu_public_routes import router as menu_public_router
 from tax_routes import router as tax_router
 from rules_routes import router as rules_router
@@ -1491,10 +1491,17 @@ def invoice_confirm(
     except Exception:
         log.exception("invoice ↔ statement dedup failed (non-fatal) for %s", invoice_id)
 
+    sync_summary = None
+    try:
+        sync_summary = _auto_sync_ingredient_prices()
+    except Exception:
+        log.exception("auto-sync ingredient prices failed (non-fatal) for %s", invoice_id)
+
     return {
         "success": True,
         "invoice": resp.data[0],
         "statement_match": match_summary,
+        "ingredient_sync": sync_summary,
     }
 
 

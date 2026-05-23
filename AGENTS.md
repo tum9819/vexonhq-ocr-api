@@ -172,4 +172,19 @@ The best AGENTS.md grows from edge cases, not upfront planning.
 mistake the same rule would have prevented. Don't edit existing rules
 without TUM's explicit ask. Date the addition in the commit message.
 
-*Last updated: Session 31, 2026-05-21.*
+**9. ai-link-ingredients: AI may return Thai text as ingredient_id.** (Session 34, 2026-05-23)
+```python
+# Claude Haiku occasionally returns "ไม่มี ID ต้นประกอบ" or similar Thai text
+# instead of a valid UUID when it cannot find a matching ingredient.
+# Inserting that text into recipe_ingredients (UUID column) causes:
+#   psycopg2.errors.InvalidTextRepresentation: invalid input syntax for type uuid
+# Fix: build valid_ingredient_ids set from all_ingredients before the apply loop;
+# skip + log.warning any ingredient_id not in that set.
+valid_ingredient_ids = {i["id"] for i in all_ingredients}
+if ing_id not in valid_ingredient_ids:
+    logger.warning("ai-link: skipping invalid ingredient_id %r", ing_id)
+    skipped += 1
+    continue
+```
+
+*Last updated: Session 34, 2026-05-23.*
