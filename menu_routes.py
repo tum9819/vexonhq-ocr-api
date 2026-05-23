@@ -4212,6 +4212,12 @@ _PREP_DISPLAY_ORDER = [
     "สิงห์", "ช้าง", "อาซาฮี", "โซดา", "น้ำเปล่า", "น้ำแข็ง",
 ]
 
+# Modifier / note items that should not appear in the prep sub-list
+_PREP_SKIP_ITEM_NAMES = {
+    "ไม่รับช้อนส้อมพลาสติก",
+    "แก้วแข็ง",
+}
+
 
 def _prep_classify_item(item_name: str, category: str) -> tuple[str | None, int]:
     """Return (group_key, multiplier). None = skip."""
@@ -4345,7 +4351,8 @@ def pos_prep_forecast(
         dow_totals[dow][group] += qty
         if group in ("เสียบไม้", "อาหาร"):
             iname = r.get("item_name") or "ไม่ระบุ"
-            item_detail_raw[dow][f"{group}::{iname}"] += qty
+            if iname not in _PREP_SKIP_ITEM_NAMES:
+                item_detail_raw[dow][f"{group}::{iname}"] += qty
 
     dow_avg: dict[int, dict[str, float]] = {}
     for dow, groups in dow_totals.items():
