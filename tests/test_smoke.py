@@ -96,6 +96,7 @@ AUTHED_ROUTES = [
     ("GET", "/pos/voids"),
     ("GET", "/pos/discounts"),
     ("GET", "/pos/overview"),
+    ("GET", "/pos/prep-forecast"),
 
     # Inventory — Phase 32 regression zone
     ("GET", "/inventory/forecast"),
