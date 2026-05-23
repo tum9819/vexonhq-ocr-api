@@ -78,8 +78,10 @@ from auto_diagnose import try_diagnose
 # (Phase 1 uses supabase client for OCR flows — this is for high-volume
 #  executemany() inserts that need raw PG driver)
 
+import psutil
 import psycopg2
 import psycopg2.extensions
+from line_bot_routes import _scheduler as _line_scheduler
 
 # ────────────────────────────────────────────────────────────
 # Slow-query watcher (P2.2)
@@ -478,6 +480,26 @@ def health_deep(background_tasks: BackgroundTasks):
     checks["telegram_configured"] = bool(
         os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID")
     )
+
+    # 4) VPS resource usage (psutil — zero I/O, ~1ms)
+    try:
+        ram = psutil.virtual_memory()
+        checks["resources"] = {
+            "ram_pct": round(ram.percent, 1),
+            "cpu_pct": round(psutil.cpu_percent(interval=0.1), 1),
+            "ram_warn": ram.percent >= 70,
+        }
+    except Exception:
+        checks["resources"] = {"ram_pct": None, "cpu_pct": None, "ram_warn": False}
+
+    # 5) APScheduler liveness (confirms cron jobs are still registered)
+    try:
+        checks["scheduler"] = {
+            "running": _line_scheduler.running,
+            "job_count": len(_line_scheduler.get_jobs()),
+        }
+    except Exception:
+        checks["scheduler"] = {"running": False, "job_count": 0}
 
     # Decide overall status + HTTP code
     if not db_ok:
