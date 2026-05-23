@@ -4333,6 +4333,7 @@ def pos_prep_forecast(
 
     # ── Build DOW group averages ──────────────────────────────────────────
     dow_totals: dict[int, dict[str, float]] = _dd(lambda: _dd(float))
+    item_detail_raw: dict[int, dict[str, float]] = _dd(lambda: _dd(float))
     total_days_with_data = sum(day_count_by_dow.values())
 
     for r in item_rows:
@@ -4340,12 +4341,21 @@ def pos_prep_forecast(
         group, mult = _prep_classify_item(r.get("item_name") or "", r.get("category") or "")
         if group is None:
             continue
-        dow_totals[dow][group] += float(r.get("total_qty") or 0) * mult
+        qty = float(r.get("total_qty") or 0) * mult
+        dow_totals[dow][group] += qty
+        if group in ("เสียบไม้", "อาหาร"):
+            iname = r.get("item_name") or "ไม่ระบุ"
+            item_detail_raw[dow][f"{group}::{iname}"] += qty
 
     dow_avg: dict[int, dict[str, float]] = {}
     for dow, groups in dow_totals.items():
         n = max(day_count_by_dow.get(dow, 1), 1)
         dow_avg[dow] = {g: v / n for g, v in groups.items()}
+
+    item_detail_avg: dict[int, dict[str, float]] = {}
+    for dow, items in item_detail_raw.items():
+        n = max(day_count_by_dow.get(dow, 1), 1)
+        item_detail_avg[dow] = {k: v / n for k, v in items.items()}
 
     # ── Helper: build one day dict ────────────────────────────────────────
     def _day_dict(target_date: date, groups: dict[str, float], forecast: bool) -> dict:
@@ -4406,6 +4416,26 @@ def pos_prep_forecast(
     else:
         peak_day = {}
 
+    # ── Per-item detail (sum avg across 7 forecast days) ─────────────────
+    item_detail_week: dict[str, dict[str, float]] = {
+        "เสียบไม้": _dd(float), "อาหาร": _dd(float),
+    }
+    for i in range(7):
+        d      = today + timedelta(days=i)
+        dow_pg = (d.weekday() + 1) % 7
+        for composite_key, avg_qty in item_detail_avg.get(dow_pg, {}).items():
+            grp, iname = composite_key.split("::", 1)
+            item_detail_week[grp][iname] += avg_qty
+
+    item_detail: dict[str, list] = {}
+    for grp, unit in (("เสียบไม้", "ไม้"), ("อาหาร", "จาน")):
+        item_detail[grp] = sorted(
+            [{"item": k, "qty": round(v), "unit": unit}
+             for k, v in item_detail_week[grp].items() if v >= 0.5],
+            key=lambda x: x["qty"],
+            reverse=True,
+        )
+
     # ── Prep list ─────────────────────────────────────────────────────────
     prep_totals: dict[str, float] = _dd(float)
     for day in next_7_days:
@@ -4434,4 +4464,5 @@ def pos_prep_forecast(
         "next_7_days":    next_7_days,
         "prep_list":      prep_list,
         "peak_day":       peak_day,
+        "item_detail":    item_detail,
     }
