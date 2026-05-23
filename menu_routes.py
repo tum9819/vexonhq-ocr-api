@@ -4188,77 +4188,69 @@ def pos_shifts(
 
 
 # ─────────────────────────────────────────────────────────
-# Phase 68 — AI Prep Forecast
+# Phase 68 — AI Prep Forecast (v2: 3 groups)
 # GET /pos/prep-forecast
-# แนะนำจำนวนเนื้อสัตว์/ผัก/เครื่องดื่มที่ต้องเตรียมสำหรับ 7 วันข้างหน้า
-# โดยคำนวณจาก DOW average ย้อนหลัง N สัปดาห์
+# 3 กลุ่ม: เสียบไม้ / อาหาร / เครื่องดื่ม
 # ─────────────────────────────────────────────────────────
 
-_PREP_MEAT_CATS  = {"เมนูหม่าล่า เนื้อสัตว์"}
-_PREP_VEG_CATS   = {"เมนูหม่าล่า ผัก"}
-_PREP_DRINK_CAT  = "เครื่องดื่ม"
-_PREP_ALL_CATS   = _PREP_MEAT_CATS | _PREP_VEG_CATS | {_PREP_DRINK_CAT}
+_PREP_SKEWER_CATS = {"เมนูหม่าล่า เนื้อสัตว์", "เมนูหม่าล่า ผัก"}
+_PREP_DRINK_CATS  = {
+    "เครื่องดื่ม",
+    "Pro beer ก่อน 2 ทุ่ม 🍻",
+    "โปรเบียร์ สิงห์รีเสริ์ฟ 2 ขวด 100",
+    "โปร ยกลัง ✅",
+}
 
-_PREP_CASE_SIZES = {"สิงห์": 12, "ช้าง": 12, "อาซาฮี": 12, "โซดา": 24}
+_PREP_CASE_SIZES  = {"สิงห์": 12, "ช้าง": 12, "อาซาฮี": 12, "โซดา": 24}
 _PREP_DRINK_UNITS = {"น้ำเปล่า": "ขวด", "น้ำแข็ง": "ถัง"}
 
 # Sunday-based full day labels (matching Postgres EXTRACT DOW: Sun=0)
 _PREP_DOW_FULL = ["อาทิตย์", "จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์"]
 
-# Order for prep_list output
 _PREP_DISPLAY_ORDER = [
-    "หมู", "ไก่", "เนื้อวัว", "อื่นๆ_เนื้อ", "ผัก",
+    "เสียบไม้", "อาหาร",
     "สิงห์", "ช้าง", "อาซาฮี", "โซดา", "น้ำเปล่า", "น้ำแข็ง",
 ]
 
 
 def _prep_classify_item(item_name: str, category: str) -> tuple[str | None, int]:
-    """Return (group_key, bottle_multiplier). None = skip this item."""
+    """Return (group_key, multiplier). None = skip."""
     name = item_name or ""
     cat  = category or ""
 
-    # Pro pack multiplier — detect BEFORE keyword matching (name contains both)
-    mult = 5 if "5ขวด" in name else 3 if "3ขวด" in name else 1
+    if cat in _PREP_SKEWER_CATS:
+        return ("เสียบไม้", 1)
 
-    if cat in _PREP_MEAT_CATS:
-        if "หมู"   in name: return ("หมู",        1)
-        if "ไก่"   in name: return ("ไก่",        1)
-        if "เนื้อ" in name: return ("เนื้อวัว",   1)
-        return ("อื่นๆ_เนื้อ", 1)
-
-    if cat in _PREP_VEG_CATS:
-        return ("ผัก", 1)
-
-    if cat == _PREP_DRINK_CAT:
+    if cat in _PREP_DRINK_CATS:
+        mult = 5 if "5ขวด" in name else 3 if "3ขวด" in name else 1
         if "สิงห์"    in name: return ("สิงห์",    mult)
         if "ช้าง"     in name: return ("ช้าง",     mult)
         if "อาซาฮี"  in name: return ("อาซาฮี",   mult)
         if "โซดา"    in name: return ("โซดา",     1)
         if "น้ำเปล่า" in name: return ("น้ำเปล่า", 1)
         if "น้ำแข็ง"  in name: return ("น้ำแข็ง",  1)
+        return (None, 1)  # drink promo ที่จำแนกไม่ได้ — skip
 
-    return (None, 1)
+    # ทุกอย่างที่เหลือ = อาหาร (เมนูอาหาร, อาหารจานเดียว, อื่นๆ, null)
+    return ("อาหาร", 1)
 
 
 def _prep_to_entry(group: str, total_units: float) -> dict:
-    """Convert raw unit total to prep_list entry with display string."""
     qty_raw   = round(total_units)
     case_size = _PREP_CASE_SIZES.get(group)
     if case_size:
         cases = max(1, round(total_units / case_size)) if total_units > 0 else 0
-        return {
-            "item":      group,
-            "unit":      "ลัง",
-            "total_qty": cases,
-            "display":   f"{cases} ลัง ({qty_raw} ขวด)",
-        }
+        return {"item": group, "unit": "ลัง", "total_qty": cases,
+                "display": f"{cases} ลัง ({qty_raw} ขวด)"}
+    if group == "เสียบไม้":
+        return {"item": group, "unit": "ไม้", "total_qty": qty_raw,
+                "display": f"{qty_raw:,} ไม้"}
+    if group == "อาหาร":
+        return {"item": group, "unit": "จาน", "total_qty": qty_raw,
+                "display": f"{qty_raw:,} จาน"}
     unit = _PREP_DRINK_UNITS.get(group, "ไม้")
-    return {
-        "item":      group,
-        "unit":      unit,
-        "total_qty": qty_raw,
-        "display":   f"{qty_raw} {unit}",
-    }
+    return {"item": group, "unit": unit, "total_qty": qty_raw,
+            "display": f"{qty_raw} {unit}"}
 
 
 @router.get("/pos/prep-forecast")
@@ -4275,7 +4267,7 @@ def pos_prep_forecast(
     try:
         with conn.cursor() as cur:
 
-            # ── 1. DOW item totals (raw, not averaged yet) ────────────────
+            # ── 1. DOW item totals (all categories — no filter) ───────────
             cur.execute(
                 """
                 SELECT
@@ -4288,15 +4280,14 @@ def pos_prep_forecast(
                 WHERE pb.branch_code = %s
                   AND pb.sales_date  >= %s
                   AND pb.bill_net    >  0
-                  AND psi.category   = ANY(%s)
                 GROUP BY dow, psi.category, psi.item_name
                 ORDER BY dow
                 """,
-                (branch, cutoff, list(_PREP_ALL_CATS)),
+                (branch, cutoff),
             )
             item_rows = _rows_to_dicts(cur)
 
-            # ── 2. DOW day counts (how many of each weekday in the window) ─
+            # ── 2. DOW day counts ─────────────────────────────────────────
             cur.execute(
                 """
                 SELECT
@@ -4330,11 +4321,10 @@ def pos_prep_forecast(
                 WHERE pb.branch_code = %s
                   AND pb.sales_date  BETWEEN %s AND %s
                   AND pb.bill_net    >  0
-                  AND psi.category   = ANY(%s)
                 GROUP BY pb.sales_date, psi.category, psi.item_name
                 ORDER BY pb.sales_date
                 """,
-                (branch, hist_start, hist_end, list(_PREP_ALL_CATS)),
+                (branch, hist_start, hist_end),
             )
             hist_rows = _rows_to_dicts(cur)
 
@@ -4343,18 +4333,15 @@ def pos_prep_forecast(
 
     # ── Build DOW group averages ──────────────────────────────────────────
     dow_totals: dict[int, dict[str, float]] = _dd(lambda: _dd(float))
-
     total_days_with_data = sum(day_count_by_dow.values())
 
     for r in item_rows:
-        dow               = int(r["dow"])
-        group, mult       = _prep_classify_item(r.get("item_name") or "", r.get("category") or "")
+        dow         = int(r["dow"])
+        group, mult = _prep_classify_item(r.get("item_name") or "", r.get("category") or "")
         if group is None:
             continue
-        qty = float(r.get("total_qty") or 0)
-        dow_totals[dow][group] += qty * mult
+        dow_totals[dow][group] += float(r.get("total_qty") or 0) * mult
 
-    # avg per occurrence day = total / how many of that weekday in window
     dow_avg: dict[int, dict[str, float]] = {}
     for dow, groups in dow_totals.items():
         n = max(day_count_by_dow.get(dow, 1), 1)
@@ -4364,12 +4351,6 @@ def pos_prep_forecast(
     def _day_dict(target_date: date, groups: dict[str, float], forecast: bool) -> dict:
         # Python weekday: Mon=0 Sun=6 → Postgres DOW: Sun=0 Mon=1
         dow_pg = (target_date.weekday() + 1) % 7
-        meat = {
-            "หมู":        round(groups.get("หมู",        0)),
-            "ไก่":        round(groups.get("ไก่",        0)),
-            "เนื้อวัว":   round(groups.get("เนื้อวัว",   0)),
-            "อื่นๆ_เนื้อ": round(groups.get("อื่นๆ_เนื้อ", 0)),
-        }
         drinks = {
             "สิงห์_ขวด":    round(groups.get("สิงห์",    0)),
             "ช้าง_ขวด":     round(groups.get("ช้าง",     0)),
@@ -4381,8 +4362,8 @@ def pos_prep_forecast(
         d: dict = {
             "date":      target_date.isoformat(),
             "dow_label": _PREP_DOW_FULL[dow_pg],
-            "meat":      meat,
-            "ผัก":       round(groups.get("ผัก", 0)),
+            "เสียบไม้":  round(groups.get("เสียบไม้", 0)),
+            "อาหาร":     round(groups.get("อาหาร",    0)),
             "drinks":    drinks,
         }
         if forecast:
@@ -4398,23 +4379,24 @@ def pos_prep_forecast(
         hist_by_date[r["sales_date"]][group] += float(r.get("total_qty") or 0) * mult
 
     last_7_days = [
-        _day_dict(today - timedelta(days=i), hist_by_date.get((today - timedelta(days=i)).isoformat(), {}), False)
+        _day_dict(today - timedelta(days=i),
+                  hist_by_date.get((today - timedelta(days=i)).isoformat(), {}), False)
         for i in range(7, 0, -1)
     ]
 
     # ── Next 7 days (forecast) ────────────────────────────────────────────
     next_7_days = []
     for i in range(7):
-        d       = today + timedelta(days=i)
-        dow_pg  = (d.weekday() + 1) % 7
-        groups  = dow_avg.get(dow_pg, {})
+        d      = today + timedelta(days=i)
+        dow_pg = (d.weekday() + 1) % 7
+        groups = dow_avg.get(dow_pg, {})
         next_7_days.append(_day_dict(d, groups, True))
 
-    # Mark peak day by total meat + veg qty
+    # Peak day = highest เสียบไม้ + อาหาร
     if next_7_days:
         peak_idx = max(
             range(len(next_7_days)),
-            key=lambda i: sum(next_7_days[i]["meat"].values()) + next_7_days[i]["ผัก"],
+            key=lambda i: next_7_days[i]["เสียบไม้"] + next_7_days[i]["อาหาร"],
         )
         next_7_days[peak_idx]["is_peak_day"] = True
         peak_day = {
@@ -4424,12 +4406,11 @@ def pos_prep_forecast(
     else:
         peak_day = {}
 
-    # ── Prep list (sum next 7 days → convert units) ───────────────────────
+    # ── Prep list ─────────────────────────────────────────────────────────
     prep_totals: dict[str, float] = _dd(float)
     for day in next_7_days:
-        for k in ["หมู", "ไก่", "เนื้อวัว", "อื่นๆ_เนื้อ"]:
-            prep_totals[k] += day["meat"].get(k, 0)
-        prep_totals["ผัก"]     += day.get("ผัก", 0)
+        prep_totals["เสียบไม้"] += day["เสียบไม้"]
+        prep_totals["อาหาร"]    += day["อาหาร"]
         dr = day["drinks"]
         prep_totals["สิงห์"]    += dr.get("สิงห์_ขวด",    0)
         prep_totals["ช้าง"]     += dr.get("ช้าง_ขวด",     0)
