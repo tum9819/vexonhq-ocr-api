@@ -34,10 +34,17 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import psycopg2
 import jwt
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+
+try:
+    from main import get_db_conn  # type: ignore[import]
+except ImportError:
+    def get_db_conn():  # type: ignore[misc]
+        return psycopg2.connect(os.environ["DATABASE_URL"])
 
 log = logging.getLogger("auth_routes")
 
@@ -61,6 +68,21 @@ VEXON_HASH = os.environ.get(
     "pbkdf2:sha256:260000:3aca8935884bee634378925756665515:Z5xUmbAylUBocnq4FchR1f2nfYGeK1WfIPfe62qSvPs="
 )
 # Default password: mara2026  (override via VEXON_HASH env var in Coolify)
+
+# ── Role config ───────────────────────────────────────────────────────────────
+# Comma-separated usernames that get role="admin" in their JWT.
+# Default includes the legacy single-user "vexonhq" and "tum".
+# Override in Coolify: VEXON_ADMINS=tum,vexonhq,manager
+_ADMIN_USERNAMES: frozenset[str] = frozenset(
+    x.strip().lower()
+    for x in os.environ.get("VEXON_ADMINS", "tum,vexonhq").split(",")
+    if x.strip()
+)
+
+
+def _get_role(username: str) -> str:
+    """Return 'admin' or 'user' for a given username (case-insensitive)."""
+    return "admin" if username.strip().lower() in _ADMIN_USERNAMES else "user"
 
 
 def _load_users() -> dict[str, str]:
@@ -142,9 +164,11 @@ def _hash_password(plain: str) -> str:
 # ─────────────────────────────────────────────────────────
 
 def create_token(username: str) -> str:
+    role = _get_role(username)
     now = datetime.now(timezone.utc)
     payload = {
         "sub": username,
+        "role": role,
         "iat": now,
         "exp": now + timedelta(hours=JWT_EXPIRE_HOURS),
     }
@@ -187,6 +211,11 @@ def _check_rate_limit(ip: str) -> bool:
 class LoginRequest(BaseModel):
     username: str
     password: str
+
+
+class PageConfigUpdate(BaseModel):
+    page_href: str
+    user_visible: bool
 
 
 # ─────────────────────────────────────────────────────────
@@ -267,6 +296,7 @@ def get_me(request: Request):
 
     return {
         "username": payload.get("sub"),
+        "role": payload.get("role", "user"),
         "expires_at": payload.get("exp"),
     }
 
@@ -278,3 +308,78 @@ def logout():
     Client should delete the stored JWT token.
     """
     return {"detail": "Logged out successfully. Please remove your token."}
+
+
+def _require_admin_role(request: Request) -> dict:
+    """Decode JWT from request and raise 403 if not admin. Returns payload."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    payload = verify_token(auth_header[7:])
+    if not payload:
+        raise HTTPException(status_code=401, detail="Token expired or invalid")
+    if payload.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return payload
+
+
+@router.get("/page-config")
+def get_page_config(request: Request):
+    """
+    Return page visibility config for the authenticated user.
+
+    Admin: returns role='admin' with empty pages dict (frontend shows everything).
+    User:  returns role='user' with dict of {page_href: bool} from user_page_config.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    payload = verify_token(auth_header[7:])
+    if not payload:
+        raise HTTPException(status_code=401, detail="Token expired or invalid")
+
+    role = payload.get("role", "user")
+
+    if role == "admin":
+        # Admin sees everything — no need to send full page list
+        return {"role": "admin", "pages": {}}
+
+    # For users, load visibility from DB
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT page_href, user_visible FROM public.user_page_config ORDER BY sort_order"
+            )
+            pages = {row[0]: bool(row[1]) for row in cur.fetchall()}
+        return {"role": "user", "pages": pages}
+    finally:
+        conn.close()
+
+
+@router.post("/page-config")
+def update_page_config(body: PageConfigUpdate, request: Request):
+    """
+    Update visibility for a single page (admin only).
+
+    Body: { "page_href": "/cashflow", "user_visible": true }
+    """
+    _require_admin_role(request)
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.user_page_config (page_href, page_label, user_visible, updated_at)
+                VALUES (%s, %s, %s, now())
+                ON CONFLICT (page_href) DO UPDATE
+                  SET user_visible = EXCLUDED.user_visible,
+                      updated_at   = now()
+                """,
+                (body.page_href, body.page_href, body.user_visible),
+            )
+        conn.commit()
+        return {"ok": True, "page_href": body.page_href, "user_visible": body.user_visible}
+    finally:
+        conn.close()
