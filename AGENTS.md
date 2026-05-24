@@ -32,7 +32,7 @@ uvicorn main:app --reload --port 8000
 python -c "import ast; ast.parse(open('<file>.py', encoding='utf-8').read())"   # per-file
 pytest tests/test_<feature>.py -v                                                # if tests exist
 .\verify.ps1            # compileall on every .py (~2 s)
-.\verify.ps1 -Smoke     # + live 57-route smoke against deployed backend
+.\verify.ps1 -Smoke     # + live 63-route smoke against deployed backend (as of Session 40)
 
 # Backup tag before any change to main
 git fetch origin
@@ -77,6 +77,7 @@ WHERE table_schema='public' AND table_name='<table>' ORDER BY ordinal_position;
 - Database schema changes (write idempotent migration, commit to repo before applying)
 - Touching `line_bot_routes.py`, `alerts_webhook_routes.py`, or scheduler files (coordination zone with other-Claude worktrees)
 - Anything that requires a new Coolify env var (instruct TUM, don't paste secret in chat)
+- Modifying `_ADMIN_USERNAMES` logic or `_get_role()` in `auth_routes.py` — affects all user access
 
 ### 🚫 Never do
 - `git push` — TUM pushes from his own PowerShell, always
