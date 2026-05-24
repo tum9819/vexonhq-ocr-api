@@ -144,6 +144,9 @@ AUTHED_ROUTES = [
 
     # Auth
     ("GET", "/auth/me"),
+    # Session 40 RBAC — page-config endpoints
+    ("GET", "/auth/page-config"),
+    ("POST", "/auth/page-config"),   # POST without auth = 401 (route exists)
 
     # LINE bot diagnostics (now authed after Session 24 task O narrowed
     # the middleware prefix — only /line/webhook stays public for LINE
