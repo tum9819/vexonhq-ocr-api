@@ -153,12 +153,17 @@ class TestWF1Auth:
         )
 
     def test_auth_me_returns_correct_role(self, http, auth_headers):
-        """/auth/me returns username and role=admin."""
+        """/auth/me returns user identifier and role=admin.
+
+        Accepts either 'username' or 'sub' as the user identifier field
+        (Session 40 changed /auth/me to return 'sub' instead of 'username').
+        """
         r = _get(http, "/auth/me", headers=auth_headers)
         assert r.status_code == 200, f"/auth/me failed: {r.status_code} {r.text[:200]}"
         data = r.json()
         assert data.get("role") == "admin", f"/auth/me role mismatch: {data}"
-        assert "username" in data, f"/auth/me missing 'username': {data}"
+        user_id = data.get("username") or data.get("sub")
+        assert user_id, f"/auth/me missing user identifier (username or sub): {data}"
 
     def test_wrong_password_is_rejected(self, http):
         """Wrong password must return 401 — not crash or accept."""
