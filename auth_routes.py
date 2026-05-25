@@ -155,7 +155,7 @@ def _get_supabase_jwks_client() -> Optional[object]:
         return None
     try:
         from jwt import PyJWKClient  # PyJWT >= 2.4
-        jwks_url = SUPABASE_URL.rstrip("/") + "/.well-known/jwks.json"
+        jwks_url = SUPABASE_URL.rstrip("/") + "/auth/v1/.well-known/jwks.json"
         _supabase_jwks_client = PyJWKClient(jwks_url, cache_keys=True)
         log.info("Supabase JWKS client initialised: %s", jwks_url)
     except Exception as exc:
