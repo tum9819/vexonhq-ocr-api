@@ -200,6 +200,11 @@ def verify_token(token: str) -> Optional[dict]:
     # Path 1: Supabase Auth tokens (future SSO)
     if SUPABASE_JWT_SECRET:
         try:
+            _hdr = jwt.get_unverified_header(token)
+            log.warning("verify_token: JWT header alg=%s kid=%s", _hdr.get("alg"), _hdr.get("kid"))
+        except Exception as _he:
+            log.warning("verify_token: cannot read JWT header: %s", _he)
+        try:
             payload = jwt.decode(
                 token,
                 SUPABASE_JWT_SECRET,
