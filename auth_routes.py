@@ -58,6 +58,10 @@ JWT_SECRET = os.environ.get(
     "JWT_SECRET",
     "vexonhq-change-this-secret-key-in-production-please"
 )
+# Supabase JWT Secret — from Supabase → Settings → API → JWT Secret.
+# Used to verify JWTs issued by Supabase Auth after SSO migration.
+# Keep secret: never use NEXT_PUBLIC_ prefix, never log it.
+SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = 8
 
@@ -176,9 +180,31 @@ def create_token(username: str) -> str:
 
 
 def verify_token(token: str) -> Optional[dict]:
-    """Return payload dict or None if invalid/expired."""
+    """
+    Verify a Supabase JWT and return the normalized payload, or None.
+
+    Decodes using SUPABASE_JWT_SECRET with audience="authenticated" (set by
+    Supabase on every token). Adds a synthetic '_role' key with the role
+    string from app_metadata so all callers can do payload['_role'] without
+    re-extracting the nested field.
+
+    Returns None on any verification failure (expired, wrong audience,
+    wrong secret, malformed). Never raises.
+    """
+    if not SUPABASE_JWT_SECRET:
+        log.error("verify_token: SUPABASE_JWT_SECRET is not set — rejecting all tokens")
+        return None
     try:
-        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(
+            token,
+            SUPABASE_JWT_SECRET,
+            algorithms=[JWT_ALGORITHM],
+            audience="authenticated",
+        )
+        # Normalize role into a top-level key for convenience
+        app_meta = payload.get("app_metadata") or {}
+        payload["_role"] = app_meta.get("role", "staff")
+        return payload
     except jwt.ExpiredSignatureError:
         return None
     except jwt.InvalidTokenError:
