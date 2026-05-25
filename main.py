@@ -81,6 +81,9 @@ from auto_diagnose import try_diagnose
 import psutil
 import psycopg2
 import psycopg2.extensions
+import sentry_sdk
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+from sentry_sdk.integrations.starlette import StarletteIntegration
 from line_bot_routes import _scheduler as _line_scheduler
 
 # ────────────────────────────────────────────────────────────
@@ -236,23 +239,22 @@ def get_openai() -> OpenAI:
 # Init before app creation so FastApiIntegration captures all routes.
 # Set SENTRY_DSN env var in Coolify to enable. No-ops if DSN is unset.
 # ============================================================
-import sentry_sdk
-from sentry_sdk.integrations.fastapi import FastApiIntegration
-from sentry_sdk.integrations.starlette import StarletteIntegration
-
 _sentry_dsn = os.environ.get("SENTRY_DSN")
 if _sentry_dsn:
-    sentry_sdk.init(
-        dsn=_sentry_dsn,
-        environment=os.environ.get("ENVIRONMENT", "production"),
-        traces_sample_rate=0.1,
-        send_default_pii=False,
-        integrations=[
-            FastApiIntegration(),
-            StarletteIntegration(),
-        ],
-    )
-    log.info("Sentry initialised (DSN configured)")
+    try:
+        sentry_sdk.init(
+            dsn=_sentry_dsn,
+            environment=os.environ.get("ENVIRONMENT", "production"),
+            traces_sample_rate=0.1,
+            send_default_pii=False,
+            integrations=[
+                FastApiIntegration(),
+                StarletteIntegration(),
+            ],
+        )
+        log.info("Sentry initialised (DSN configured)")
+    except Exception as exc:
+        log.warning("Sentry init failed — running without error tracking: %s", exc)
 else:
     log.info("Sentry disabled — SENTRY_DSN not set")
 
@@ -352,7 +354,7 @@ class JWTAuthMiddleware(BaseHTTPMiddleware):
 
         # Attach user to Sentry events for this request
         if _sentry_dsn and request.state.username:
-            sentry_sdk.set_user({"username": request.state.username})
+            sentry_sdk.set_user({"id": request.state.username})
 
         return await call_next(request)
 
