@@ -13,7 +13,7 @@ Setup (ทำใน PowerShell ก่อน run):
     $env:VEXONHQ_TEST_PASS = "รหัสผ่าน_ของ_tum"    # ห้ามใส่ใน chat
 
 Optional overrides:
-    $env:VEXONHQ_TEST_USER = "tum"                  # default "tum"
+    $env:VEXONHQ_TEST_USER = "vexonhq"              # default "vexonhq"
     $env:BACKEND_URL = "https://api.marastation.com" # default ↑
 
 Run:
@@ -37,7 +37,7 @@ import requests
 # Config
 # ─────────────────────────────────────────────────────────────────
 BACKEND_URL = os.environ.get("BACKEND_URL", "https://api.marastation.com").rstrip("/")
-TEST_USER   = os.environ.get("VEXONHQ_TEST_USER", "tum")
+TEST_USER   = os.environ.get("VEXONHQ_TEST_USER", "vexonhq")
 TEST_PASS   = os.environ.get("VEXONHQ_TEST_PASS", "")
 
 _NO_CREDS_MSG = (
@@ -60,20 +60,43 @@ def http():
 
 @pytest.fixture(scope="session")
 def admin_token(http):
-    """Login and return access_token. Skip all if password not set."""
+    """Login and return access_token. Skip all if password not set.
+
+    Retries up to 3x with 5s backoff to handle Coolify redeploy windows
+    (502/503 during the ~30s deploy). Without retry, one failed login causes
+    all auth-dependent tests to ERROR rather than skip or fail cleanly.
+    """
     if not TEST_PASS:
         pytest.skip(_NO_CREDS_MSG)
-    r = http.post(
-        f"{BACKEND_URL}/auth/login",
-        json={"username": TEST_USER, "password": TEST_PASS},
-        timeout=DEFAULT_TIMEOUT,
+
+    import requests as _req
+
+    last_err: str = ""
+    for attempt in range(3):
+        try:
+            r = http.post(
+                f"{BACKEND_URL}/auth/login",
+                json={"username": TEST_USER, "password": TEST_PASS},
+                timeout=DEFAULT_TIMEOUT,
+            )
+            if r.status_code in (502, 503, 504):
+                last_err = f"Backend unavailable ({r.status_code}) on attempt {attempt + 1}/3"
+                time.sleep(5)
+                continue
+            assert r.status_code == 200, (
+                f"WF-1 Login failed ({r.status_code}): {r.text[:300]}"
+            )
+            data = r.json()
+            assert "access_token" in data, f"No access_token in login response: {data}"
+            return data["access_token"]
+        except _req.exceptions.ConnectionError as exc:
+            last_err = f"ConnectionError on attempt {attempt + 1}/3: {exc}"
+            time.sleep(5)
+
+    pytest.fail(
+        f"Could not login after 3 attempts (backend may still be deploying). "
+        f"Last error: {last_err}"
     )
-    assert r.status_code == 200, (
-        f"WF-1 Login failed ({r.status_code}): {r.text[:300]}"
-    )
-    data = r.json()
-    assert "access_token" in data, f"No access_token in login response: {data}"
-    return data["access_token"]
 
 
 @pytest.fixture(scope="session")
