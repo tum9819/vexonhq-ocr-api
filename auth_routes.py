@@ -321,8 +321,9 @@ def get_me(request: Request):
         raise HTTPException(status_code=401, detail="Token expired or invalid")
 
     return {
-        "username": payload.get("sub"),
-        "role": payload.get("role", "user"),
+        "sub": payload.get("sub"),
+        "email": payload.get("email"),
+        "role": payload.get("_role", "staff"),
         "expires_at": payload.get("exp"),
     }
 
@@ -344,7 +345,7 @@ def _require_admin_role(request: Request) -> dict:
     payload = verify_token(auth_header[7:])
     if not payload:
         raise HTTPException(status_code=401, detail="Token expired or invalid")
-    if payload.get("role") != "admin":
+    if payload.get("_role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     return payload
 
@@ -364,7 +365,7 @@ def get_page_config(request: Request):
     if not payload:
         raise HTTPException(status_code=401, detail="Token expired or invalid")
 
-    role = payload.get("role", "user")
+    role = payload.get("_role", "staff")
 
     if role == "admin":
         # Admin sees everything — no need to send full page list
