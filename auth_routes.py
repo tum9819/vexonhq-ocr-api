@@ -212,8 +212,9 @@ def verify_token(token: str) -> Optional[dict]:
         except jwt.ExpiredSignatureError:
             # Token IS a Supabase token but it's expired — don't fallback
             return None
-        except jwt.InvalidTokenError:
+        except jwt.InvalidTokenError as e:
             # Wrong key or audience — may be a self-issued token, fall through
+            log.warning("verify_token: Supabase path failed (%s: %s) — trying legacy path", type(e).__name__, e)
             pass
 
     # Path 2: Self-issued tokens from /auth/login
