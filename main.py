@@ -319,10 +319,10 @@ class JWTAuthMiddleware(BaseHTTPMiddleware):
                 content={"detail": "Session หมดอายุ กรุณาเข้าสู่ระบบใหม่"},
             )
 
-        # Stash the JWT subject (username) on request.state so endpoints
-        # can read it for audit trail (created_by / updated_by / reviewed_by)
-        # without re-parsing the token. Falls back to None if the token had
-        # no `sub` claim (legacy / malformed JWTs).
+        # Stash the JWT subject on request.state for audit trail
+        # (created_by / updated_by / reviewed_by) without re-parsing.
+        # After Supabase SSO migration, sub is a UUID (e.g. "a1b2c3d4-...").
+        # Falls back to None if the token had no `sub` claim.
         request.state.username = payload.get("sub")
 
         return await call_next(request)
