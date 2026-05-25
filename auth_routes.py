@@ -58,9 +58,11 @@ JWT_SECRET = os.environ.get(
     "JWT_SECRET",
     "vexonhq-change-this-secret-key-in-production-please"
 )
-# Supabase JWT Secret — from Supabase → Settings → API → JWT Secret.
-# Used to verify JWTs issued by Supabase Auth after SSO migration.
-# Keep secret: never use NEXT_PUBLIC_ prefix, never log it.
+# Supabase project URL — used to build the JWKS endpoint for ES256 token verification.
+# Set in Coolify: SUPABASE_URL=https://<project-id>.supabase.co
+# (Never use NEXT_PUBLIC_ prefix — this is server-side only.)
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+# Supabase JWT Secret — kept for legacy HS256 Supabase projects; not used for ES256.
 SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = 8
@@ -132,6 +134,35 @@ def _load_users() -> dict[str, str]:
         users[username.lower()] = user_hash
     return users
 
+# ─────────────────────────────────────────────────────────
+# Supabase JWKS client (ES256 verification)
+# ─────────────────────────────────────────────────────────
+
+_supabase_jwks_client: Optional[object] = None
+
+
+def _get_supabase_jwks_client() -> Optional[object]:
+    """
+    Return a cached PyJWKClient pointed at the Supabase JWKS endpoint,
+    or None when SUPABASE_URL is not configured.
+
+    Requires: cryptography>=3.4 (for EC key support in PyJWT).
+    """
+    global _supabase_jwks_client
+    if _supabase_jwks_client is not None:
+        return _supabase_jwks_client
+    if not SUPABASE_URL:
+        return None
+    try:
+        from jwt import PyJWKClient  # PyJWT >= 2.4
+        jwks_url = SUPABASE_URL.rstrip("/") + "/.well-known/jwks.json"
+        _supabase_jwks_client = PyJWKClient(jwks_url, cache_keys=True)
+        log.info("Supabase JWKS client initialised: %s", jwks_url)
+    except Exception as exc:
+        log.error("Failed to initialise Supabase JWKS client: %s", exc)
+    return _supabase_jwks_client
+
+
 # Simple in-memory rate limiter: {ip: [timestamp, ...]}
 _login_attempts: dict[str, list[float]] = {}
 MAX_ATTEMPTS = 10
@@ -185,49 +216,70 @@ def verify_token(token: str) -> Optional[dict]:
 
     Tries two validation paths in order:
 
-    Path 1 — Supabase Auth tokens (prepared for future SSO migration):
-        Decodes with SUPABASE_JWT_SECRET + audience="authenticated".
+    Path 1 — Supabase Auth tokens:
+        ES256 (current Supabase default): verifies using EC public key fetched
+            from Supabase's JWKS endpoint (SUPABASE_URL env var required).
+        HS256 (legacy Supabase): verifies with SUPABASE_JWT_SECRET env var.
         Role comes from app_metadata.role (Supabase convention).
-        Only tried when SUPABASE_JWT_SECRET env var is set.
 
-    Path 2 — Self-issued tokens from /auth/login (current auth system):
+    Path 2 — Self-issued tokens from /auth/login (legacy VEXONHQ login):
         Decodes with JWT_SECRET, no audience check.
-        Role comes directly from payload["role"] (our own convention).
-        Always tried as fallback when Path 1 fails due to wrong key/audience.
+        Role comes directly from payload["role"] (our convention).
+        Always tried as fallback when Path 1 fails.
 
     Returns None on any definitive failure (expired, malformed). Never raises.
     """
-    # Path 1: Supabase Auth tokens (future SSO)
-    if SUPABASE_JWT_SECRET:
+    # Path 1: Supabase Auth tokens (ES256 via JWKS, or HS256 via secret)
+    if SUPABASE_URL or SUPABASE_JWT_SECRET:
         try:
-            _hdr = jwt.get_unverified_header(token)
-            log.warning("verify_token: JWT header alg=%s kid=%s", _hdr.get("alg"), _hdr.get("kid"))
-        except Exception as _he:
-            log.warning("verify_token: cannot read JWT header: %s", _he)
-        try:
-            payload = jwt.decode(
-                token,
-                SUPABASE_JWT_SECRET,
-                algorithms=[JWT_ALGORITHM],
-                audience="authenticated",
-            )
-            app_meta = payload.get("app_metadata") or {}
-            payload["_role"] = app_meta.get("role", "staff")
-            return payload
+            hdr = jwt.get_unverified_header(token)
+            alg = hdr.get("alg", "")
+
+            if alg == "ES256":
+                # Modern Supabase: asymmetric ES256 — verify with EC public key from JWKS
+                jwks_client = _get_supabase_jwks_client()
+                if jwks_client is None:
+                    log.warning("verify_token: ES256 token but SUPABASE_URL not set — skipping Supabase path")
+                else:
+                    signing_key = jwks_client.get_signing_key_from_jwt(token)  # type: ignore[union-attr]
+                    payload = jwt.decode(
+                        token,
+                        signing_key.key,
+                        algorithms=["ES256"],
+                        audience="authenticated",
+                    )
+                    app_meta = payload.get("app_metadata") or {}
+                    payload["_role"] = app_meta.get("role", "staff")
+                    return payload
+
+            elif alg == "HS256" and SUPABASE_JWT_SECRET:
+                # Legacy HS256 Supabase project
+                payload = jwt.decode(
+                    token,
+                    SUPABASE_JWT_SECRET,
+                    algorithms=["HS256"],
+                    audience="authenticated",
+                )
+                app_meta = payload.get("app_metadata") or {}
+                payload["_role"] = app_meta.get("role", "staff")
+                return payload
+
         except jwt.ExpiredSignatureError:
-            # Token IS a Supabase token but it's expired — don't fallback
+            # Expired Supabase token — don't fall through to legacy path
             return None
-        except jwt.InvalidTokenError as e:
-            # Wrong key or audience — may be a self-issued token, fall through
-            log.warning("verify_token: Supabase path failed (%s: %s) — trying legacy path", type(e).__name__, e)
-            pass
+        except Exception as exc:
+            # Network error, wrong audience, invalid signature, etc. — try legacy
+            log.warning(
+                "verify_token: Supabase path failed (%s: %s) — trying legacy path",
+                type(exc).__name__, exc,
+            )
 
     # Path 2: Self-issued tokens from /auth/login
     try:
         payload = jwt.decode(
             token,
             JWT_SECRET,
-            algorithms=[JWT_ALGORITHM],
+            algorithms=["HS256"],
             options={"verify_aud": False},
         )
         # Normalize role to _role so all callers use payload['_role'] consistently
