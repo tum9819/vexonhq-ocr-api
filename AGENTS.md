@@ -227,4 +227,37 @@ FROM job_heartbeat WHERE job_id = 'weekly_do_snapshot';
 ```
 `last_success_at` should populate the Sunday after the token update.
 
-*Last updated: Session 40, 2026-05-25.*
+**12. verify_token and create_token must use the same secret.** (Session 41, 2026-05-25)
+```python
+# create_token() signs with JWT_SECRET (no aud claim)
+# verify_token() must also accept JWT_SECRET — not ONLY SUPABASE_JWT_SECRET
+
+# ❌ BAD — broke ALL auth silently (Session 40 commit 6069f32)
+def verify_token(token):
+    if not SUPABASE_JWT_SECRET:
+        return None  # rejects ALL tokens if env var missing
+    payload = jwt.decode(token, SUPABASE_JWT_SECRET, audience="authenticated")
+    # ↑ fails: wrong key + no aud claim in self-issued tokens
+
+# ✅ GOOD — dual-path: Supabase SSO first, self-issued fallback
+def verify_token(token):
+    if SUPABASE_JWT_SECRET:
+        try:
+            payload = jwt.decode(token, SUPABASE_JWT_SECRET, audience="authenticated")
+            payload["_role"] = payload.get("app_metadata", {}).get("role", "staff")
+            return payload
+        except jwt.ExpiredSignatureError:
+            return None  # expired = terminal
+        except jwt.InvalidTokenError:
+            pass         # wrong key/aud = try self-issued path
+    try:
+        payload = jwt.decode(token, JWT_SECRET, options={"verify_aud": False})
+        payload["_role"] = payload.get("role", "staff")
+        return payload
+    except Exception:
+        return None
+```
+Rule: whenever `create_token` signing key or claims change, `verify_token` MUST be updated
+in the same commit. Test with `pytest tests/test_workflow.py -k "auth"` before push.
+
+*Last updated: Session 41, 2026-05-25.*
