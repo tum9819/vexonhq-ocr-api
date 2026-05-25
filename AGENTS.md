@@ -207,4 +207,24 @@ Rule: any `async def` endpoint that calls sync, CPU/IO-heavy functions (pandas, 
 MUST use `asyncio.to_thread()` or `BackgroundTasks`. The actual import endpoint `/pos/import`
 already does this correctly via `background_tasks.add_task()`.
 
-*Last updated: Session 36, 2026-05-23.*
+**11. DigitalOcean API token for snapshots requires `image:create` scope explicitly.** (Session 40, 2026-05-25)
+```
+# DigitalOcean scoped tokens — common mistake:
+# A token with "snapshot:read+delete" + "image:read+delete" is NOT enough.
+# Creating a snapshot requires the separate "image:create" scope.
+# The error at runtime:
+#   403 Forbidden: "You are missing the required permission image:create."
+# This fails silently (job runs, error_count++ but no alert fires).
+#
+# When creating a new DO token for vexonhq-ocr-api:
+# Required scopes: image:create, image:delete, droplet:read
+# Env var: DO_API_TOKEN (set in Coolify → vexonhq-ocr-api → Environment)
+```
+Verify: after redeploying with new token, check `job_heartbeat` table:
+```sql
+SELECT job_id, run_count, error_count, last_success_at
+FROM job_heartbeat WHERE job_id = 'weekly_do_snapshot';
+```
+`last_success_at` should populate the Sunday after the token update.
+
+*Last updated: Session 40, 2026-05-25.*
