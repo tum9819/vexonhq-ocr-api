@@ -64,10 +64,10 @@ WHERE table_schema='public' AND table_name='<table>' ORDER BY ordinal_position;
 
 Run this **before** drafting the step-5 paste block — it is part of the task definition, not optional ceremony.
 
-1. **Update docs** in `C:\Users\rapee\VEXONHQ\docs\` (backend มี `docs/` ของตัวเองที่ frontend repo):
-   - `docs/04_LOGS/DAILY_LOG_2026_05.md` — **always**, one entry per session. Use `## Session N — YYYY-MM-DD` heading. ✅ Done / 🟡 Pending / 🔵 Known follow-ups blocks.
-   - `docs/01_PROJECT/CHANGELOG.md` — when a feature or fix ships.
-   - `docs/01_PROJECT/TOMORROW.md` — update open items and next-session priorities.
+1. **Update docs**:
+   - `docs/TOMORROW.md` (this repo) — update backend priorities, Sentry status, open items.
+   - `C:\Users\rapee\VEXONHQ\docs\04_LOGS\DAILY_LOG_2026_05.md` — **always**, one entry per session. Use `## Session N — YYYY-MM-DD` heading. ✅ Done / 🟡 Pending / 🔵 Known follow-ups blocks.
+   - `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\CHANGELOG.md` — when a feature or fix ships.
 
 2. **Update `AGENTS.md`** (this file) **only when an agent-relevant change occurred** — new rule, new pitfall, new infra detail. Append a bullet to the relevant existing section; date the addition in the commit message body.
 
