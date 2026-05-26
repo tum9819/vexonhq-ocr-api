@@ -60,9 +60,19 @@ def _get_conn():
         return psycopg2.connect(os.environ["DATABASE_URL"])
 
 
-def record_heartbeat(job_id: str, ok: bool, error_message: str | None = None) -> None:
+def record_heartbeat(
+    job_id: str,
+    ok: bool,
+    error_message: str | None = None,
+    expected_interval_hours: int = 24,
+) -> None:
     """Insert/update a heartbeat row for a job. Best-effort — failures
-    are swallowed so heartbeat instrumentation never breaks a job."""
+    are swallowed so heartbeat instrumentation never breaks a job.
+
+    expected_interval_hours: how often this job is scheduled (24 for daily,
+    168 for weekly). Used by /cron/health to flag stale jobs (> 2× interval).
+    Always written on every run so the value stays correct after code changes.
+    """
     try:
         conn = _get_conn()
         try:
@@ -71,32 +81,36 @@ def record_heartbeat(job_id: str, ok: bool, error_message: str | None = None) ->
                     cur.execute(
                         """
                         INSERT INTO public.job_heartbeat
-                            (job_id, last_run_at, last_success_at, run_count)
-                        VALUES (%s, NOW(), NOW(), 1)
+                            (job_id, last_run_at, last_success_at, run_count,
+                             expected_interval_hours)
+                        VALUES (%s, NOW(), NOW(), 1, %s)
                         ON CONFLICT (job_id) DO UPDATE
-                        SET last_run_at      = NOW(),
-                            last_success_at  = NOW(),
-                            run_count        = job_heartbeat.run_count + 1,
-                            updated_at       = NOW()
+                        SET last_run_at              = NOW(),
+                            last_success_at          = NOW(),
+                            run_count                = job_heartbeat.run_count + 1,
+                            expected_interval_hours  = EXCLUDED.expected_interval_hours,
+                            updated_at               = NOW()
                         """,
-                        (job_id,),
+                        (job_id, expected_interval_hours),
                     )
                 else:
                     cur.execute(
                         """
                         INSERT INTO public.job_heartbeat
                             (job_id, last_run_at, last_error_at,
-                             last_error_message, run_count, error_count)
-                        VALUES (%s, NOW(), NOW(), %s, 1, 1)
+                             last_error_message, run_count, error_count,
+                             expected_interval_hours)
+                        VALUES (%s, NOW(), NOW(), %s, 1, 1, %s)
                         ON CONFLICT (job_id) DO UPDATE
-                        SET last_run_at         = NOW(),
-                            last_error_at       = NOW(),
-                            last_error_message  = EXCLUDED.last_error_message,
-                            run_count           = job_heartbeat.run_count + 1,
-                            error_count         = job_heartbeat.error_count + 1,
-                            updated_at          = NOW()
+                        SET last_run_at              = NOW(),
+                            last_error_at            = NOW(),
+                            last_error_message       = EXCLUDED.last_error_message,
+                            run_count                = job_heartbeat.run_count + 1,
+                            error_count              = job_heartbeat.error_count + 1,
+                            expected_interval_hours  = EXCLUDED.expected_interval_hours,
+                            updated_at               = NOW()
                         """,
-                        (job_id, (error_message or "")[:500]),
+                        (job_id, (error_message or "")[:500], expected_interval_hours),
                     )
             conn.commit()
         finally:
@@ -105,17 +119,23 @@ def record_heartbeat(job_id: str, ok: bool, error_message: str | None = None) ->
         log.exception("record_heartbeat failed (job_id=%s, ok=%s)", job_id, ok)
 
 
-def heartbeat(job_id: str) -> Callable[[F], F]:
-    """Decorator that records a heartbeat around the wrapped function."""
+def heartbeat(job_id: str, expected_interval_hours: int = 24) -> Callable[[F], F]:
+    """Decorator that records a heartbeat around the wrapped function.
+
+    expected_interval_hours: how often this job runs (24=daily, 168=weekly).
+    /cron/health flags a job stale when last_run > 2× this value.
+    """
     def deco(fn: F) -> F:
         @functools.wraps(fn)
         def wrapped(*args, **kwargs):
             try:
                 result = fn(*args, **kwargs)
-                record_heartbeat(job_id, ok=True)
+                record_heartbeat(job_id, ok=True,
+                                 expected_interval_hours=expected_interval_hours)
                 return result
             except Exception as e:
-                record_heartbeat(job_id, ok=False, error_message=str(e))
+                record_heartbeat(job_id, ok=False, error_message=str(e),
+                                 expected_interval_hours=expected_interval_hours)
                 raise
         return wrapped  # type: ignore[return-value]
     return deco

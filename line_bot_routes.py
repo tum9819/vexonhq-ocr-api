@@ -865,7 +865,7 @@ def _build_weekly_summary() -> str:
         conn.close()
 
 
-@_heartbeat("weekly_summary")
+@_heartbeat("weekly_summary", expected_interval_hours=168)
 def _scheduled_weekly_summary():
     """APScheduler job: send weekly summary to LINE every Monday 08:00 Bangkok."""
     log.info("Scheduled weekly summary — running")
@@ -1581,7 +1581,7 @@ except Exception as e:
 # itself takes ~5-10 min as DO copies the droplet image, but our HTTP
 # call to /droplets/{id}/actions returns immediately with an "in-progress"
 # action — we don't block waiting for it.
-@_heartbeat("weekly_do_snapshot")
+@_heartbeat("weekly_do_snapshot", expected_interval_hours=168)
 def _scheduled_do_snapshot_rotation():
     """APScheduler job: trigger DO auto-snapshot rotation weekly."""
     log.info("Scheduled DO snapshot rotation running")
