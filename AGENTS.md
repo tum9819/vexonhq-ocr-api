@@ -60,6 +60,23 @@ WHERE table_schema='public' AND table_name='<table>' ORDER BY ordinal_position;
 
 ---
 
+## Post-task closure routine (mandatory)
+
+Run this **before** drafting the step-5 paste block — it is part of the task definition, not optional ceremony.
+
+1. **Update docs** in `C:\Users\rapee\VEXONHQ\docs\` (backend มี `docs/` ของตัวเองที่ frontend repo):
+   - `docs/04_LOGS/DAILY_LOG_2026_05.md` — **always**, one entry per session. Use `## Session N — YYYY-MM-DD` heading. ✅ Done / 🟡 Pending / 🔵 Known follow-ups blocks.
+   - `docs/01_PROJECT/CHANGELOG.md` — when a feature or fix ships.
+   - `docs/01_PROJECT/TOMORROW.md` — update open items and next-session priorities.
+
+2. **Update `AGENTS.md`** (this file) **only when an agent-relevant change occurred** — new rule, new pitfall, new infra detail. Append a bullet to the relevant existing section; date the addition in the commit message body.
+
+3. **Push to GitHub** — TUM pushes from his own PowerShell. Claude prepares the paste block (no `Co-Authored-By:` trailer). **Claude never pushes** unless TUM explicitly grants permission for that turn.
+
+**Why this exists:** The next Claude session loads `AGENTS.md` + `CLAUDE.md` + auto-memory first; skipping doc updates makes the new session start with stale context.
+
+---
+
 ## Boundaries
 
 ### ✅ Always do
