@@ -2,7 +2,7 @@
 
 **Date started:** 2026-05-27
 **Scope:** P&L + Daybook subsystem (money-first preventive audit)
-**Status:** Audit complete — C1 fixed (`9296ed5`), C2+C3 fixed + C8 auto-closed (`44f692d`), 4 CRITICAL findings remain open (C4, C5, C6, C7)
+**Status:** ✅ ALL 8 BATCH-1 CRITICALs CLOSED (2026-05-27). C1 (`9296ed5`), C2+C3+C8 (`44f692d`), C4+M4+M6+v_daybook_pnl view (`6c4250d`), C5 (auto via M4), C6+C7 (`e59fdb6`). MEDIUM/LOW remain for future batches.
 
 ---
 
@@ -152,7 +152,7 @@ Top risk by file:
 
 ---
 
-### [C4] — `/pnl/yearly` mixes `v_daybook` totals with raw `pos_sales_daily` & `rider_deliveries` totals (can disagree)
+### [C4] — ✅ FIXED in commit `6c4250d` (2026-05-27, via v_daybook_pnl) — `/pnl/yearly` mixes `v_daybook` totals with raw `pos_sales_daily` & `rider_deliveries` totals (can disagree)
 - **File:** `yearly_routes.py:86-129`
 - **Endpoint:** `GET /pnl/yearly`
 - **Current code:**
@@ -211,7 +211,11 @@ Top risk by file:
 
 ---
 
-### [C5] — `/dashboard` silently displays inflated top_categories + food_cost + bill_count from broken backend
+### [C5] — ✅ FIXED via backend M4 in commit `6c4250d` (2026-05-27) — `/dashboard` silently displays inflated top_categories + food_cost + bill_count from broken backend
+
+> Resolved by the backend M4 fix (top_categories + food_cost now read v_daybook_pnl). Discovered during the fix that the OLD vendor_bills-only query returned ZERO categorized expense every month (vendor_bills.category_code is NULL across all history) — the dashboard pie was effectively empty, not just undercounting. No frontend change needed (display auto-corrects once backend returns real data). Auth header concern in the original finding was a non-issue (M12 false positive — global interceptor handles it).
+
+
 - **File:** `app/dashboard/page.tsx:166-183`
 - **Page:** `/dashboard`
 - **Current code:**
@@ -257,7 +261,7 @@ Top risk by file:
 
 ---
 
-### [C6] — `/daybook` displays `net` that includes equity (Session 6 bug class)
+### [C6] — ✅ FIXED in commit `e59fdb6` (frontend) + `6c4250d` (backend M6, net_pnl) — `/daybook` displays `net` that includes equity (Session 6 bug class)
 - **File:** `app/daybook/page.tsx:235-237, 266-278`
 - **Page:** `/daybook`
 - **Current code:**
@@ -291,7 +295,7 @@ Top risk by file:
 
 ---
 
-### [C7] — `/scorecard` has no `res.ok` check; backend 500 / non-JSON body crashes the page with no error UI
+### [C7] — ✅ FIXED in commit `e59fdb6` (2026-05-27) — `/scorecard` has no `res.ok` check; backend 500 / non-JSON body crashes the page with no error UI
 - **File:** `app/scorecard/page.tsx:140-147`
 - **Page:** `/scorecard`
 - **Current code:**
@@ -476,7 +480,7 @@ Top risk by file:
   1. `SELECT DISTINCT category_code FROM expense_categories WHERE code IN ('musician_fee','freelance','pnd3','rent');` — verify which exist.
   2. Sample known-good 2026 PND.3 amounts (TUM submits these to สรรพากร monthly) and reconcile to within ฿0.50 per row.
 
-### [M4] — `phase2_routes.py /dashboard/overview` `top_categories` and `food_cost` only query `vendor_bills` (no manual/bank)
+### [M4] — ✅ FIXED in commit `6c4250d` (2026-05-27, via v_daybook_pnl) — `phase2_routes.py /dashboard/overview` `top_categories` and `food_cost` only query `vendor_bills` (no manual/bank)
 - **File:** `phase2_routes.py:357-388, 458-478`
 - **Endpoint:** `GET /dashboard/overview`
 - **Current code:**
@@ -542,7 +546,7 @@ Top risk by file:
   Frontend renders "ข้อมูล YTD ไม่พร้อม" instead of "฿0".
 - **Test plan:** Force one subquery to fail (e.g. temporarily rename `v_budget_status`). Hit endpoint — currently returns 200 with empty `budget_status: []`; should signal failure instead.
 
-### [M6] — `phase3_daybook_routes.py /daybook/summary` includes equity/transfer rows in `net` and `by_direction`
+### [M6] — ✅ FIXED in commit `6c4250d` (2026-05-27, added net_pnl via v_daybook_pnl) — `phase3_daybook_routes.py /daybook/summary` includes equity/transfer rows in `net` and `by_direction`
 - **File:** `phase3_daybook_routes.py:181-219`
 - **Endpoint:** `GET /daybook/summary`
 - **Current code:**
