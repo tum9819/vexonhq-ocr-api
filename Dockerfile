@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     tesseract-ocr-tha \
     tesseract-ocr-eng \
+    docker.io \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
