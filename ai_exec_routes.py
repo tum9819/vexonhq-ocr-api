@@ -52,8 +52,9 @@ WHITELIST: set[str] = {
 # Map our friendly names → Coolify app UUID prefix so restart works
 # regardless of build suffix (which changes on every deploy).
 COOLIFY_RESTART_MAP: dict[str, str] = {
-    "docker restart vexonhq-backend":  "b4zhad8qkoxjushdq8465056",
-    "docker restart vexonhq-frontend": "zpz697qb6hrhocj090d3cy3s",
+    "docker restart vexonhq-backend":  "b4zhad8qkoxjushdq8465056",  # api.marastation.com (FastAPI)
+    "docker restart vexonhq-frontend": "r7plics0ljl0lxwr6r8zdun0",  # app.marastation.com (VEXONHQ admin)
+    # NOTE: zpz697qb6hrhocj090d3cy3s = marastation-ai (ai.marastation.com) — DO NOT restart via tool
 }
 
 # ── In-memory rate limiter (per IP, 20 req / 60 s) ────────────────────
