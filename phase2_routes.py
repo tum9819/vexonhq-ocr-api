@@ -356,20 +356,25 @@ def dashboard_overview(
             top_categories = []
             try:
                 pe = _next_month(month_start)
+                # Audit M4 fix (2026-05-27): was vendor_bills-only, so the pie
+                # chart summed to less than the headline current.expense_total
+                # (which is v_daybook-based). Now reads v_daybook_pnl → includes
+                # manual_entries + bank_statement expenses, reconciles with the
+                # expense_total headline. v_daybook_pnl already excludes equity.
                 cur.execute(
-                    """SELECT vb.category_code,
-                              COALESCE(ec.name_th, vb.category_code) AS name_th,
-                              SUM(vb.amount)::numeric AS spent
-                       FROM public.vendor_bills vb
-                       LEFT JOIN public.expense_categories ec ON ec.code = vb.category_code
-                       WHERE vb.review_status = 'confirmed'
-                         AND vb.bill_date IS NOT NULL
-                         AND vb.bill_date >= %s AND vb.bill_date < %s
-                         AND vb.category_code IS NOT NULL
-                       GROUP BY vb.category_code, ec.name_th
+                    """SELECT d.category_code,
+                              COALESCE(ec.name_th, d.category_code) AS name_th,
+                              SUM(d.amount)::numeric AS spent
+                       FROM public.v_daybook_pnl d
+                       LEFT JOIN public.expense_categories ec ON ec.code = d.category_code
+                       WHERE d.direction = 'expense'
+                         AND COALESCE(d.branch_code, %s) = %s
+                         AND d.entry_date >= %s AND d.entry_date < %s
+                         AND d.category_code IS NOT NULL
+                       GROUP BY d.category_code, ec.name_th
                        ORDER BY spent DESC
                        LIMIT 5""",
-                    (month_start, pe),
+                    (branch, branch, month_start, pe),
                 )
                 top_rows = cur.fetchall()
                 total_categorized = sum(float(r[2] or 0) for r in top_rows) or 1.0
@@ -457,13 +462,17 @@ def dashboard_overview(
             food_cost_pct = 0.0
             try:
                 pe_fc = _next_month(month_start)
+                # Audit M4 fix (2026-05-27): was vendor_bills-only, understating
+                # food cost (cash + bank-transfer raw-material purchases missed).
+                # Now reads v_daybook_pnl across all expense sources with the
+                # same COGS category codes.
                 cur.execute(
-                    """SELECT COALESCE(SUM(vb.amount), 0)::numeric
-                       FROM public.vendor_bills vb
-                       WHERE vb.review_status = 'confirmed'
-                         AND COALESCE(vb.branch_code, %s) = %s
-                         AND vb.bill_date >= %s AND vb.bill_date < %s
-                         AND vb.category_code IN (
+                    """SELECT COALESCE(SUM(d.amount), 0)::numeric
+                       FROM public.v_daybook_pnl d
+                       WHERE d.direction = 'expense'
+                         AND COALESCE(d.branch_code, %s) = %s
+                         AND d.entry_date >= %s AND d.entry_date < %s
+                         AND d.category_code IN (
                              'food_cost','raw_meat','raw_veggies',
                              'raw_seasoning','raw_oil_gas','raw_beverage'
                          )""",

@@ -82,30 +82,36 @@ def pnl_yearly(
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            # ── All income + expense from v_daybook (excludes equity transfers) ──
+            # ── All rollup numbers from v_daybook_pnl (single source of truth) ──
+            # Audit C4 fix (2026-05-27): sales_net + rider_net previously came
+            # from raw pos_sales_daily / rider_deliveries while income/expense
+            # came from v_daybook — they could silently disagree (sales+rider !=
+            # income_total). Pulling all four from the same pre-filtered view
+            # guarantees they reconcile by construction. v_daybook_pnl already
+            # excludes equity/transfer sources, so no inline NOT IN needed.
             cur.execute(
                 """SELECT EXTRACT(MONTH FROM entry_date)::int AS m,
+                          COALESCE(SUM(CASE WHEN source='pos_sale'
+                                           THEN amount ELSE 0 END), 0)::numeric AS sales_net,
+                          COALESCE(SUM(CASE WHEN source IN ('rider_income_grab','rider_income_lineman')
+                                           THEN amount ELSE 0 END), 0)::numeric AS rider_net,
                           COALESCE(SUM(CASE WHEN direction='income'
                                            THEN amount ELSE 0 END), 0)::numeric AS income_total,
                           COALESCE(SUM(CASE WHEN direction='expense'
                                            THEN amount ELSE 0 END), 0)::numeric AS expense_total
-                   FROM public.v_daybook
+                   FROM public.v_daybook_pnl
                    WHERE branch_code = %s
                      AND EXTRACT(YEAR FROM entry_date) = %s
-                     AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
-                            'bank_statement', 'vendor_payment',
-                            'grab_payout', 'lineman_payout',
-                            'pos_cash_deposit', 'cash_withdrawal')
                    GROUP BY 1""",
                 (branch, year),
             )
-            daybook_map = {r[0]: (float(r[1] or 0), float(r[2] or 0))
+            daybook_map = {r[0]: (float(r[1] or 0), float(r[2] or 0),
+                                  float(r[3] or 0), float(r[4] or 0))
                            for r in cur.fetchall()}
 
-            # ── POS sales breakdown (for sales_net + bill_count) ──────────────
+            # ── POS sales bill_count only (v_daybook_pnl doesn't carry it) ────
             cur.execute(
                 """SELECT EXTRACT(MONTH FROM sales_date)::int AS m,
-                          SUM(net_total)::numeric             AS sales_net,
                           SUM(bill_count)::int                AS bill_count
                    FROM public.pos_sales_daily
                    WHERE branch_code = %s
@@ -113,20 +119,7 @@ def pnl_yearly(
                    GROUP BY 1""",
                 (branch, year),
             )
-            sales_map = {r[0]: (float(r[1] or 0), int(r[2] or 0))
-                         for r in cur.fetchall()}
-
-            # ── Rider income breakdown ─────────────────────────────────────────
-            cur.execute(
-                """SELECT EXTRACT(MONTH FROM delivery_date)::int AS m,
-                          SUM(net_payout)::numeric              AS rider_net
-                   FROM public.rider_deliveries
-                   WHERE branch_code = %s
-                     AND EXTRACT(YEAR FROM delivery_date) = %s
-                   GROUP BY 1""",
-                (branch, year),
-            )
-            rider_map = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
+            sales_bill_map = {r[0]: int(r[1] or 0) for r in cur.fetchall()}
 
             # ── Expense bill count ─────────────────────────────────────────────
             cur.execute(
@@ -150,9 +143,8 @@ def pnl_yearly(
                   expense_total=0.0, gross_profit=0.0, bill_count=0, expense_bill_count=0)
 
     for m in range(1, 13):
-        income, expense = daybook_map.get(m, (0.0, 0.0))
-        s_net, s_bills = sales_map.get(m, (0.0, 0))
-        r_net = rider_map.get(m, 0.0)
+        s_net, r_net, income, expense = daybook_map.get(m, (0.0, 0.0, 0.0, 0.0))
+        s_bills = sales_bill_map.get(m, 0)
         e_bills = exp_bills_map.get(m, 0)
         profit = income - expense
         margin = round(profit / income * 100, 1) if income else None

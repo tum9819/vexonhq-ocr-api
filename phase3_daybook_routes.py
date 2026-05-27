@@ -196,7 +196,23 @@ def daybook_summary(
             for d, count, total in direction_rows:
                 by_direction[d] = {"count": int(count), "total": float(total or 0)}
 
+            # `net` is the RAW ledger signed-sum (includes owner equity +
+            # transfers). Kept for the full-ledger view. NOT profit.
             net = by_direction["income"]["total"] - by_direction["expense"]["total"]
+
+            # Audit M6 fix (2026-05-27): the true P&L net excludes equity /
+            # transfer sources. Computed from v_daybook_pnl with the same filter
+            # so the frontend can label "กำไร/ขาดทุน" honestly (see audit C6).
+            cur.execute(
+                f"""SELECT
+                       COALESCE(SUM(CASE WHEN direction='income'  THEN amount ELSE 0 END), 0)
+                     - COALESCE(SUM(CASE WHEN direction='expense' THEN amount ELSE 0 END), 0)
+                       AS net_pnl
+                    FROM public.v_daybook_pnl
+                    WHERE {base_where}""",
+                base_params,
+            )
+            net_pnl = float(cur.fetchone()[0] or 0)
 
             # Source breakdown — always show ALL sources here so users see
             # which sources are hidden by filter (helpful UX context)
@@ -223,6 +239,7 @@ def daybook_summary(
             "date_to":   dt.isoformat(),
             "by_direction": by_direction,
             "net":          float(net),
+            "net_pnl":      net_pnl,
             "by_source":    by_source,
             "applied_sources": sources_filter,
         }
