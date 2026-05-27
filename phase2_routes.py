@@ -842,6 +842,9 @@ def category_trends(
     try:
         with conn.cursor() as cur:
             # vendor_bills
+            # NOTE: no `direction` column on vendor_bills — direction='expense' is
+            # synthesized only inside the v_daybook view. vendor_bills rows are
+            # expenses by construction. (Audit C2, fixed 2026-05-27.)
             cur.execute("""
                 SELECT
                     vb.category_code,
@@ -851,7 +854,6 @@ def category_trends(
                 FROM public.vendor_bills vb
                 LEFT JOIN public.expense_categories ec ON ec.code = vb.category_code
                 WHERE vb.review_status = 'confirmed'
-                  AND vb.direction = 'expense'
                   AND vb.bill_date >= %s AND vb.bill_date < %s
                   AND vb.category_code IS NOT NULL
                 GROUP BY 1, 2, 3
@@ -875,6 +877,11 @@ def category_trends(
             manual_rows = cur.fetchall()
 
             # bank_statement_entries
+            # Exclude equity / transfer source_types — same intent as the v_daybook
+            # exclusion in pnl_routes.py. owner_advance is the dominant leak in
+            # production (~446K baht as of 2026-05-27); owner_capital + transfer_error
+            # are added defensively in case future imports put them on the debit side.
+            # (Audit C3, fixed 2026-05-27.)
             cur.execute("""
                 SELECT
                     bse.category_code,
@@ -887,6 +894,7 @@ def category_trends(
                   AND bse.debit > 0
                   AND bse.category_code IS NOT NULL
                   AND bse.txn_date >= %s AND bse.txn_date < %s
+                  AND bse.source_type NOT IN ('owner_advance', 'owner_capital', 'transfer_error')
                 GROUP BY 1, 2, 3
             """, (branch, start, end))
             bank_rows = cur.fetchall()
