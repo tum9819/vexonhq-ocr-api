@@ -44,6 +44,20 @@ MONTHS_TH = [
     "กรกฎาคม", "สิงหาคม", "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม",
 ]
 
+# Sources to exclude from P&L aggregates. Mirrors pnl_routes.py:96-99 so the
+# monthly narrative agrees with /pnl/daily and /dashboard/overview. Adding this
+# closes the Session-6 incident class (equity inflates income, transfer pairs
+# pollute expense). Spliced into queries via f-string — values are constants
+# so SQL injection is not a concern.
+_EXCLUDED_SOURCES_SQL = (
+    "AND d.source NOT IN ("
+    "'owner_capital', 'owner_advance', 'transfer_error', "
+    "'bank_statement', 'vendor_payment', "
+    "'grab_payout', 'lineman_payout', "
+    "'pos_cash_deposit', 'cash_withdrawal'"
+    ")"
+)
+
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -147,11 +161,12 @@ def _gather_month_data(month: str) -> dict:
         with conn.cursor() as cur:
             # ── Overall income / expense / net ──
             cur.execute(
-                """SELECT
+                f"""SELECT
                      COALESCE(SUM(CASE WHEN d.direction='income'  THEN d.amount ELSE 0 END), 0) AS total_income,
                      COALESCE(SUM(CASE WHEN d.direction='expense' THEN d.amount ELSE 0 END), 0) AS total_expense
                    FROM public.v_daybook d
-                   WHERE d.entry_date BETWEEN %s AND %s""",
+                   WHERE d.entry_date BETWEEN %s AND %s
+                     {_EXCLUDED_SOURCES_SQL}""",
                 (first, last),
             )
             row = cur.fetchone()
@@ -162,11 +177,12 @@ def _gather_month_data(month: str) -> dict:
 
             # ── Income breakdown by source ──
             cur.execute(
-                """SELECT d.source,
+                f"""SELECT d.source,
                           COALESCE(SUM(d.amount), 0) AS total
                    FROM public.v_daybook d
                    WHERE d.direction = 'income'
                      AND d.entry_date BETWEEN %s AND %s
+                     {_EXCLUDED_SOURCES_SQL}
                    GROUP BY d.source
                    ORDER BY total DESC""",
                 (first, last),
@@ -175,13 +191,14 @@ def _gather_month_data(month: str) -> dict:
 
             # ── Top 5 expense categories ──
             cur.execute(
-                """SELECT
+                f"""SELECT
                      COALESCE(ec.name_th, d.category_code, d.source) AS cat_name,
                      COALESCE(SUM(d.amount), 0) AS total
                    FROM public.v_daybook d
                    LEFT JOIN public.expense_categories ec ON ec.code = d.category_code
                    WHERE d.direction = 'expense'
                      AND d.entry_date BETWEEN %s AND %s
+                     {_EXCLUDED_SOURCES_SQL}
                    GROUP BY 1
                    ORDER BY total DESC
                    LIMIT 5""",
@@ -191,7 +208,10 @@ def _gather_month_data(month: str) -> dict:
 
             # ── Transaction count ──
             cur.execute(
-                "SELECT COUNT(*) FROM public.v_daybook WHERE entry_date BETWEEN %s AND %s",
+                f"""SELECT COUNT(*)
+                   FROM public.v_daybook d
+                   WHERE d.entry_date BETWEEN %s AND %s
+                     {_EXCLUDED_SOURCES_SQL}""",
                 (first, last),
             )
             txn_count = int(cur.fetchone()[0])
