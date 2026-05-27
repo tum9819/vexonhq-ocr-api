@@ -277,4 +277,32 @@ def verify_token(token):
 Rule: whenever `create_token` signing key or claims change, `verify_token` MUST be updated
 in the same commit. Test with `pytest tests/test_workflow.py -k "auth"` before push.
 
-*Last updated: Session 41, 2026-05-25.*
+**13. v_daybook P&L queries MUST exclude equity/transfer sources — duplicated in 7+ files, missing = Session-6 incident.** (Session 43, 2026-05-27)
+```python
+# Every query that aggregates v_daybook for P&L purposes (income/expense totals,
+# category breakdowns, narrative inputs, dashboard cards) MUST filter out these
+# sources, otherwise equity injections + bank transfers inflate the numbers.
+
+# ❌ BAD — Session-6 incident pattern, found again in phase10_narrative_routes.py
+#         (audit C1, fixed commit 9296ed5). Inflated April 2026 income by 62K baht.
+cur.execute("""SELECT SUM(d.amount) FROM v_daybook d
+               WHERE d.entry_date BETWEEN %s AND %s""", (first, last))
+
+# ✅ GOOD — use the same exclusion list as pnl_routes.py:96-99
+_EXCLUDED_SOURCES_SQL = (
+    "AND d.source NOT IN ("
+    "'owner_capital', 'owner_advance', 'transfer_error', "
+    "'bank_statement', 'vendor_payment', "
+    "'grab_payout', 'lineman_payout', "
+    "'pos_cash_deposit', 'cash_withdrawal'"
+    ")"
+)
+cur.execute(f"""SELECT SUM(d.amount) FROM v_daybook d
+               WHERE d.entry_date BETWEEN %s AND %s
+                 {_EXCLUDED_SOURCES_SQL}""", (first, last))
+```
+Files known to use the exclusion (cross-check before duplicating again): `pnl_routes.py`, `phase2_routes.py` (overview branch), `phase10_narrative_routes.py` (Session 43 fix). Files known to LACK it as of 2026-05-27 audit: `phase2_routes.py` /dashboard/category-trends (C3), `yearly_routes.py` (C4 source-mixing). Long-term fix: extract to DB view `v_daybook_pnl` so SQL stays DRY — until then, splice the constant.
+
+Verify your change: run an A/B query via Supabase MCP for a month that contains equity rows (April 2026 has 52 `owner_advance` + 10 `owner_capital`) — old vs new totals should differ; the new value should match `/pnl/monthly` for the same month.
+
+*Last updated: Session 43, 2026-05-27.*
