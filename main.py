@@ -74,6 +74,7 @@ from alerts_webhook_routes import router as alerts_router
 from discord_routes import router as discord_router
 from do_snapshot_routes import router as do_snapshot_router
 from auto_diagnose import try_diagnose
+from ai_exec_routes import router as ai_exec_router
 # === Phase 2: psycopg connection for POS bulk imports ===
 # (Phase 1 uses supabase client for OCR flows — this is for high-volume
 #  executemany() inserts that need raw PG driver)
@@ -293,6 +294,7 @@ app.include_router(tax_router)
 app.include_router(alerts_router)
 app.include_router(discord_router)
 app.include_router(do_snapshot_router)
+app.include_router(ai_exec_router)
 app.include_router(rules_router)
 app.include_router(slip_router)
 app.include_router(store_context_router)
@@ -307,7 +309,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse as StarletteJSONResponse
 
-PUBLIC_PATHS = {"/", "/health", "/health/deep", "/cron/health", "/auth/login", "/auth/logout", "/docs", "/openapi.json", "/redoc", "/ap/due-reminder", "/stock/alert", "/alerts/uptime-webhook", "/alerts/test-telegram", "/alerts/discord-interaction", "/alerts/discord-restart-test", "/line/webhook", "/snapshots/status", "/snapshots/auto-rotate", "/menu/public"}
+PUBLIC_PATHS = {"/", "/health", "/health/deep", "/cron/health", "/auth/login", "/auth/logout", "/docs", "/openapi.json", "/redoc", "/ap/due-reminder", "/stock/alert", "/alerts/uptime-webhook", "/alerts/test-telegram", "/alerts/discord-interaction", "/alerts/discord-restart-test", "/line/webhook", "/snapshots/status", "/snapshots/auto-rotate", "/menu/public", "/ai/exec"}
 
 class JWTAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: StarletteRequest, call_next):
