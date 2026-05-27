@@ -163,6 +163,9 @@ AUTHED_ROUTES = [
     # DO snapshot rotation (Session 31 P2.4) — GET without ?secret → 401
     ("GET", "/snapshots/status"),
     ("GET", "/snapshots/auto-rotate"),
+
+    # Option A + LINE Alert — AI exec endpoint (POST-only → GET returns 405 = route registered)
+    ("GET", "/ai/exec"),
 ]
 
 
