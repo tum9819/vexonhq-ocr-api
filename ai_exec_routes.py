@@ -48,6 +48,14 @@ WHITELIST: set[str] = {
     "docker restart vexonhq-frontend",
 }
 
+# Coolify generates container names like "<app-uuid>-<build-id>".
+# Map our friendly names → Coolify app UUID prefix so restart works
+# regardless of build suffix (which changes on every deploy).
+COOLIFY_RESTART_MAP: dict[str, str] = {
+    "docker restart vexonhq-backend":  "b4zhad8qkoxjushdq8465056",
+    "docker restart vexonhq-frontend": "zpz697qb6hrhocj090d3cy3s",
+}
+
 # ── In-memory rate limiter (per IP, 20 req / 60 s) ────────────────────
 _rate_buckets: dict[str, list[float]] = defaultdict(list)
 RATE_LIMIT = 20
@@ -95,7 +103,14 @@ def exec_command(body: ExecRequest, request: Request) -> ExecResponse:
         log.warning("[AI-EXEC] REJECTED cmd=%r ip=%s", cmd, client_ip)
         raise HTTPException(status_code=403, detail=f"Command not in whitelist: {cmd!r}")
 
-    # 4. Execute
+    # 4. Translate friendly restart names → actual Coolify container UUID
+    # Coolify names containers "<app-uuid>-<build-id>"; use --filter name= to
+    # match by UUID prefix, which stays stable across deploys.
+    if cmd in COOLIFY_RESTART_MAP:
+        uuid = COOLIFY_RESTART_MAP[cmd]
+        cmd = f"docker ps -q --filter name={uuid} | xargs -r docker restart"
+
+    # 5. Execute
     ts = datetime.utcnow().isoformat(timespec="seconds")
     try:
         result = subprocess.run(
@@ -103,7 +118,7 @@ def exec_command(body: ExecRequest, request: Request) -> ExecResponse:
             shell=True,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=30,
         )
         log.info("[AI-EXEC] %s cmd=%r exit=%d ip=%s", ts, cmd, result.returncode, client_ip)
         return ExecResponse(
