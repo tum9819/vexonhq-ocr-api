@@ -1626,6 +1626,21 @@ except Exception as e:
     log.error("Failed to register weekly_do_snapshot job: %s", e)
 
 
+# Option A + LINE Alert (2026-05-27): VPS health monitor every 15 min.
+# Checks disk, RAM, containers, API health — fires LINE alert on issue.
+try:
+    from health_monitor import health_check_job as _health_check_job
+    _scheduler.add_job(
+        _health_check_job,
+        trigger="interval",
+        minutes=15,
+        id="vps_health_monitor",
+        replace_existing=True,
+    )
+    log.info("VPS health monitor started — fires every 15 min")
+except Exception as e:
+    log.error("Failed to register vps_health_monitor job: %s", e)
+
 
 def _verify_signature(body: bytes, signature: str) -> bool:
     secret = os.environ.get("LINE_CHANNEL_SECRET", "")
