@@ -2,7 +2,7 @@
 
 **Date started:** 2026-05-27
 **Scope:** P&L + Daybook subsystem (money-first preventive audit)
-**Status:** Audit complete — C1 fixed (commit `9296ed5`, 2026-05-27), 7 CRITICAL findings remain open
+**Status:** Audit complete — C1 fixed (`9296ed5`), C2+C3 fixed + C8 auto-closed (`44f692d`), 4 CRITICAL findings remain open (C4, C5, C6, C7)
 
 ---
 
@@ -76,7 +76,7 @@ Top risk by file:
 
 ---
 
-### [C2] — `/dashboard/category-trends` references nonexistent column `vendor_bills.direction`
+### [C2] — ✅ FIXED in commit `44f692d` (2026-05-27) — `/dashboard/category-trends` references nonexistent column `vendor_bills.direction`
 - **File:** `phase2_routes.py:845-858`
 - **Endpoint:** `GET /dashboard/category-trends?months=6`
 - **Current code:**
@@ -111,7 +111,7 @@ Top risk by file:
 
 ---
 
-### [C3] — `/dashboard/category-trends` for `bank_statement_entries` lacks transfer/equity exclusion
+### [C3] — ✅ FIXED in commit `44f692d` (2026-05-27) — `/dashboard/category-trends` for `bank_statement_entries` lacks transfer/equity exclusion
 - **File:** `phase2_routes.py:878-892`
 - **Endpoint:** `GET /dashboard/category-trends`
 - **Current code:**
@@ -337,7 +337,15 @@ Top risk by file:
 
 ---
 
-### [C8] — `/expense-trends` silently empty while backend C2 returns 500
+### [C8] — ✅ AUTO-CLOSED by C2 fix in commit `44f692d` (2026-05-27) — `/expense-trends` silently empty while backend C2 returns 500
+
+> The frontend FE-side concern (no error banner when backend 500s) is still valid as a hardening item; tracked separately. The visible page-broken state is resolved because the underlying backend C2 is fixed.
+
+---
+
+**Original finding:**
+
+
 - **File:** `app/expense-trends/page.tsx:67-74`
 - **Page:** `/expense-trends`
 - **Current code:**
