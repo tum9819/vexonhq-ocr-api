@@ -41,6 +41,19 @@ class TestBuildResourcesSnapshot:
         # RAM probe is independent — should still produce a value
         assert snap["ram_pct"] is not None
 
+    def test_resilient_to_shutil_disk_failure(self, monkeypatch):
+        """shutil.disk_usage raises -> disk_* keys None, other metrics still collected."""
+        def boom(*a, **k):
+            raise OSError("disk denied")
+        monkeypatch.setattr(di.shutil, "disk_usage", boom)
+        monkeypatch.setattr(di, "_get_scheduler", lambda: None)
+        snap = di.build_resources_snapshot()
+        assert snap["disk_pct"] is None
+        assert snap["disk_used_gb"] is None
+        assert snap["disk_total_gb"] is None
+        # Independent probes unaffected
+        assert snap["ram_pct"] is not None
+
     def test_warnings_fired_above_threshold(self, monkeypatch):
         """RAM at 85% -> 'RAM high' warning present."""
         class FakeMem:

@@ -6,8 +6,9 @@ restart/logs logic can be unit-tested in isolation. The HTTP layer
 uses urllib.request to match auto_diagnose.py style (no new transport
 lib).
 
-The only external dependency added by this module is PyNaCl, for
-Ed25519 signature verification of Discord interaction payloads.
+External dependencies added by this module: PyNaCl (Ed25519 signature
+verification of Discord interaction payloads) and psutil (VPS resource
+probing for the /resources slash command).
 
 What this module provides:
   - verify_signature()                    Ed25519 verify of Discord headers
@@ -19,6 +20,8 @@ What this module provides:
   - send_followup_message()               POST follow-up (used by Show patch)
   - coolify_restart()                     POST .../applications/{uuid}/restart
   - coolify_fetch_logs()                  GET .../applications/{uuid}/logs (v3)
+  - build_resources_snapshot()            Read-only VPS snapshot for /resources
+  - _get_scheduler()                      Lazy accessor for line_bot APScheduler
 
 Env vars (all loaded at module level, gracefully no-op if missing):
   DISCORD_BOT_TOKEN          Bot tab → Reset Token
@@ -112,9 +115,9 @@ def build_resources_snapshot() -> dict[str, Any]:
 
     try:
         d = shutil.disk_usage("/")
-        snap["disk_pct"] = round(d.used / d.total * 100, 1)
         snap["disk_used_gb"] = round(d.used / GB, 1)
         snap["disk_total_gb"] = round(d.total / GB, 1)
+        snap["disk_pct"] = round(d.used / d.total * 100, 1) if d.total else None
     except Exception:
         log.warning("snapshot: disk_usage failed", exc_info=True)
 
