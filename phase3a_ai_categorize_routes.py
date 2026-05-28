@@ -364,8 +364,13 @@ def categorize_batch(
                 result = _categorize_one(conn, bill_id, allow_llm=allow_llm)
                 processed.append(result)
             except HTTPException as e:
+                # Audit B7-C2: rollback the shared connection so a per-bill failure
+                # (e.g. transient LLM 502 after a rule-table UPDATE) doesn't leave the
+                # transaction in 'aborted' state and poison every subsequent iteration.
+                conn.rollback()
                 errors.append({"bill_id": bill_id, "status": e.status_code, "error": e.detail})
             except Exception as e:
+                conn.rollback()
                 errors.append({"bill_id": bill_id, "status": 500, "error": str(e)})
 
         by_tier = {"rule": 0, "llm": 0}
@@ -664,8 +669,12 @@ def categorize_cashflow_batch(
                 result = _categorize_cashflow_one(conn, eid, allow_llm=allow_llm)
                 processed.append(result)
             except HTTPException as e:
+                # Audit B7-C2: rollback shared connection — same reasoning as the
+                # bill batch above (one transient failure must not abort the whole batch).
+                conn.rollback()
                 errors.append({"entry_id": eid, "error": e.detail})
             except Exception as e:
+                conn.rollback()
                 errors.append({"entry_id": eid, "error": str(e)})
 
         by_tier = {}

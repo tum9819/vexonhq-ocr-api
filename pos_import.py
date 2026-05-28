@@ -490,7 +490,11 @@ def parse_payment_type_summary(df: pd.DataFrame, period_start: date,
             "payment_method":   strip_html(r.get("วิธีบันทึกรายการชำระ")),
             "custom_code":      strip_html(r.get("รหัสชำระเงินแบบกำหนดเอง")),
             "gross":            to_num(r.get("ยอดก่อนลด"))    or 0,
-            "total_discount":   to_num(r.iloc[4])             or 0,  # 'ส่วนลด' merged col
+            # Audit B7-C5 fix (2026-05-28): was r.iloc[4], a fragile positional
+            # access that reads the wrong cell if FoodStory adds/reorders a column.
+            # "ส่วนลด" is in _CANONICAL_COLS so .get() resolves it through the
+            # normalised header map like every other field in this parser.
+            "total_discount":   to_num(r.get("ส่วนลด"))       or 0,
             "total":            to_num(r.get("ยอดรวม"))      or 0,
             "service_charge":   to_num(r.get("ค่าบริการ"))    or 0,
             "pre_tax":          to_num(r.get("ยอดก่อนภาษี"))  or 0,
@@ -1330,17 +1334,28 @@ class ImportResponse(BaseModel):
 # ============================================================
 
 @router.post("/import_sync", response_model=ImportResponse)
-async def import_pos_excel_sync(
+def import_pos_excel_sync(
     file: UploadFile = File(...),
     branch_code: str = Form("thawi_watthana"),
     period_year_hint: int = Form(2026),
     uploaded_by: Optional[str] = Form(None),
 ):
+    # Audit B7-C3 fix (2026-05-28): dropped `async` — this endpoint calls
+    # read_and_detect (pd.read_excel × 3) + psycopg2.executemany synchronously,
+    # and an async def runs that ON the event loop, freezing all other requests
+    # for the duration (Session-36 class). Starlette runs a plain def in its
+    # threadpool, which keeps the event loop free. /detect-only was already
+    # fixed with asyncio.to_thread; this legacy /import_sync was missed.
     """
     [LEGACY — kept for debugging] Synchronous import. Prefer POST /pos/import.
     Upload one POS report. Auto-detects type. Blocks until done.
     """
-    content = await file.read()
+    # Audit B7-C3: switched to sync def, so we read the SpooledTemporaryFile
+    # directly (was `await file.read()` when this was async). UploadFile.file
+    # is the underlying SpooledTemporaryFile and supports sync .read() the
+    # same way UploadFile.read() does (UploadFile.read just wraps file.read
+    # in a threadpool call).
+    content = file.file.read()
     if not content:
         raise HTTPException(400, "Empty file")
     file_hash = hashlib.sha256(content).hexdigest()
