@@ -111,6 +111,17 @@ def create_statement_rule(body: StatementRuleIn, request: Request):
     if body.direction not in ("income", "expense"):
         raise HTTPException(400, f"invalid direction {body.direction!r}")
 
+    # Audit B9-C3 fix (2026-05-28): a 1-char or blank match_value becomes
+    # `ILIKE '%x%'` (or `%%`, matching everything) and misclassifies every slip
+    # on the next rematch-all. Require >= 2 characters after trim. Thai keywords
+    # are short but 2 chars is the floor — 1 char is always a catch-all.
+    match_value = body.match_value.strip()
+    if len(match_value) < 2:
+        raise HTTPException(
+            400,
+            "match_value ต้องยาวอย่างน้อย 2 ตัวอักษร (กฎสั้นไปจะกลายเป็น catch-all จับทุก slip)",
+        )
+
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -129,7 +140,7 @@ def create_statement_rule(body: StatementRuleIn, request: Request):
                 """,
                 (
                     body.rule_type,
-                    body.match_value.strip(),
+                    match_value,
                     body.direction,
                     body.category_code,
                     body.source_type,
