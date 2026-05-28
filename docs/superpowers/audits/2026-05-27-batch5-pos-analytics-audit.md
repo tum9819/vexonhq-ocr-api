@@ -20,6 +20,17 @@ Headline:
 
 NOTE on hallucinated columns: the historical offenders (`net_price`, `b.status`, `b.branch`, `staff`, `r.menu_name`, `ri.quantity`) were searched. `menu_routes.py` is clean of those EXCEPT it correctly uses `bill_net`, `branch_code`, `opened_by`, and aliases `r.name AS menu_name` (line 3982 — alias only, not a column reference, OK). The one genuine hallucinated column is `a.mean_amount` ([C1]). `pos_sales_daily.net_total`/`bill_count` and `pos_inventory_items.qty_in_stock` were verified REAL via `pos_import.py`.
 
+## ✅ Closure status (Session 44, 2026-05-28)
+
+All 4 CRITICAL closed:
+- **C1** `/alerts/summary` `a.mean_amount` — ✅ fixed in `766bdc0` (column dropped, anomaly feed unblocked)
+- **C2/C3/C4** void leak across 11 endpoints / 28 queries — ✅ fixed in `5b785e9` (added `AND b.bill_net > 0` everywhere it was missing)
+
+MEDIUM closures:
+- **M7** `net_delta abs()` — ✅ investigated as not-a-bug (`5be34f3`, comment added)
+
+Remaining MEDIUM (6) — none money-at-risk after CRITICAL closures.
+
 ---
 
 ## CRITICAL

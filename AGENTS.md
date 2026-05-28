@@ -305,4 +305,40 @@ Files known to use the exclusion (cross-check before duplicating again): `pnl_ro
 
 Verify your change: run an A/B query via Supabase MCP for a month that contains equity rows (April 2026 has 52 `owner_advance` + 10 `owner_capital`) — old vs new totals should differ; the new value should match `/pnl/monthly` for the same month.
 
-*Last updated: Session 43, 2026-05-27.*
+Update Session 44 (2026-05-28): `v_daybook_pnl` is now live in production and used by `/pnl/*`, `/scorecard`, `/dashboard/overview`, `/daybook/summary`, `/pos/food-cost`, `/yearly`, `/pnl/narrative`. New P&L queries should `FROM public.v_daybook_pnl` directly — no inline exclusion needed.
+
+**14. Don't use positional `r.iloc[N]` for column access in POS Excel parsers.** (Session 44, 2026-05-28)
+```python
+# ❌ BAD — silent wrong-cell write if FoodStory adds or reorders columns
+"total_discount": to_num(r.iloc[4]) or 0,   # "ส่วนลด" merged col
+
+# ✅ GOOD — `r.get(canonical_name)` resolves via the normalize_columns map
+"total_discount": to_num(r.get("ส่วนลด")) or 0,
+```
+Rule: every field in `pos_import.py` that maps to a POS report column MUST go through `r.get("<canonical Thai name>")`. The canonical name must exist in `_CANONICAL_COLS`. Positional `iloc` is fragile and was the root cause of B7-C5 — `total_discount` could end up reading `ยอดรวม` or `ค่าบริการ` instead.
+
+**15. Async def handlers must NOT call blocking I/O directly.** (Session 44, 2026-05-28; first seen Session 36)
+```python
+# ❌ BAD — blocks uvicorn event loop, freezes /health for the whole parse
+@router.post("/import_sync", response_model=ImportResponse)
+async def import_pos_excel_sync(...):
+    content = await file.read()
+    df, rtype = read_and_detect(content, file.filename or "")   # pd.read_excel × 3, 10-30s
+    cur.executemany("INSERT ...", rows)                          # blocking psycopg2
+
+# ✅ GOOD — sync def (Starlette runs in threadpool) + file.file.read() instead of await file.read()
+@router.post("/import_sync", response_model=ImportResponse)
+def import_pos_excel_sync(...):
+    content = file.file.read()
+    df, rtype = read_and_detect(content, file.filename or "")
+    cur.executemany("INSERT ...", rows)
+
+# ✅ ALSO GOOD — keep async but offload to threadpool
+@router.post("/detect-only")
+async def detect_only(file: UploadFile = File(...)):
+    content = await file.read()
+    _, rtype = await asyncio.to_thread(read_and_detect, content, file.filename or "")
+```
+Rule: any handler that calls pandas (`pd.read_excel`), psycopg2 (`cur.execute*` on big inputs), or other blocking C extensions must NOT be `async def` unless every blocking call is wrapped in `asyncio.to_thread()` or `BackgroundTasks`. Default to plain `def` for import paths — simpler, no foot-gun. (Audit B7-C3 / Session 36 incident class.)
+
+*Last updated: Session 44, 2026-05-28.*

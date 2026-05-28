@@ -207,9 +207,16 @@ def to_num(v: Any) -> Optional[float]:
         return None
     if isinstance(v, (int, float)):
         return float(v)
-    s = str(v).replace(",", "").strip()
+    # Audit B7-M4 fix (2026-05-28): strip non-breaking spaces + currency symbols
+    # and translate accounting parens to a negative sign before float().
+    # FoodStory and OCR'd reports occasionally include "(1,234.00)" for negatives
+    # or embed "฿" / NBSP inside numeric cells; both previously fell through to
+    # float() and returned None (silently writing 0 into the books downstream).
+    s = str(v).replace(",", "").replace(" ", "").replace("฿", "").strip()
     if not s or s == "-":
         return None
+    if s.startswith("(") and s.endswith(")"):
+        s = "-" + s[1:-1].strip()
     try:
         return float(s)
     except ValueError:
