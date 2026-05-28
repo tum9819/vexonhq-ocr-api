@@ -713,36 +713,43 @@ def phase2_health():
 
 @router.get("/inventory/current")
 def inventory_current(branch: str = Query(DEFAULT_BRANCH)):
-    """Latest snapshot + status-grouped item list."""
+    """Latest snapshot + status-grouped item list.
+
+    Audit B3-C1 fix (2026-05-28): this endpoint used to pick "ORDER BY
+    snapshot_at DESC LIMIT 1" and include promo/bundle SKUs, so it could show a
+    stray 1-row upload as the whole inventory and count Pro/(pro) packs as real
+    stock. Now reuses stock_routes._get_latest_snapshot_id (partial-upload
+    defense: latest snapshot >= 50% of the max item_count in 30 days) and
+    excludes promo SKUs the same way /stock/* does. total_items + total_value
+    are recomputed from the filtered items so the headline numbers match what
+    the user actually sees.
+    """
+    from stock_routes import _get_latest_snapshot_id
+
+    snap_id, snap_at = _get_latest_snapshot_id(branch)
+    if not snap_id:
+        return {
+            "snapshot_at": None,
+            "branch_code": branch,
+            "total_items": 0,
+            "total_value": 0,
+            "by_status": {"negative":0,"out":0,"critical":0,"low":0,"ok":0},
+            "items": [],
+        }
+
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """SELECT id, snapshot_at, item_count, total_value
-                   FROM public.pos_inventory_snapshots
-                   WHERE branch_code = %s
-                   ORDER BY snapshot_at DESC
-                   LIMIT 1""",
-                (branch,),
-            )
-            row = cur.fetchone()
-            if not row:
-                return {
-                    "snapshot_at": None,
-                    "branch_code": branch,
-                    "total_items": 0,
-                    "total_value": 0,
-                    "by_status": {"negative":0,"out":0,"critical":0,"low":0,"ok":0},
-                    "items": [],
-                }
-            snap_id, snap_at, item_count, total_value = row
-
+            # Promo NOT LIKE patterns must be passed as params, not inlined —
+            # psycopg2 treats inline '%' as a placeholder (see stock_routes.py:121-123).
             cur.execute(
                 """SELECT item_name, material_code, tag,
                           qty_in_stock, qty_max, qty_diff,
                           unit, unit_price, stock_value
                    FROM public.pos_inventory_items
                    WHERE snapshot_id = %s
+                     AND LOWER(item_name) NOT LIKE %s
+                     AND LOWER(item_name) NOT LIKE %s
                    ORDER BY
                      CASE
                        WHEN qty_in_stock < 0 THEN 1
@@ -752,10 +759,11 @@ def inventory_current(branch: str = Query(DEFAULT_BRANCH)):
                        ELSE 5
                      END,
                      item_name""",
-                (snap_id,),
+                (snap_id, "pro(%", "(pro%"),
             )
             items = []
             counts = {"negative":0,"out":0,"critical":0,"low":0,"ok":0}
+            total_value = 0.0
             for r in cur.fetchall():
                 qty = float(r[3]) if r[3] is not None else 0
                 qmax = float(r[4]) if r[4] is not None else 0
@@ -765,6 +773,8 @@ def inventory_current(branch: str = Query(DEFAULT_BRANCH)):
                 elif qmax > 0 and qty < qmax * 0.5: status = "low"
                 else: status = "ok"
                 counts[status] += 1
+                stock_value = float(r[8]) if r[8] is not None else 0
+                total_value += stock_value
                 items.append({
                     "item_name": r[0],
                     "material_code": r[1],
@@ -774,14 +784,14 @@ def inventory_current(branch: str = Query(DEFAULT_BRANCH)):
                     "qty_diff": float(r[5]) if r[5] is not None else None,
                     "unit": r[6],
                     "unit_price": float(r[7]) if r[7] is not None else None,
-                    "stock_value": float(r[8]) if r[8] is not None else 0,
+                    "stock_value": stock_value,
                     "status": status,
                 })
         return {
-            "snapshot_at": snap_at.isoformat() if snap_at else None,
+            "snapshot_at": snap_at,  # already a str from _get_latest_snapshot_id
             "branch_code": branch,
-            "total_items": item_count,
-            "total_value": float(total_value or 0),
+            "total_items": len(items),
+            "total_value": round(total_value, 2),
             "by_status": counts,
             "items": items,
         }
