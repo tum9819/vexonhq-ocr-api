@@ -594,7 +594,11 @@ def _categorize_cashflow_one(conn, entry_id: str, allow_llm: bool = True) -> dic
             raise HTTPException(409, f"Entry already processed: {status}")
 
         # Tier 1 — rules
-        rule_result = _try_rules(cur, description)
+        # Audit B7-C1 fix (2026-05-27): was _try_rules() which does not exist
+        # (NameError on every cashflow categorize → /ai/categorize/cashflow/batch
+        # never worked, petty-cash entries stuck 'pending' forever). Correct name
+        # is _try_rule_match (same (cur, text) signature, returns category_code dict).
+        rule_result = _try_rule_match(cur, description)
         if rule_result:
             cat = rule_result["category_code"]
             cur.execute(

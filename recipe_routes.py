@@ -732,10 +732,10 @@ def _auto_sync_ingredient_prices() -> dict:
                 applied += 1
 
             conn.commit()
-        log.info("auto-sync ingredient prices: applied=%d updates=%s", applied, updated)
+        logger.info("auto-sync ingredient prices: applied=%d updates=%s", applied, updated)
         return {"applied_count": applied, "updated": updated}
     except Exception:
-        log.exception("auto-sync ingredient prices failed (non-fatal)")
+        logger.exception("auto-sync ingredient prices failed (non-fatal)")
         return {"applied_count": 0, "updated": []}
     finally:
         conn.close()

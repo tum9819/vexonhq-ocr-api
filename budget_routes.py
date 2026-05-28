@@ -278,8 +278,7 @@ def suggest_budget(
                 FROM public.vendor_bills vb
                 LEFT JOIN public.expense_categories ec ON ec.code = vb.category_code
                 WHERE vb.branch_code = %s
-                  AND vb.confirmed = TRUE
-                  AND vb.direction = 'expense'
+                  AND vb.review_status = 'confirmed'
                   AND vb.bill_date >= %s
                   AND vb.bill_date < %s
                   AND vb.category_code IS NOT NULL

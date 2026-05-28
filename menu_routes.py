@@ -1342,9 +1342,13 @@ def alerts_summary(branch: str = "thawi_watthana"):
 
         # ── 1. Bill Anomalies (pending review) ──────────────────
         try:
+            # audit B5-C1: removed a.mean_amount (nonexistent column — real name is
+            # category_mean — and it was never read). It made this query 500, which
+            # the bare `except: pass` below swallowed, leaving the anomaly feed
+            # silently empty in the Alert Center.
             anom_sql = """
                 SELECT a.id, a.severity, a.anomaly_type, a.message,
-                       a.bill_amount, a.mean_amount, a.created_at,
+                       a.bill_amount, a.created_at,
                        vb.vendor_name, vb.bill_date, vb.category_code
                 FROM public.bill_anomalies a
                 JOIN public.vendor_bills vb ON vb.id = a.bill_id
@@ -1556,7 +1560,7 @@ def scorecard(month: str = "", branch: str = "thawi_watthana"):
             SELECT
                 SUM(CASE WHEN TO_CHAR(entry_date,'YYYY-MM')=%s THEN amount ELSE 0 END) AS this_rev,
                 SUM(CASE WHEN TO_CHAR(entry_date,'YYYY-MM')=%s THEN amount ELSE 0 END) AS prev_rev
-            FROM public.v_daybook
+            FROM public.v_daybook_pnl   -- audit B2-C3: exclude equity/transfer (was v_daybook)
             WHERE direction='income'
               AND TO_CHAR(entry_date,'YYYY-MM') IN (%s,%s)
               AND (%s='' OR branch_code=%s)
@@ -1571,7 +1575,7 @@ def scorecard(month: str = "", branch: str = "thawi_watthana"):
             SELECT
                 SUM(CASE WHEN TO_CHAR(entry_date,'YYYY-MM')=%s THEN amount ELSE 0 END) AS this_exp,
                 SUM(CASE WHEN TO_CHAR(entry_date,'YYYY-MM')=%s THEN amount ELSE 0 END) AS prev_exp
-            FROM public.v_daybook
+            FROM public.v_daybook_pnl   -- audit B2-C3: exclude equity/transfer (was v_daybook)
             WHERE direction='expense'
               AND TO_CHAR(entry_date,'YYYY-MM') IN (%s,%s)
               AND (%s='' OR branch_code=%s)
@@ -1589,7 +1593,7 @@ def scorecard(month: str = "", branch: str = "thawi_watthana"):
         # ── 4. Food Cost % ────────────────────────────────────
         fc_sql = """
             SELECT COALESCE(SUM(amount),0) AS food_cost
-            FROM public.v_daybook
+            FROM public.v_daybook_pnl   -- audit B2-C3: exclude equity/transfer (was v_daybook)
             WHERE direction='expense'
               AND category_code IN ('food_cost','raw_meat','raw_veggies','raw_seasoning','raw_oil_gas','raw_beverage')
               AND TO_CHAR(entry_date,'YYYY-MM')=%s
@@ -3976,11 +3980,20 @@ def pos_food_cost(
             cur.execute("SELECT COUNT(*) AS cnt FROM ingredients WHERE price_per_unit > 0")
             priced_count = int((_rows_to_dicts(cur)[0])["cnt"] or 0)
 
-            # Recipe cost per menu item (SUM of ingredient qty × price)
+            # Recipe cost per menu item (SUM of ingredient qty × price ÷ yield).
+            # Audit B2-C1 fix (2026-05-27): must divide by effective yield to match
+            # the canonical /recipes engine (_calc_cost, recipe_routes.py:778-779):
+            #   item_cost = qty_used * price_per_unit / (yield_pct/100)
+            # Without it, any trimmed ingredient (yield < 100%) understated COGS and
+            # inflated GP here, and this page disagreed with /recipes for the same dish.
+            # yield_pct NULL or 0 → treated as 100% (divisor 1.0).
             # NOTE: recipes table uses `name` column, aliased to menu_name for backward compat (Session 18 fix)
             cur.execute("""
                 SELECT r.name AS menu_name,
-                       COALESCE(SUM(ri.qty_used * COALESCE(i.price_per_unit, 0)), 0) AS cost_per_unit
+                       COALESCE(SUM(
+                           ri.qty_used * COALESCE(i.price_per_unit, 0)
+                           / (COALESCE(NULLIF(i.yield_pct, 0), 100) / 100.0)
+                       ), 0) AS cost_per_unit
                 FROM recipes r
                 JOIN recipe_ingredients ri ON ri.recipe_id = r.id
                 JOIN ingredients i ON i.id = ri.ingredient_id

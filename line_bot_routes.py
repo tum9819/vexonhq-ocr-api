@@ -622,9 +622,14 @@ def _build_digest(target_date: date) -> str:
         cur = conn.cursor()
 
         # ── 1. v_daybook summary for the day ──
+        # Audit B8-C1/C2 fix (2026-05-27): read v_daybook_pnl (equity/transfers
+        # excluded) so the daily 06:00 LINE digest's รายรับ/รายจ่าย/กำไรสุทธิ and
+        # margin% are true P&L — matches the weekly digest (which already excludes)
+        # and /pnl/daily. Raw v_daybook leaked owner_capital/owner_advance/
+        # transfer_error into the numbers TUM reads as truth (Session-6 class).
         cur.execute("""
             SELECT direction, source, COALESCE(SUM(amount), 0) AS total
-            FROM public.v_daybook
+            FROM public.v_daybook_pnl
             WHERE entry_date = %s
             GROUP BY direction, source
             ORDER BY direction, source
