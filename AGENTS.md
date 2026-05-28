@@ -155,6 +155,24 @@ silently deleted 165 lines of `/inventory/ai-order-advice`. ALWAYS
 run `.\verify.ps1 -Smoke` after a refactor PR. Pattern to recover:
 `git log -S "<function_name>"`.
 
+**7. Discord API behind Cloudflare bans default `Python-urllib` UA.**
+Any new `urllib.request` call to `discord.com/api/*` MUST set a
+`User-Agent` header. The default `Python-urllib/3.x` gets HTTP 403
+with body `error code: 1010` (Cloudflare browser-signature ban).
+```python
+req = urllib.request.Request(
+    url, data=body, method="POST",
+    headers={
+        "Authorization": f"Bot {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "VEXONHQ-OpsBot (vexonhq.com, 1.0)",  # required
+    },
+)
+```
+The 4 Discord call sites already in `discord_interactions.py` (lines
+361/417/476/526) all set this. Session 45 `scripts/register_slash_commands.py`
+shipped without it → blocked at first invocation → fixed in `daeef7f`.
+
 ---
 
 ## Workspaces
@@ -341,4 +359,4 @@ async def detect_only(file: UploadFile = File(...)):
 ```
 Rule: any handler that calls pandas (`pd.read_excel`), psycopg2 (`cur.execute*` on big inputs), or other blocking C extensions must NOT be `async def` unless every blocking call is wrapped in `asyncio.to_thread()` or `BackgroundTasks`. Default to plain `def` for import paths — simpler, no foot-gun. (Audit B7-C3 / Session 36 incident class.)
 
-*Last updated: Session 44, 2026-05-28.*
+*Last updated: Session 45 follow-up, 2026-05-29 (Discord /resources shipped + pitfall #7 added).*
