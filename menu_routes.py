@@ -1378,7 +1378,12 @@ def alerts_summary(branch: str = "thawi_watthana"):
                     "link_label": "ตรวจสอบ",
                 })
         except Exception:
-            pass
+            # Audit B5-M6 (2026-05-29): surface the failure to logs instead of
+            # swallowing silently. The /alerts/summary subqueries are
+            # best-effort (one section's failure should not break the page),
+            # but TUM needs to be able to see WHICH section is broken from
+            # Coolify logs. log.exception() includes the traceback.
+            log.exception("alerts/summary: subquery failed (section continues with empty list)")
 
         # ── 2. Budget Overruns this month ────────────────────────
         try:
@@ -1424,7 +1429,12 @@ def alerts_summary(branch: str = "thawi_watthana"):
                     "link_label": "ดูงบประมาณ",
                 })
         except Exception:
-            pass
+            # Audit B5-M6 (2026-05-29): surface the failure to logs instead of
+            # swallowing silently. The /alerts/summary subqueries are
+            # best-effort (one section's failure should not break the page),
+            # but TUM needs to be able to see WHICH section is broken from
+            # Coolify logs. log.exception() includes the traceback.
+            log.exception("alerts/summary: subquery failed (section continues with empty list)")
 
         # ── 3. AP Overdue + Due Soon ─────────────────────────────
         try:
@@ -1463,7 +1473,12 @@ def alerts_summary(branch: str = "thawi_watthana"):
                     "link_label": "จ่ายบิล",
                 })
         except Exception:
-            pass
+            # Audit B5-M6 (2026-05-29): surface the failure to logs instead of
+            # swallowing silently. The /alerts/summary subqueries are
+            # best-effort (one section's failure should not break the page),
+            # but TUM needs to be able to see WHICH section is broken from
+            # Coolify logs. log.exception() includes the traceback.
+            log.exception("alerts/summary: subquery failed (section continues with empty list)")
 
         # ── 4. Low Stock ─────────────────────────────────────────
         try:
@@ -1498,7 +1513,12 @@ def alerts_summary(branch: str = "thawi_watthana"):
                     "link_label": "ดู Inventory",
                 })
         except Exception:
-            pass
+            # Audit B5-M6 (2026-05-29): surface the failure to logs instead of
+            # swallowing silently. The /alerts/summary subqueries are
+            # best-effort (one section's failure should not break the page),
+            # but TUM needs to be able to see WHICH section is broken from
+            # Coolify logs. log.exception() includes the traceback.
+            log.exception("alerts/summary: subquery failed (section continues with empty list)")
 
         # ── Sort: danger first, then warning, then info ──────────
         sev_order = {"danger": 0, "warning": 1, "info": 2}

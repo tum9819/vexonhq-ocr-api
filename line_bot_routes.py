@@ -32,10 +32,21 @@ import urllib.error
 import uuid
 from datetime import date, datetime, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import psycopg2
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
+
+# Audit B8-M3 (2026-05-29): the Coolify container runs on UTC, so date.today()
+# returns the UTC date — at 06:00 BKK (23:00 UTC previous day) it gives the
+# WRONG day relative to "today in Bangkok". Use _today_bkk() in every digest
+# / scheduled-job context to compute the Bangkok-local date explicitly.
+_BKK = ZoneInfo("Asia/Bangkok")
+
+def _today_bkk() -> date:
+    """Return today's date in Asia/Bangkok timezone (not host TZ)."""
+    return datetime.now(_BKK).date()
 from budget_routes import run_budget_alert_check as _budget_alert_check_inner
 from cron_heartbeat import heartbeat as _heartbeat
 
@@ -739,7 +750,10 @@ def _build_digest(target_date: date) -> str:
 @_heartbeat("daily_line_digest")
 def _scheduled_daily_digest():
     """APScheduler job: send yesterday's digest to LINE at 06:00 Bangkok time."""
-    yesterday = date.today() - timedelta(days=1)
+    # Audit B8-M3 (2026-05-29): container TZ is UTC; date.today() at 06:00 BKK
+    # (23:00 UTC previous day) returns the WRONG day. Use _today_bkk() so
+    # "yesterday" lines up with the Bangkok business day.
+    yesterday = _today_bkk() - timedelta(days=1)
     log.info("Scheduled digest — sending for %s", yesterday)
     try:
         text = _build_digest(yesterday)
@@ -785,7 +799,12 @@ def _build_weekly_summary() -> str:
     """Build weekly P&L summary for last Mon–Sun."""
     conn = _get_db_conn()
     try:
-        today = date.today()
+        # Audit B8-M3 (2026-05-29): use Bangkok-local "today" so the
+        # Mon 08:00 weekly run lands on the correct ISO week boundary
+        # (container is UTC; date.today() at 08:00 BKK = 01:00 UTC
+        # which is still Monday in BKK but other call sites at <07:00 BKK
+        # would silently shift the week).
+        today = _today_bkk()
         # Last week Mon–Sun (if today is Mon, go back 7 days)
         days_since_mon = today.weekday()  # 0=Mon, 6=Sun
         week_end = today - timedelta(days=days_since_mon + 1)    # last Sunday
@@ -940,7 +959,9 @@ def line_test():
 @router.post("/digest/today")
 def digest_today():
     """Build and send today's financial digest to LINE."""
-    today = date.today()
+    # Audit B8-M3 (2026-05-29): manual /digest/today before 07:00 BKK
+    # (00:00 UTC) would have returned yesterday's digest under UTC.
+    today = _today_bkk()
     text = _build_digest(today)
     result = _push_text(text)
     return {"success": True, "date": str(today), "message_sent": text, "line_response": result}
