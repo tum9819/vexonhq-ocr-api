@@ -196,10 +196,21 @@ def _call_llm(prompt: str) -> dict:
         logger.warning("LLM returned non-JSON: %s", choice)
         parsed = {"category_code": "misc", "confidence": 0.3, "reason": "LLM JSON parse failed, fell back to misc"}
 
+    # Audit B7-M6 fix (2026-05-28): an LLM can return confidence as a string
+    # ("high"), a number > 1, or omit it — float() of "high" raises ValueError
+    # and the >1 value violates the ai_categorization_log CHECK constraint, both
+    # surfacing as 500. Mirror product_classifier.py:219-221: try/except defaulting
+    # to 0.5, then clamp to [0, 1]. Session-34 class (AI -> typed column).
+    try:
+        conf = float(parsed.get("confidence", 0.5))
+    except (TypeError, ValueError):
+        conf = 0.5
+    conf = max(0.0, min(1.0, conf))
+
     return {
         "tier": "llm",
         "category_code": parsed.get("category_code", "misc"),
-        "confidence": float(parsed.get("confidence", 0.5)),
+        "confidence": conf,
         "reason": parsed.get("reason", ""),
         "model_name": LLM_MODEL,
         "prompt_tokens": usage.prompt_tokens if usage else 0,
