@@ -37,11 +37,121 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import urllib.error
 import urllib.request
 from typing import Any, Optional
 
+import psutil
+
 log = logging.getLogger("discord_interactions")
+
+# ──────────────────────────────────────────────────────────
+# Scheduler accessor — wrapped so tests can monkeypatch without
+# triggering line_bot_routes module init (DB, APScheduler.start).
+# ──────────────────────────────────────────────────────────
+def _get_scheduler():
+    """Return the line_bot APScheduler instance, or None if unavailable."""
+    try:
+        import line_bot_routes  # noqa: PLC0415 — lazy to avoid import-time cost
+        return getattr(line_bot_routes, "_scheduler", None)
+    except Exception:
+        return None
+
+
+# ──────────────────────────────────────────────────────────
+# /resources snapshot — read-only VPS health collection.
+# Used by the Discord slash command added Session 45.
+# ──────────────────────────────────────────────────────────
+def build_resources_snapshot() -> dict[str, Any]:
+    """
+    Collect a one-shot VPS resource snapshot for the /resources slash
+    command. Never raises — every metric is independently try/excepted
+    so a single failed probe degrades to None instead of crashing the
+    whole response.
+
+    Threshold warnings (appended to snap["warnings"] as strings):
+      cpu_pct  > 80   -> "CPU high"
+      ram_pct  > 80   -> "RAM high"
+      disk_pct > 80   -> "Disk filling"
+      swap_pct > 50   -> "Swap heavy use"
+      scheduler not running -> "APScheduler not running"
+    """
+    GB = 1024 ** 3
+    MB = 1024 ** 2
+
+    snap: dict[str, Any] = {
+        "cpu_pct": None,
+        "ram_pct": None,
+        "ram_used_gb": None,
+        "ram_total_gb": None,
+        "disk_pct": None,
+        "disk_used_gb": None,
+        "disk_total_gb": None,
+        "swap_pct": None,
+        "swap_used_mb": None,
+        "swap_total_gb": None,
+        "scheduler_running": False,
+        "scheduler_jobs": 0,
+        "git_sha": "unknown",
+        "warnings": [],
+    }
+
+    try:
+        snap["cpu_pct"] = round(psutil.cpu_percent(interval=0.1), 1)
+    except Exception:
+        log.warning("snapshot: cpu_percent failed", exc_info=True)
+
+    try:
+        m = psutil.virtual_memory()
+        snap["ram_pct"] = round(m.percent, 1)
+        snap["ram_used_gb"] = round(m.used / GB, 2)
+        snap["ram_total_gb"] = round(m.total / GB, 2)
+    except Exception:
+        log.warning("snapshot: virtual_memory failed", exc_info=True)
+
+    try:
+        d = shutil.disk_usage("/")
+        snap["disk_pct"] = round(d.used / d.total * 100, 1)
+        snap["disk_used_gb"] = round(d.used / GB, 1)
+        snap["disk_total_gb"] = round(d.total / GB, 1)
+    except Exception:
+        log.warning("snapshot: disk_usage failed", exc_info=True)
+
+    try:
+        s = psutil.swap_memory()
+        snap["swap_pct"] = round(s.percent, 1)
+        snap["swap_used_mb"] = round(s.used / MB, 0)
+        snap["swap_total_gb"] = round(s.total / GB, 1)
+    except Exception:
+        log.warning("snapshot: swap_memory failed", exc_info=True)
+
+    try:
+        sched = _get_scheduler()
+        if sched is not None:
+            snap["scheduler_running"] = bool(getattr(sched, "running", False))
+            snap["scheduler_jobs"] = len(sched.get_jobs())
+    except Exception:
+        log.warning("snapshot: scheduler probe failed", exc_info=True)
+
+    for var in ("SOURCE_COMMIT", "COOLIFY_GIT_COMMIT_SHA", "GIT_SHA"):
+        v = os.environ.get(var, "")
+        if v:
+            snap["git_sha"] = v[:7]
+            break
+
+    if snap["cpu_pct"] is not None and snap["cpu_pct"] > 80:
+        snap["warnings"].append("CPU high — wait before next deploy")
+    if snap["ram_pct"] is not None and snap["ram_pct"] > 80:
+        snap["warnings"].append("RAM high — risk of OOM kill")
+    if snap["disk_pct"] is not None and snap["disk_pct"] > 80:
+        snap["warnings"].append("Disk filling — run docker prune")
+    if snap["swap_pct"] is not None and snap["swap_pct"] > 50:
+        snap["warnings"].append("Swap heavy use — investigate process")
+    if not snap["scheduler_running"]:
+        snap["warnings"].append("APScheduler not running — digests will not fire")
+
+    return snap
 
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 DISCORD_APP_PUBLIC_KEY = os.environ.get("DISCORD_APP_PUBLIC_KEY", "")
