@@ -54,6 +54,11 @@ def _post_command(app_id: str, token: str, cmd: dict) -> tuple[int, str]:
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:400]
         return e.code, detail
+    except urllib.error.URLError as e:
+        # Network-down (DNS / connection refused / timeout). Surface a
+        # clean message instead of letting a raw traceback escape and
+        # break the documented 0/1/2 exit-code contract.
+        return -1, f"network error: {e.reason}"
 
 
 def main(argv: list[str]) -> int:
