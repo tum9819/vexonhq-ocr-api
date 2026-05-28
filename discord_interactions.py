@@ -141,15 +141,15 @@ def build_resources_snapshot() -> dict[str, Any]:
             break
 
     if snap["cpu_pct"] is not None and snap["cpu_pct"] > 80:
-        snap["warnings"].append("CPU high — wait before next deploy")
+        snap["warnings"].append("⚠️ CPU high — wait before next deploy")
     if snap["ram_pct"] is not None and snap["ram_pct"] > 80:
-        snap["warnings"].append("RAM high — risk of OOM kill")
+        snap["warnings"].append("⚠️ RAM high — risk of OOM kill")
     if snap["disk_pct"] is not None and snap["disk_pct"] > 80:
-        snap["warnings"].append("Disk filling — run docker prune")
+        snap["warnings"].append("⚠️ Disk filling — run docker prune")
     if snap["swap_pct"] is not None and snap["swap_pct"] > 50:
-        snap["warnings"].append("Swap heavy use — investigate process")
+        snap["warnings"].append("⚠️ Swap heavy use — investigate process")
     if not snap["scheduler_running"]:
-        snap["warnings"].append("APScheduler not running — digests will not fire")
+        snap["warnings"].append("⚠️ APScheduler not running — digests will not fire")
 
     return snap
 
