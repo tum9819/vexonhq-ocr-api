@@ -1593,6 +1593,11 @@ def scorecard(month: str = "", branch: str = "thawi_watthana"):
         net_profit = this_rev - this_exp
         prev_net   = prev_rev - prev_exp
         net_margin = round(net_profit / this_rev * 100, 1) if this_rev else 0
+        # Audit B5-M7 (2026-05-28): abs(prev_net) is deliberate. It makes the
+        # delta sign report direction-of-improvement, not direction-of-change:
+        #   loss -100k → loss -50k => +50% (loss shrinking = improving)
+        #   loss -100k → loss -150k => -50% (loss growing  = worsening)
+        # The `if prev_net else 0` guards divide-by-zero. Not a bug.
         net_delta  = round((net_profit - prev_net) / abs(prev_net) * 100, 1) if prev_net else 0
 
         # ── 4. Food Cost % ────────────────────────────────────
