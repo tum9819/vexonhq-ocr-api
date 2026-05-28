@@ -708,3 +708,55 @@ class TestApplicationCommandBranch:
             headers={"Content-Type": "application/json"},
         )
         assert r.status_code == 401
+
+    def test_resources_snapshot_exception_returns_error_message(
+        self, app_with_router, keypair, monkeypatch
+    ):
+        """If build_resources_snapshot raises, branch replies with 200 +
+        '❌ /resources failed' so Discord does not show 'application did
+        not respond'."""
+        sk, _ = keypair
+
+        def boom():
+            raise RuntimeError("snapshot disaster")
+        monkeypatch.setattr(di, "build_resources_snapshot", boom)
+
+        body_obj = {"type": 2, "data": {"name": "resources"},
+                    "application_id": "test-app-id-123", "token": "tok"}
+        body = json.dumps(body_obj).encode("utf-8")
+        headers = _sign_body(sk, body)
+
+        client = TestClient(app_with_router)
+        r = client.post(
+            "/alerts/discord-interaction", content=body, headers=headers
+        )
+        assert r.status_code == 200, r.text
+        j = r.json()
+        assert j["type"] == 4
+        assert "❌" in j["data"]["content"]
+        assert "/resources failed" in j["data"]["content"]
+
+    def test_unknown_command_name_is_truncated_and_escaped(
+        self, app_with_router, keypair
+    ):
+        """Long names get sliced to 32 chars; backticks become single-quotes
+        so the markdown code-span around the echoed name cannot break."""
+        sk, _ = keypair
+        nasty_name = "back`tick" + "x" * 40  # 49 chars total, contains `
+        body_obj = {"type": 2, "data": {"name": nasty_name},
+                    "application_id": "test-app-id-123", "token": "tok"}
+        body = json.dumps(body_obj).encode("utf-8")
+        headers = _sign_body(sk, body)
+
+        client = TestClient(app_with_router)
+        r = client.post(
+            "/alerts/discord-interaction", content=body, headers=headers
+        )
+        assert r.status_code == 200
+        content = r.json()["data"]["content"]
+        # Truncated: full 49-char name does NOT appear
+        assert nasty_name not in content
+        # Backtick escaped: the original backtick from "back`tick" is gone
+        assert "back`tick" not in content
+        # But the safe rendering IS present
+        assert "back'tick" in content

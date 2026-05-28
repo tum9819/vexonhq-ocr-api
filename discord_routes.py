@@ -320,13 +320,16 @@ async def discord_interaction(
                 }
             )
 
-        # Unknown command — visible so TUM can spot registration drift
+        # Unknown command — visible so TUM can spot registration drift.
+        # Sanitize backticks so a name like "back`tick" cannot break the
+        # markdown code-span. Single-quote is a visible, safe substitute.
+        safe_name = cmd_name[:32].replace("`", "'")
         return JSONResponse(
             {
                 "type": RESPONSE_CHANNEL_MESSAGE,
                 "data": {
                     "content": (
-                        f"⚠️ Unsupported command: `{cmd_name[:32]}` — "
+                        f"⚠️ Unsupported command: `{safe_name}` — "
                         f"re-run scripts/register_slash_commands.py?"
                     ),
                 },
