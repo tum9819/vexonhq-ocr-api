@@ -14,7 +14,7 @@
 Today the VEXONHQ Ops Discord channel has two AI-driven features:
 
 - **`auto_diagnose.py`** — when `/health/deep` returns 503, a FastAPI BackgroundTask asks Claude Haiku to explain the failure and posts a diagnosis embed to Discord (~5s after Uptime Robot's own DOWN alert).
-- **`discord_interactions.py` + `discord_routes.py:/discord-interaction`** — every diagnosis post carries two inline buttons:
+- **`discord_interactions.py` + `discord_routes.py:/alerts/discord-interaction`** — every diagnosis post carries two inline buttons:
   - **🔄 Restart** → POSTs `Coolify v4 /applications/{uuid}/restart`
   - **🩹 Show patch** → Haiku reads container logs + emits a unified-diff suggestion
 
@@ -40,7 +40,7 @@ The brainstorming pass surfaced several adjacent ideas and rejected them for thi
 
 **Approach B (slash command), recommended during brainstorm, accepted by TUM.**
 
-Discord slash commands are application-scoped. We register `/resources` once with the Discord HTTP API. After registration, Discord routes invocations to our existing `/discord-interaction` webhook endpoint as `INTERACTION_APPLICATION_COMMAND` (type 2) — the same endpoint that already handles button clicks (type 3).
+Discord slash commands are application-scoped. We register `/resources` once with the Discord HTTP API. After registration, Discord routes invocations to our existing `/alerts/discord-interaction` webhook endpoint as `INTERACTION_APPLICATION_COMMAND` (type 2) — the same endpoint that already handles button clicks (type 3).
 
 Approach A (button-only) was rejected because the button surfaces only on diagnosis posts; TUM wants anytime checks.
 Approach C (button + slash) was rejected as redundant — slash alone covers both contexts.
@@ -51,7 +51,7 @@ Approach C (button + slash) was rejected as redundant — slash alone covers bot
 TUM types /resources in Discord
         │
         ▼
-Discord servers → POST https://api.marastation.com/discord-interaction
+Discord servers → POST https://api.marastation.com/alerts/discord-interaction
         │           (Ed25519 signature header)
         ▼
 discord_routes.py : discord_interaction()
@@ -233,7 +233,7 @@ Per CLAUDE.md working rule 1 ("Verify before commit") and rule 5 (run pytest bef
 
 ### 9.5 `verify.ps1 -Smoke` — no change required
 
-The smoke suite hits 55 unauthenticated and JWT-authed routes. `/discord-interaction` is signature-gated and not in the smoke list. Unit + integration tests above are the gate.
+The smoke suite hits 55 unauthenticated and JWT-authed routes. `/alerts/discord-interaction` is signature-gated and not in the smoke list. Unit + integration tests above are the gate.
 
 ## 10. Future extensions (explicitly not now)
 
