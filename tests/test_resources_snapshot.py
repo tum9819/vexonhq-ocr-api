@@ -84,3 +84,60 @@ class TestBuildResourcesSnapshot:
         monkeypatch.delenv("SOURCE_COMMIT")
         snap2 = di.build_resources_snapshot()
         assert snap2["git_sha"] == "unknown"
+
+
+class TestFormatResourcesMessage:
+    def test_none_metric_renders_as_dash(self):
+        """cpu_pct=None → line contains '—' (em-dash), not 'None'."""
+        snap = {
+            "cpu_pct": None, "ram_pct": 30.0, "ram_used_gb": 1.2, "ram_total_gb": 4.0,
+            "disk_pct": 50.0, "disk_used_gb": 20.0, "disk_total_gb": 40.0,
+            "swap_pct": 0.0, "swap_used_mb": 0, "swap_total_gb": 4.0,
+            "scheduler_running": True, "scheduler_jobs": 7,
+            "git_sha": "abc1234", "warnings": [],
+        }
+        out = di.format_resources_message(snap)
+        assert "—" in out
+        assert "None" not in out
+
+    def test_warnings_block_renders(self):
+        """Multiple warnings → each appears on its own line."""
+        snap = {
+            "cpu_pct": 95.0, "ram_pct": 85.0, "ram_used_gb": 3.4, "ram_total_gb": 4.0,
+            "disk_pct": 50.0, "disk_used_gb": 20.0, "disk_total_gb": 40.0,
+            "swap_pct": 0.0, "swap_used_mb": 0, "swap_total_gb": 4.0,
+            "scheduler_running": True, "scheduler_jobs": 7,
+            "git_sha": "abc1234",
+            "warnings": ["⚠️ CPU high", "⚠️ RAM high"],
+        }
+        out = di.format_resources_message(snap)
+        assert "CPU high" in out
+        assert "RAM high" in out
+        assert "Warnings: none" not in out
+
+    def test_no_warnings_shows_none_label(self):
+        """Empty warnings list → 'Warnings: none' line present."""
+        snap = {
+            "cpu_pct": 30.0, "ram_pct": 30.0, "ram_used_gb": 1.2, "ram_total_gb": 4.0,
+            "disk_pct": 50.0, "disk_used_gb": 20.0, "disk_total_gb": 40.0,
+            "swap_pct": 0.0, "swap_used_mb": 0, "swap_total_gb": 4.0,
+            "scheduler_running": True, "scheduler_jobs": 7,
+            "git_sha": "abc1234", "warnings": [],
+        }
+        out = di.format_resources_message(snap)
+        assert "Warnings: none" in out
+
+    def test_format_includes_git_sha_short(self):
+        """Formatter renders the (already-shortened) git_sha verbatim."""
+        snap = {
+            "cpu_pct": 30.0, "ram_pct": 30.0, "ram_used_gb": 1.2, "ram_total_gb": 4.0,
+            "disk_pct": 50.0, "disk_used_gb": 20.0, "disk_total_gb": 40.0,
+            "swap_pct": 0.0, "swap_used_mb": 0, "swap_total_gb": 4.0,
+            "scheduler_running": True, "scheduler_jobs": 7,
+            "git_sha": "8ad1f51", "warnings": [],
+        }
+        out = di.format_resources_message(snap)
+        assert "8ad1f51" in out
+        # The builder is responsible for truncating to 7 chars; the
+        # formatter must not pad / expand. Sanity-check both bounds:
+        assert "8ad1f51abcdef" not in out

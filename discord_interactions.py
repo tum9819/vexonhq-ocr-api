@@ -156,6 +156,58 @@ def build_resources_snapshot() -> dict[str, Any]:
 
     return snap
 
+
+def format_resources_message(snap: dict[str, Any]) -> str:
+    """Render a snapshot dict as a Discord-flavored markdown message.
+
+    None values become em-dash. The 'Warnings' block lists each warning
+    on its own line when non-empty, or shows 'Warnings: none' when empty.
+    """
+    def _pct(v):
+        return f"{v:.1f}%" if v is not None else "—"
+
+    def _gb(used, total):
+        if used is None or total is None:
+            return ""
+        return f"({used:.2f} / {total:.2f} GB)"
+
+    def _disk_gb(used, total):
+        if used is None or total is None:
+            return ""
+        return f"({used:.1f} / {total:.1f} GB)"
+
+    def _swap_label(used_mb, total_gb):
+        if used_mb is None or total_gb is None:
+            return ""
+        return f"({used_mb:.0f} MB / {total_gb:.1f} GB)"
+
+    if snap.get("scheduler_running"):
+        sched_line = f"⏰ Scheduler      {snap.get('scheduler_jobs', 0)} jobs running"
+    else:
+        sched_line = "⏰ Scheduler      ⚠️ not running"
+
+    lines = [
+        "📊 **VPS Resources** — vexonhq-core",
+        "─────────────────────────────────",
+        f"🖥️  CPU            {_pct(snap.get('cpu_pct'))}",
+        f"💾 RAM            {_pct(snap.get('ram_pct'))}   {_gb(snap.get('ram_used_gb'), snap.get('ram_total_gb'))}".rstrip(),
+        f"💿 Disk           {_pct(snap.get('disk_pct'))}   {_disk_gb(snap.get('disk_used_gb'), snap.get('disk_total_gb'))}".rstrip(),
+        f"📦 Swap           {_pct(snap.get('swap_pct'))}   {_swap_label(snap.get('swap_used_mb'), snap.get('swap_total_gb'))}".rstrip(),
+        sched_line,
+        f"🚀 Last deploy    {snap.get('git_sha', 'unknown')}",
+        "─────────────────────────────────",
+    ]
+    warnings = snap.get("warnings") or []
+    if warnings:
+        lines.append("⚠️ Warnings:")
+        for w in warnings:
+            lines.append(f"  {w}")
+    else:
+        lines.append("⚠️ Warnings: none")
+
+    return "\n".join(lines)
+
+
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 DISCORD_APP_PUBLIC_KEY = os.environ.get("DISCORD_APP_PUBLIC_KEY", "")
 DISCORD_APP_ID = os.environ.get("DISCORD_APP_ID", "")
