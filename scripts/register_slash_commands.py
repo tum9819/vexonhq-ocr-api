@@ -44,6 +44,11 @@ def _post_command(app_id: str, token: str, cmd: dict) -> tuple[int, str]:
         headers={
             "Authorization": f"Bot {token}",
             "Content-Type": "application/json",
+            # Discord's Cloudflare returns 1010 (browser-signature ban)
+            # to default Python-urllib UA. Match the UA already used by
+            # discord_interactions.py so the script behaves like the
+            # rest of the bot integration.
+            "User-Agent": "VEXONHQ-OpsBot (vexonhq.com, 1.0)",
         },
     )
     try:
