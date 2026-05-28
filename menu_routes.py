@@ -145,6 +145,7 @@ def menu_performance(
                    WHERE pb.branch_code = %s
                      AND pb.sales_date >= %s
                      AND pb.sales_date < %s
+                     AND pb.bill_net > 0
                      AND si.item_name IS NOT NULL
                      AND si.item_name <> ''
                    GROUP BY si.item_name, si.category, si.product_group
@@ -170,6 +171,7 @@ def menu_performance(
                    WHERE pb.branch_code = %s
                      AND pb.sales_date >= %s
                      AND pb.sales_date < %s
+                     AND pb.bill_net > 0
                      AND si.item_name IS NOT NULL
                      AND si.item_name <> ''
                    GROUP BY si.item_name, si.category, si.product_group
@@ -192,6 +194,7 @@ def menu_performance(
                    WHERE pb.branch_code = %s
                      AND pb.sales_date >= %s
                      AND pb.sales_date < %s
+                     AND pb.bill_net > 0
                    GROUP BY 1
                    ORDER BY total_revenue DESC""",
                 (branch, start, end),
@@ -209,7 +212,8 @@ def menu_performance(
                    JOIN public.pos_bills pb ON pb.id = si.bill_id
                    WHERE pb.branch_code = %s
                      AND pb.sales_date >= %s
-                     AND pb.sales_date < %s""",
+                     AND pb.sales_date < %s
+                     AND pb.bill_net > 0""",
                 (branch, start, end),
             )
             r = cur.fetchone()
@@ -282,6 +286,7 @@ def menu_trends(
                    WHERE pb.branch_code = %s
                      AND pb.sales_date >= %s
                      AND pb.sales_date < %s
+                     AND pb.bill_net > 0
                      AND si.item_name = ANY(%s)
                    GROUP BY 1, 2
                    ORDER BY 1, 2""",
@@ -1815,6 +1820,7 @@ def pos_menu_engineering(
                    WHERE pb.branch_code = %s
                      AND pb.sales_date >= %s
                      AND pb.sales_date < %s
+                     AND pb.bill_net > 0
                      AND si.item_name IS NOT NULL
                      AND si.item_name <> ''
                    GROUP BY si.item_name, si.category
@@ -2058,7 +2064,8 @@ def pos_payments(
                    ) si ON si.bill_id = b.id
                    WHERE b.branch_code = %s
                      AND b.sales_date >= %s
-                     AND b.sales_date < %s""",
+                     AND b.sales_date < %s
+                     AND b.bill_net > 0""",
                 (branch, start, end),
             )
             ds = _rows_to_dicts(cur)[0]
@@ -2097,6 +2104,7 @@ def pos_payments(
                    WHERE b.branch_code = %s
                      AND b.sales_date >= %s
                      AND b.sales_date < %s
+                     AND b.bill_net > 0
                    GROUP BY 1
                    ORDER BY 1""",
                 (branch, start, end),
@@ -2254,6 +2262,7 @@ def pos_item_trend(
             FROM pos_sales_items si
             JOIN pos_bills b ON b.id = si.bill_id
             WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+              AND b.bill_net > 0
               {branch_filter}
               {category_filter}
             GROUP BY si.item_name, si.category
@@ -2270,6 +2279,7 @@ def pos_item_trend(
             FROM pos_sales_items si
             JOIN pos_bills b ON b.id = si.bill_id
             WHERE b.sales_date BETWEEN %(prev_start)s AND %(prev_end)s
+              AND b.bill_net > 0
               {branch_filter}
               {category_filter}
             GROUP BY si.item_name
@@ -2284,6 +2294,7 @@ def pos_item_trend(
             FROM pos_sales_items si
             JOIN pos_bills b ON b.id = si.bill_id
             WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+              AND b.bill_net > 0
               {branch_filter}
               {category_filter}
             GROUP BY si.item_name, month
@@ -2295,6 +2306,7 @@ def pos_item_trend(
             FROM pos_sales_items si
             JOIN pos_bills b ON b.id = si.bill_id
             WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+              AND b.bill_net > 0
               {branch_filter}
             ORDER BY si.category
         """
@@ -2575,6 +2587,7 @@ def pos_categories(
                 FROM pos_sales_items si
                 JOIN pos_bills b ON b.id = si.bill_id
                 WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  AND b.bill_net > 0
                   {branch_sql}
                 GROUP BY 1
                 ORDER BY total_revenue DESC
@@ -2593,6 +2606,7 @@ def pos_categories(
                 FROM pos_sales_items si
                 JOIN pos_bills b ON b.id = si.bill_id
                 WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  AND b.bill_net > 0
                   {branch_sql}
                 GROUP BY 1, 2
                 ORDER BY 1, revenue DESC
@@ -2609,6 +2623,7 @@ def pos_categories(
                 FROM pos_sales_items si
                 JOIN pos_bills b ON b.id = si.bill_id
                 WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  AND b.bill_net > 0
                   {branch_sql}
                 GROUP BY 1, 2
                 ORDER BY 1, revenue DESC
@@ -2735,6 +2750,7 @@ def pos_calendar(
                 FROM pos_sales_items si
                 JOIN pos_bills b ON b.id = si.bill_id
                 WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  AND b.bill_net > 0
                   {'AND b.branch_code = %(branch)s' if branch else ''}
                 GROUP BY si.item_name
                 ORDER BY revenue DESC
@@ -2818,6 +2834,7 @@ def pos_combos(
                 SELECT COUNT(DISTINCT id) AS total_bills
                 FROM pos_bills
                 WHERE sales_date BETWEEN %(start)s AND %(end)s
+                  AND bill_net > 0
                   {branch_sql_b}
             """, params)
             total_row = _rows_to_dicts(cur)
@@ -2829,6 +2846,7 @@ def pos_combos(
                 FROM pos_sales_items si
                 JOIN pos_bills b ON b.id = si.bill_id
                 WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  AND b.bill_net > 0
                   {branch_sql_b}
                 GROUP BY si.item_name
             """, params)
@@ -2847,6 +2865,7 @@ def pos_combos(
                   AND a.item_name < b.item_name
                 JOIN pos_bills bl ON bl.id = a.bill_id
                 WHERE bl.sales_date BETWEEN %(start)s AND %(end)s
+                  AND bl.bill_net > 0
                   {branch_sql_b.replace('b.branch_code', 'bl.branch_code')}
                   {item_filter}
                 GROUP BY 1, 2
@@ -2863,6 +2882,7 @@ def pos_combos(
                 FROM pos_sales_items si
                 JOIN pos_bills b ON b.id = si.bill_id
                 WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  AND b.bill_net > 0
                   {branch_sql_b}
                 GROUP BY si.item_name
                 ORDER BY bill_count DESC
@@ -2965,6 +2985,7 @@ def pos_compare(
                 FROM pos_sales_items si
                 JOIN pos_bills b ON b.id = si.bill_id
                 WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  AND b.bill_net > 0
                   {branch_sql}
                 GROUP BY si.item_name
                 ORDER BY revenue DESC
@@ -2979,6 +3000,7 @@ def pos_compare(
                 FROM pos_sales_items si
                 JOIN pos_bills b ON b.id = si.bill_id
                 WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  AND b.bill_net > 0
                   {branch_sql}
                 GROUP BY 1
                 ORDER BY revenue DESC
@@ -3169,6 +3191,7 @@ def pos_flash(date: str = Query(None), branch: str = Query("")):
                 FROM pos_sales_items si
                 JOIN pos_bills b ON b.id = si.bill_id
                 WHERE b.sales_date = %(d)s
+                  AND b.bill_net > 0
                 {branch_filter.replace('branch_code', 'b.branch_code')}
                 GROUP BY si.item_name, si.category
                 ORDER BY revenue DESC
@@ -3272,6 +3295,7 @@ def pos_discounts(months: int = Query(3), branch: str = Query("")):
                 FROM pos_bills b
                 {si_join}
                 WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  AND b.bill_net > 0
                 {branch_filter}
             """, params)
             row = cur.fetchone()
@@ -3301,6 +3325,7 @@ def pos_discounts(months: int = Query(3), branch: str = Query("")):
                 FROM pos_bills b
                 {si_join}
                 WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  AND b.bill_net > 0
                 {branch_filter}
                 GROUP BY staff
                 HAVING SUM(COALESCE(si.item_disc, 0) + b.bill_discount) > 0
@@ -3330,6 +3355,7 @@ def pos_discounts(months: int = Query(3), branch: str = Query("")):
                 FROM pos_bills b
                 {si_join}
                 WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  AND b.bill_net > 0
                 {branch_filter}
                 GROUP BY hr
                 ORDER BY hr
@@ -3351,6 +3377,7 @@ def pos_discounts(months: int = Query(3), branch: str = Query("")):
                 FROM pos_bills b
                 {si_join}
                 WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  AND b.bill_net > 0
                 {branch_filter}
                 GROUP BY month
                 ORDER BY month
@@ -3379,6 +3406,7 @@ def pos_discounts(months: int = Query(3), branch: str = Query("")):
                 FROM pos_bills b
                 {si_join}
                 WHERE b.sales_date BETWEEN %(start)s AND %(end)s
+                  AND b.bill_net > 0
                 {branch_filter}
                 GROUP BY otype
                 ORDER BY total_disc DESC
