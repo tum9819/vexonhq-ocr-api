@@ -111,8 +111,11 @@ class TestFormatResourcesMessage:
             "warnings": ["⚠️ CPU high", "⚠️ RAM high"],
         }
         out = di.format_resources_message(snap)
-        assert "CPU high" in out
-        assert "RAM high" in out
+        # Full string + indent — catches regressions that strip the
+        # emoji prefix, drop the two-space indent, or collapse warnings
+        # onto the header line.
+        assert "  ⚠️ CPU high" in out
+        assert "  ⚠️ RAM high" in out
         assert "Warnings: none" not in out
 
     def test_no_warnings_shows_none_label(self):
