@@ -22,7 +22,10 @@ Both CRITICAL closed:
 - **C1** Daily LINE digest equity exclusion — ✅ fixed in `766bdc0` (line_bot_routes.py:627 `FROM v_daybook_pnl`)
 - **C2** Margin% same root — ✅ closed by C1 fix (denominator now equity-excluded)
 
-Remaining: 4 MEDIUM + 3 LOW — quick-entry parser quirks, no money corruption.
+MEDIUM closures (Session 45, 2026-05-28):
+- **M3** `date.today()` host-TZ bug — ✅ fixed in `8ad1f51`. Added `_today_bkk()` helper (`ZoneInfo("Asia/Bangkok")`) and replaced `date.today()` in `_scheduled_daily_digest` (line 753), `_build_weekly_summary` (line 802), and `digest_today` (line 956). Container runs UTC, so 06:00 BKK = 23:00 UTC prev day — pre-fix all three would have computed for the wrong Bangkok business day. Quick-entry INSERT and display strftime intentionally left alone (out of audit scope, "now" semantics OK there).
+
+Remaining: 3 MEDIUM + 3 LOW — quick-entry parser quirks, no money corruption.
 
 ---
 

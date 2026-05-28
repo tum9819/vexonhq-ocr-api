@@ -1,10 +1,16 @@
 # Runbook — ทยอย push พรุ่งนี้ (2026-05-28)
 
-> เขียนคืน 2026-05-27, **อัปเดตจบ Session 44 (2026-05-28)**. Audit batch 1-12 เสร็จครบ (ทุก backend + ทุก frontend page).
+> เขียนคืน 2026-05-27, **อัปเดตจบ Session 45 (2026-05-28)**. Audit batch 1-12 เสร็จครบ (ทุก backend + ทุก frontend page).
 > **Grand total = 44 CRITICAL / 92 MEDIUM / 57 LOW.**
-> **ปิดแล้ว 28 CRITICAL + 2 MEDIUM + 1 accepted-risk (B10-C1 RBAC).** เหลือ open 15 CRITICAL — 4 Tax (รอบัญชี), 2 Auth security (B10-C2/C3), 3 design (B7-C4 dedup, B9-C1 slip, B3-C2 ai guardrail), 6 frontend/backend residual.
+> **ปิดแล้ว 28 CRITICAL + 4 MEDIUM + 1 accepted-risk (B10-C1 RBAC).** เหลือ open 15 CRITICAL — 4 Tax (รอบัญชี), 2 Auth security (B10-C2/C3), 3 design (B7-C4 dedup, B9-C1 slip, B3-C2 ai guardrail), 6 frontend/backend residual.
 >
 > Session 44 ปิด 20 CRITICAL ใน 9 commits (1 frontend + 8 backend), ไม่มี VPS overload, post-deploy verify ผ่านทุกครั้ง.
+> Session 45 ปิด 2 MEDIUM (B5-M6 swallowed exceptions + B8-M3 BKK timezone) ใน 1 commit, defensive cleanup, deploy ผ่าน healthy.
+
+## 📜 Session 45 closure log (2026-05-28)
+
+Backend `vexonhq-ocr-api`:
+- `8ad1f51` — B5-M6 (`/alerts/summary` 4 × `except: pass` → `log.exception`), B8-M3 (`_today_bkk()` helper + 3 `date.today()` callsites in line_bot scheduled digests). Mechanical safe batch — no behavior change at CRITICAL level, only visibility (M6) and BKK-correctness (M3).
 
 ## 📜 Session 44 closure log (2026-05-28)
 

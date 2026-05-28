@@ -28,8 +28,9 @@ All 4 CRITICAL closed:
 
 MEDIUM closures:
 - **M7** `net_delta abs()` — ✅ investigated as not-a-bug (`5be34f3`, comment added)
+- **M6** suppressed `except: pass` in `/alerts/summary` — ✅ fixed in `8ad1f51` (Session 45). 4 blocks now `log.exception("alerts/summary: subquery failed (section continues with empty list)")`. Behavior unchanged (each section still falls back to empty list); the next hallucinated column / silent fail surfaces in Coolify logs instead of disappearing.
 
-Remaining MEDIUM (6) — none money-at-risk after CRITICAL closures.
+Remaining MEDIUM (5) — none money-at-risk after CRITICAL closures.
 
 ---
 
