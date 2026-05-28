@@ -53,6 +53,7 @@ ALERTS_WEBHOOK_SECRET = os.environ.get("ALERTS_WEBHOOK_SECRET", "")
 
 # Discord interaction types (subset we care about)
 INTERACTION_PING = 1
+INTERACTION_APPLICATION_COMMAND = 2
 INTERACTION_MESSAGE_COMPONENT = 3
 
 # Discord interaction response types
@@ -292,6 +293,41 @@ async def discord_interaction(
                     "content": (
                         f"⚠️ Unsupported component custom_id: "
                         f"`{custom_id[:64]}`"
+                    ),
+                },
+            }
+        )
+
+    if itype == INTERACTION_APPLICATION_COMMAND:
+        data = payload.get("data") or {}
+        cmd_name = (data.get("name") or "").lower()
+
+        if cmd_name == "resources":
+            try:
+                snap = di.build_resources_snapshot()
+                content = di.format_resources_message(snap)
+            except Exception:
+                log.exception(
+                    "discord_interaction: /resources snapshot failed"
+                )
+                content = (
+                    "❌ /resources failed — check Coolify logs for traceback"
+                )
+            return JSONResponse(
+                {
+                    "type": RESPONSE_CHANNEL_MESSAGE,
+                    "data": {"content": content},
+                }
+            )
+
+        # Unknown command — visible so TUM can spot registration drift
+        return JSONResponse(
+            {
+                "type": RESPONSE_CHANNEL_MESSAGE,
+                "data": {
+                    "content": (
+                        f"⚠️ Unsupported command: `{cmd_name[:32]}` — "
+                        f"re-run scripts/register_slash_commands.py?"
                     ),
                 },
             }

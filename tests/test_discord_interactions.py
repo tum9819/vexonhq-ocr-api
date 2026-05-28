@@ -637,3 +637,74 @@ class TestShowPatchBackgroundTask:
         followup_mock.assert_called_once()
         msg = followup_mock.call_args.args[2]
         assert "Coolify logs are empty" in msg
+
+
+# ──────────────────────────────────────────────────────────
+# Slash command branch (INTERACTION_APPLICATION_COMMAND = 2)
+# ──────────────────────────────────────────────────────────
+class TestApplicationCommandBranch:
+    def test_resources_returns_snapshot_message(
+        self, app_with_router, keypair, monkeypatch
+    ):
+        """POST /alerts/discord-interaction with type=2, name=resources →
+        200 + RESPONSE_CHANNEL_MESSAGE containing snapshot text."""
+        sk, _ = keypair
+        # Force a known snapshot so the test is deterministic
+        fake_snap = {
+            "cpu_pct": 25.0, "ram_pct": 30.0, "ram_used_gb": 1.2,
+            "ram_total_gb": 4.0, "disk_pct": 50.0, "disk_used_gb": 20.0,
+            "disk_total_gb": 40.0, "swap_pct": 0.0, "swap_used_mb": 0,
+            "swap_total_gb": 4.0, "scheduler_running": True,
+            "scheduler_jobs": 7, "git_sha": "abc1234", "warnings": [],
+        }
+        monkeypatch.setattr(di, "build_resources_snapshot", lambda: fake_snap)
+
+        body_obj = {"type": 2, "data": {"name": "resources"},
+                    "application_id": "test-app-id-123", "token": "tok"}
+        body = json.dumps(body_obj).encode("utf-8")
+        headers = _sign_body(sk, body)
+
+        client = TestClient(app_with_router)
+        r = client.post(
+            "/alerts/discord-interaction", content=body, headers=headers
+        )
+        assert r.status_code == 200, r.text
+        j = r.json()
+        assert j["type"] == 4  # RESPONSE_CHANNEL_MESSAGE
+        assert "VPS Resources" in j["data"]["content"]
+        assert "abc1234" in j["data"]["content"]
+
+    def test_unknown_command_name_returns_warning(
+        self, app_with_router, keypair
+    ):
+        """Unknown slash-command name → 'Unsupported command' reply."""
+        sk, _ = keypair
+        body_obj = {"type": 2, "data": {"name": "nope"},
+                    "application_id": "test-app-id-123", "token": "tok"}
+        body = json.dumps(body_obj).encode("utf-8")
+        headers = _sign_body(sk, body)
+
+        client = TestClient(app_with_router)
+        r = client.post(
+            "/alerts/discord-interaction", content=body, headers=headers
+        )
+        assert r.status_code == 200
+        j = r.json()
+        assert j["type"] == 4
+        assert "Unsupported command" in j["data"]["content"]
+        assert "nope" in j["data"]["content"]
+
+    def test_application_command_still_requires_valid_signature(
+        self, app_with_router
+    ):
+        """Unsigned slash-command POST → 401, snapshot never built."""
+        body_obj = {"type": 2, "data": {"name": "resources"}}
+        body = json.dumps(body_obj).encode("utf-8")
+
+        client = TestClient(app_with_router)
+        r = client.post(
+            "/alerts/discord-interaction",
+            content=body,
+            headers={"Content-Type": "application/json"},
+        )
+        assert r.status_code == 401
