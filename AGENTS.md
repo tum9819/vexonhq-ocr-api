@@ -173,6 +173,48 @@ The 4 Discord call sites already in `discord_interactions.py` (lines
 361/417/476/526) all set this. Session 45 `scripts/register_slash_commands.py`
 shipped without it → blocked at first invocation → fixed in `daeef7f`.
 
+**8. Discord slash commands collide across bots in shared servers — namespace under one top-level command.**
+The VEXONHQ Ops Discord server hosts multiple bots (Sentry, GitHub,
+Wordle, etc.). Each bot's slash commands appear in the SAME autocomplete
+list. Generic names like `/help`, `/logs`, `/info` will collide — Sentry
+already owns `/help`, and TUM accidentally invoked Sentry's `/help`
+instead of ours during initial testing (Session 45).
+
+Solution: register ONE top-level command per bot, with subcommands
+underneath. Discord's autocomplete then shows `/vex resources` and
+`/vex help` (clearly ours, no collision) instead of `/resources` and
+`/help` (which would compete with every other bot's commands).
+
+```python
+# WRONG — every command is a top-level name in the global pool
+COMMANDS = [
+    {"name": "resources", "type": 1, "description": "..."},
+    {"name": "help",      "type": 1, "description": "..."},  # collides with Sentry
+]
+
+# RIGHT — one top-level namespace, two subcommands
+COMMANDS = [
+    {
+        "name": "vex", "type": 1,
+        "description": "VEXONHQ Ops Bot",
+        "options": [
+            {"name": "resources", "type": 1, "description": "..."},
+            {"name": "help",      "type": 1, "description": "..."},
+        ],
+    },
+]
+```
+
+Companion rule: when *renaming* or *removing* commands, use Discord's
+**bulk overwrite** endpoint (`PUT /applications/{id}/commands`)
+instead of POST-per-command. PUT replaces the entire command set
+atomically — anything not in the body is deleted. POST-per-command
+leaves orphaned old commands forever (no auto-cleanup).
+
+Refactored in `ab053aa` after live UX feedback. Dispatch pattern in
+`discord_routes.py` reads `data["options"][0]["name"]` for the
+subcommand after matching the top-level `data["name"] == "vex"`.
+
 ---
 
 ## Workspaces
@@ -359,4 +401,4 @@ async def detect_only(file: UploadFile = File(...)):
 ```
 Rule: any handler that calls pandas (`pd.read_excel`), psycopg2 (`cur.execute*` on big inputs), or other blocking C extensions must NOT be `async def` unless every blocking call is wrapped in `asyncio.to_thread()` or `BackgroundTasks`. Default to plain `def` for import paths — simpler, no foot-gun. (Audit B7-C3 / Session 36 incident class.)
 
-*Last updated: Session 45 follow-up, 2026-05-29 (Discord /resources shipped + pitfall #7 added).*
+*Last updated: Session 45 follow-up #3, 2026-05-29 (Discord /vex namespace + pitfall #8 added).*
