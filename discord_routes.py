@@ -320,6 +320,16 @@ async def discord_interaction(
                 }
             )
 
+        if cmd_name == "help":
+            # Pure static text — no try/except needed; format_help_message
+            # has no failure modes that would justify shielding.
+            return JSONResponse(
+                {
+                    "type": RESPONSE_CHANNEL_MESSAGE,
+                    "data": {"content": di.format_help_message()},
+                }
+            )
+
         # Unknown command — visible so TUM can spot registration drift.
         # Sanitize backticks so a name like "back`tick" cannot break the
         # markdown code-span. Single-quote is a visible, safe substitute.

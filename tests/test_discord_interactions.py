@@ -760,3 +760,29 @@ class TestApplicationCommandBranch:
         assert "back`tick" not in content
         # But the safe rendering IS present
         assert "back'tick" in content
+
+    def test_help_command_returns_help_message(
+        self, app_with_router, keypair
+    ):
+        """POST /alerts/discord-interaction with type=2, name=help →
+        200 + RESPONSE_CHANNEL_MESSAGE containing the help text. Confirms
+        the new /help dispatch branch is wired and reachable."""
+        sk, _ = keypair
+        body_obj = {"type": 2, "data": {"name": "help"},
+                    "application_id": "test-app-id-123", "token": "tok"}
+        body = json.dumps(body_obj).encode("utf-8")
+        headers = _sign_body(sk, body)
+
+        client = TestClient(app_with_router)
+        r = client.post(
+            "/alerts/discord-interaction", content=body, headers=headers
+        )
+        assert r.status_code == 200, r.text
+        j = r.json()
+        assert j["type"] == 4
+        content = j["data"]["content"]
+        # Smoke-check: help message lists at least the canonical pieces
+        assert "VEXONHQ Ops Bot" in content
+        assert "/resources" in content
+        assert "/help" in content
+        assert "Restart" in content

@@ -208,6 +208,29 @@ def format_resources_message(snap: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_help_message() -> str:
+    """Render the /help slash command response.
+
+    Static text — lists every Bot capability so TUM can rediscover
+    features without reading code. Update this when a new slash
+    command, button, or auto-message is added.
+    """
+    return "\n".join([
+        "🤖 **VEXONHQ Ops Bot — Commands**",
+        "─────────────────────────────────",
+        "`/resources`    📊 VPS snapshot (CPU/RAM/disk/swap/scheduler/last deploy)",
+        "`/help`         📖 Show this list",
+        "",
+        "🔘 **Buttons** (appear on diagnose posts when `/health/deep` returns 503):",
+        "  🔄 Restart       — restart the backend container via Coolify API",
+        "  🩹 Show patch    — Claude reads container logs + suggests a unified-diff fix",
+        "",
+        "📢 **Auto messages**:",
+        "  🤖 AI Diagnosis   — Claude diagnoses the failure within ~5 s of an outage",
+        "  🚨 Uptime alert   — Uptime Robot pings @everyone on DOWN / UP transitions",
+    ])
+
+
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 DISCORD_APP_PUBLIC_KEY = os.environ.get("DISCORD_APP_PUBLIC_KEY", "")
 DISCORD_APP_ID = os.environ.get("DISCORD_APP_ID", "")

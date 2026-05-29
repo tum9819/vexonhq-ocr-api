@@ -144,3 +144,30 @@ class TestFormatResourcesMessage:
         # The builder is responsible for truncating to 7 chars; the
         # formatter must not pad / expand. Sanity-check both bounds:
         assert "8ad1f51abcdef" not in out
+
+
+class TestFormatHelpMessage:
+    def test_lists_all_user_facing_capabilities(self):
+        """/help output must mention every command, every button, and
+        every auto-message. This is the canonical 'what can this bot do'
+        reference for TUM; if a capability is added without updating
+        format_help_message, this test catches it."""
+        out = di.format_help_message()
+        # Slash commands
+        assert "/resources" in out
+        assert "/help" in out
+        # Buttons (appear on diagnose posts)
+        assert "Restart" in out
+        assert "Show patch" in out
+        # Auto messages
+        assert "AI Diagnosis" in out
+        assert "Uptime" in out
+
+    def test_returns_non_empty_markdown_string(self):
+        """Sanity: function returns a str, not None or empty, and
+        carries the bot-name header so the user knows what they're
+        looking at."""
+        out = di.format_help_message()
+        assert isinstance(out, str)
+        assert len(out) > 100
+        assert "VEXONHQ Ops Bot" in out

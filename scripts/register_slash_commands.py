@@ -29,6 +29,11 @@ COMMANDS = [
         ),
         "type": 1,  # CHAT_INPUT
     },
+    {
+        "name": "help",
+        "description": "List all Ops Bot commands, buttons, and auto messages",
+        "type": 1,  # CHAT_INPUT
+    },
 ]
 
 

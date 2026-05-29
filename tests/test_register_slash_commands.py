@@ -25,7 +25,9 @@ def test_dry_run_lists_resources_without_api_call():
         f"stdout={result.stdout}\nstderr={result.stderr}"
     )
     out = result.stdout.lower()
+    # Both commands the script registers must appear in the dry-run list
     assert "resources" in out
+    assert "help" in out
     # Real guard against a live call is the "--dry-run early-return"
     # logic in the script; sanity-check that path emitted its marker.
     assert "dry-run" in out
