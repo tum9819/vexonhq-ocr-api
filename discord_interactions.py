@@ -209,17 +209,17 @@ def format_resources_message(snap: dict[str, Any]) -> str:
 
 
 def format_help_message() -> str:
-    """Render the /help slash command response.
+    """Render the /vex help subcommand response.
 
     Static text — lists every Bot capability so TUM can rediscover
-    features without reading code. Update this when a new slash
-    command, button, or auto-message is added.
+    features without reading code. Update this when a new subcommand,
+    button, or auto-message is added.
     """
     return "\n".join([
         "🤖 **VEXONHQ Ops Bot — Commands**",
         "─────────────────────────────────",
-        "`/resources`    📊 VPS snapshot (CPU/RAM/disk/swap/scheduler/last deploy)",
-        "`/help`         📖 Show this list",
+        "`/vex resources`    📊 VPS snapshot (CPU/RAM/disk/swap/scheduler/last deploy)",
+        "`/vex help`         📖 Show this list",
         "",
         "🔘 **Buttons** (appear on diagnose posts when `/health/deep` returns 503):",
         "  🔄 Restart       — restart the backend container via Coolify API",

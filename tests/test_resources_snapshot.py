@@ -148,14 +148,14 @@ class TestFormatResourcesMessage:
 
 class TestFormatHelpMessage:
     def test_lists_all_user_facing_capabilities(self):
-        """/help output must mention every command, every button, and
-        every auto-message. This is the canonical 'what can this bot do'
-        reference for TUM; if a capability is added without updating
+        """/vex help output must mention every subcommand, every button,
+        and every auto-message. This is the canonical 'what can this bot
+        do' reference for TUM; if a capability is added without updating
         format_help_message, this test catches it."""
         out = di.format_help_message()
-        # Slash commands
-        assert "/resources" in out
-        assert "/help" in out
+        # Subcommands of /vex
+        assert "/vex resources" in out
+        assert "/vex help" in out
         # Buttons (appear on diagnose posts)
         assert "Restart" in out
         assert "Show patch" in out

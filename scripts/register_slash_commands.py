@@ -1,15 +1,25 @@
 """Register VEXONHQ Discord slash commands.
 
-Idempotent: Discord upserts application commands by name. Re-run any
-time you add a new command or change a description.
+Uses Discord's BULK OVERWRITE endpoint
+(PUT /applications/{id}/commands) so the COMMANDS list below is the
+canonical source of truth — any command no longer in the list is
+DELETED from Discord on the next run. This avoids the "old /resources
++ /help linger forever after rename" hazard.
 
 Required env (live mode only):
   DISCORD_APP_ID      from Discord Developer Portal → General Information
   DISCORD_BOT_TOKEN   from Bot tab → Reset Token (NOT the OAuth2 client secret)
 
 Usage:
-  python scripts/register_slash_commands.py            # live POST
+  python scripts/register_slash_commands.py            # live PUT
   python scripts/register_slash_commands.py --dry-run  # print plan only
+
+Subcommand design note: one top-level `/vex` namespace with
+subcommands underneath (e.g. `/vex resources`, `/vex help`) so this
+bot's commands don't collide with other bots sharing the same Discord
+server (Sentry, GitHub, etc. all register their own `/help`). One
+top-level command per bot is the recommended pattern when multiple
+bots co-exist.
 """
 
 from __future__ import annotations
@@ -20,32 +30,43 @@ import sys
 import urllib.error
 import urllib.request
 
+# Discord application command option types
+_OPT_SUB_COMMAND = 1
+
 COMMANDS = [
     {
-        "name": "resources",
-        "description": (
-            "Show VPS resource snapshot "
-            "(CPU/RAM/disk/swap/scheduler/last deploy)"
-        ),
+        "name": "vex",
+        "description": "VEXONHQ Ops Bot — VPS snapshot, help, future ops actions",
         "type": 1,  # CHAT_INPUT
-    },
-    {
-        "name": "help",
-        "description": "List all Ops Bot commands, buttons, and auto messages",
-        "type": 1,  # CHAT_INPUT
+        "options": [
+            {
+                "name": "resources",
+                "description": (
+                    "Show VPS resource snapshot "
+                    "(CPU/RAM/disk/swap/scheduler/last deploy)"
+                ),
+                "type": _OPT_SUB_COMMAND,
+            },
+            {
+                "name": "help",
+                "description": (
+                    "List all Ops Bot commands, buttons, and auto messages"
+                ),
+                "type": _OPT_SUB_COMMAND,
+            },
+        ],
     },
 ]
 
 
-def _post_command(app_id: str, token: str, cmd: dict) -> tuple[int, str]:
-    url = (
-        f"https://discord.com/api/v10/applications/{app_id}/commands"
-    )
-    body = json.dumps(cmd).encode("utf-8")
+def _bulk_overwrite(app_id: str, token: str, commands: list[dict]) -> tuple[int, str]:
+    """PUT the entire command list — Discord deletes anything not in body."""
+    url = f"https://discord.com/api/v10/applications/{app_id}/commands"
+    body = json.dumps(commands).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=body,
-        method="POST",
+        method="PUT",
         headers={
             "Authorization": f"Bot {token}",
             "Content-Type": "application/json",
@@ -60,7 +81,9 @@ def _post_command(app_id: str, token: str, cmd: dict) -> tuple[int, str]:
         with urllib.request.urlopen(req, timeout=15) as resp:
             text = resp.read().decode("utf-8")
             data = json.loads(text)
-            return 0, str(data.get("id", "?"))
+            # Bulk overwrite returns an array of command objects
+            ids = [str(c.get("id", "?")) for c in data] if isinstance(data, list) else []
+            return 0, ",".join(ids)
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:400]
         return e.code, detail
@@ -71,14 +94,27 @@ def _post_command(app_id: str, token: str, cmd: dict) -> tuple[int, str]:
         return -1, f"network error: {e.reason}"
 
 
+def _describe_command(c: dict) -> list[str]:
+    """Render one COMMANDS entry as 1-or-more printable lines for --dry-run."""
+    lines = [f"  /{c['name']} — {c['description']}"]
+    for opt in c.get("options", []) or []:
+        if opt.get("type") == _OPT_SUB_COMMAND:
+            lines.append(f"     /{c['name']} {opt['name']} — {opt['description']}")
+    return lines
+
+
 def main(argv: list[str]) -> int:
     dry_run = "--dry-run" in argv
 
     if dry_run:
-        print("Would register the following commands:")
+        print("Would PUT (bulk overwrite) the following commands:")
         for c in COMMANDS:
-            print(f"  /{c['name']} — {c['description']}")
-        print(f"\nTotal: {len(COMMANDS)} command(s) (dry-run, no API call)")
+            for line in _describe_command(c):
+                print(line)
+        print(
+            f"\nTotal: {len(COMMANDS)} top-level command(s) "
+            f"(dry-run, no API call)"
+        )
         return 0
 
     app_id = os.environ.get("DISCORD_APP_ID", "").strip()
@@ -94,18 +130,16 @@ def main(argv: list[str]) -> int:
         )
         return 2
 
-    overall_rc = 0
-    for c in COMMANDS:
-        code, detail = _post_command(app_id, token, c)
-        if code == 0:
-            print(f"✅ Registered /{c['name']} (id={detail})")
-        else:
-            print(
-                f"❌ /{c['name']}: HTTP {code} — {detail}",
-                file=sys.stderr,
-            )
-            overall_rc = 1
-    return overall_rc
+    code, detail = _bulk_overwrite(app_id, token, COMMANDS)
+    if code == 0:
+        names = ", ".join(f"/{c['name']}" for c in COMMANDS)
+        print(f"✅ Bulk-overwrote {len(COMMANDS)} command(s): {names} (ids={detail})")
+        return 0
+    print(
+        f"❌ bulk overwrite failed: HTTP {code} — {detail}",
+        file=sys.stderr,
+    )
+    return 1
 
 
 if __name__ == "__main__":

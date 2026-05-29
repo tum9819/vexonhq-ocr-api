@@ -302,44 +302,66 @@ async def discord_interaction(
         data = payload.get("data") or {}
         cmd_name = (data.get("name") or "").lower()
 
-        if cmd_name == "resources":
-            try:
-                snap = di.build_resources_snapshot()
-                content = di.format_resources_message(snap)
-            except Exception:
-                log.exception(
-                    "discord_interaction: /resources snapshot failed"
+        if cmd_name == "vex":
+            # Subcommand pattern (`/vex <subcommand>`). Discord delivers
+            # the subcommand as the first element of data.options[].
+            opts = data.get("options") or []
+            sub_name = ""
+            if opts:
+                sub_name = (opts[0].get("name") or "").lower()
+
+            if sub_name == "resources":
+                try:
+                    snap = di.build_resources_snapshot()
+                    content = di.format_resources_message(snap)
+                except Exception:
+                    log.exception(
+                        "discord_interaction: /vex resources snapshot failed"
+                    )
+                    content = (
+                        "❌ /vex resources failed — check Coolify logs for traceback"
+                    )
+                return JSONResponse(
+                    {
+                        "type": RESPONSE_CHANNEL_MESSAGE,
+                        "data": {"content": content},
+                    }
                 )
-                content = (
-                    "❌ /resources failed — check Coolify logs for traceback"
+
+            if sub_name == "help":
+                # Pure static text — no try/except needed; format_help_message
+                # has no failure modes that would justify shielding.
+                return JSONResponse(
+                    {
+                        "type": RESPONSE_CHANNEL_MESSAGE,
+                        "data": {"content": di.format_help_message()},
+                    }
                 )
+
+            # Unknown SUBCOMMAND of /vex — visible so TUM can spot
+            # registration drift. Same backtick-escape rule applies.
+            safe_sub = sub_name[:32].replace("`", "'")
             return JSONResponse(
                 {
                     "type": RESPONSE_CHANNEL_MESSAGE,
-                    "data": {"content": content},
+                    "data": {
+                        "content": (
+                            f"⚠️ Unsupported subcommand: `/vex {safe_sub}` — "
+                            f"re-run scripts/register_slash_commands.py?"
+                        ),
+                    },
                 }
             )
 
-        if cmd_name == "help":
-            # Pure static text — no try/except needed; format_help_message
-            # has no failure modes that would justify shielding.
-            return JSONResponse(
-                {
-                    "type": RESPONSE_CHANNEL_MESSAGE,
-                    "data": {"content": di.format_help_message()},
-                }
-            )
-
-        # Unknown command — visible so TUM can spot registration drift.
-        # Sanitize backticks so a name like "back`tick" cannot break the
-        # markdown code-span. Single-quote is a visible, safe substitute.
+        # Unknown TOP-LEVEL command (not /vex). Sanitize backticks so a
+        # name like "back`tick" cannot break the markdown code-span.
         safe_name = cmd_name[:32].replace("`", "'")
         return JSONResponse(
             {
                 "type": RESPONSE_CHANNEL_MESSAGE,
                 "data": {
                     "content": (
-                        f"⚠️ Unsupported command: `{safe_name}` — "
+                        f"⚠️ Unsupported command: `/{safe_name}` — "
                         f"re-run scripts/register_slash_commands.py?"
                     ),
                 },

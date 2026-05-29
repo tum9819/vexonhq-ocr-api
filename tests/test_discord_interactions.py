@@ -642,11 +642,29 @@ class TestShowPatchBackgroundTask:
 # ──────────────────────────────────────────────────────────
 # Slash command branch (INTERACTION_APPLICATION_COMMAND = 2)
 # ──────────────────────────────────────────────────────────
+def _vex_body(subcommand: str | None) -> bytes:
+    """Build a Discord interaction payload for `/vex <subcommand>`.
+
+    `subcommand=None` simulates a bare `/vex` with no subcommand
+    (Discord normally enforces required subcommand at the client, but
+    the handler still needs to behave for malformed inputs)."""
+    data = {"name": "vex"}
+    if subcommand is not None:
+        data["options"] = [{"name": subcommand, "type": 1}]
+    body_obj = {
+        "type": 2,
+        "data": data,
+        "application_id": "test-app-id-123",
+        "token": "tok",
+    }
+    return json.dumps(body_obj).encode("utf-8")
+
+
 class TestApplicationCommandBranch:
-    def test_resources_returns_snapshot_message(
+    def test_vex_resources_returns_snapshot_message(
         self, app_with_router, keypair, monkeypatch
     ):
-        """POST /alerts/discord-interaction with type=2, name=resources →
+        """POST /alerts/discord-interaction with /vex resources →
         200 + RESPONSE_CHANNEL_MESSAGE containing snapshot text."""
         sk, _ = keypair
         # Force a known snapshot so the test is deterministic
@@ -659,9 +677,7 @@ class TestApplicationCommandBranch:
         }
         monkeypatch.setattr(di, "build_resources_snapshot", lambda: fake_snap)
 
-        body_obj = {"type": 2, "data": {"name": "resources"},
-                    "application_id": "test-app-id-123", "token": "tok"}
-        body = json.dumps(body_obj).encode("utf-8")
+        body = _vex_body("resources")
         headers = _sign_body(sk, body)
 
         client = TestClient(app_with_router)
@@ -674,12 +690,33 @@ class TestApplicationCommandBranch:
         assert "VPS Resources" in j["data"]["content"]
         assert "abc1234" in j["data"]["content"]
 
-    def test_unknown_command_name_returns_warning(
+    def test_unknown_subcommand_of_vex_returns_warning(
         self, app_with_router, keypair
     ):
-        """Unknown slash-command name → 'Unsupported command' reply."""
+        """Unknown subcommand under /vex → 'Unsupported subcommand' reply
+        naming the offending subcommand so TUM can spot registration drift."""
         sk, _ = keypair
-        body_obj = {"type": 2, "data": {"name": "nope"},
+        body = _vex_body("nope")
+        headers = _sign_body(sk, body)
+
+        client = TestClient(app_with_router)
+        r = client.post(
+            "/alerts/discord-interaction", content=body, headers=headers
+        )
+        assert r.status_code == 200
+        j = r.json()
+        assert j["type"] == 4
+        content = j["data"]["content"]
+        assert "Unsupported subcommand" in content
+        assert "/vex nope" in content
+
+    def test_unknown_top_level_command_returns_warning(
+        self, app_with_router, keypair
+    ):
+        """A top-level slash command other than /vex → 'Unsupported
+        command' (different copy than the subcommand branch)."""
+        sk, _ = keypair
+        body_obj = {"type": 2, "data": {"name": "ghost"},
                     "application_id": "test-app-id-123", "token": "tok"}
         body = json.dumps(body_obj).encode("utf-8")
         headers = _sign_body(sk, body)
@@ -691,15 +728,15 @@ class TestApplicationCommandBranch:
         assert r.status_code == 200
         j = r.json()
         assert j["type"] == 4
-        assert "Unsupported command" in j["data"]["content"]
-        assert "nope" in j["data"]["content"]
+        content = j["data"]["content"]
+        assert "Unsupported command" in content
+        assert "/ghost" in content
 
     def test_application_command_still_requires_valid_signature(
         self, app_with_router
     ):
         """Unsigned slash-command POST → 401, snapshot never built."""
-        body_obj = {"type": 2, "data": {"name": "resources"}}
-        body = json.dumps(body_obj).encode("utf-8")
+        body = _vex_body("resources")
 
         client = TestClient(app_with_router)
         r = client.post(
@@ -709,21 +746,19 @@ class TestApplicationCommandBranch:
         )
         assert r.status_code == 401
 
-    def test_resources_snapshot_exception_returns_error_message(
+    def test_vex_resources_snapshot_exception_returns_error_message(
         self, app_with_router, keypair, monkeypatch
     ):
         """If build_resources_snapshot raises, branch replies with 200 +
-        '❌ /resources failed' so Discord does not show 'application did
-        not respond'."""
+        '❌ /vex resources failed' so Discord does not show 'application
+        did not respond'."""
         sk, _ = keypair
 
         def boom():
             raise RuntimeError("snapshot disaster")
         monkeypatch.setattr(di, "build_resources_snapshot", boom)
 
-        body_obj = {"type": 2, "data": {"name": "resources"},
-                    "application_id": "test-app-id-123", "token": "tok"}
-        body = json.dumps(body_obj).encode("utf-8")
+        body = _vex_body("resources")
         headers = _sign_body(sk, body)
 
         client = TestClient(app_with_router)
@@ -734,18 +769,17 @@ class TestApplicationCommandBranch:
         j = r.json()
         assert j["type"] == 4
         assert "❌" in j["data"]["content"]
-        assert "/resources failed" in j["data"]["content"]
+        assert "/vex resources failed" in j["data"]["content"]
 
-    def test_unknown_command_name_is_truncated_and_escaped(
+    def test_unknown_subcommand_name_is_truncated_and_escaped(
         self, app_with_router, keypair
     ):
-        """Long names get sliced to 32 chars; backticks become single-quotes
-        so the markdown code-span around the echoed name cannot break."""
+        """Long subcommand names get sliced to 32 chars; backticks become
+        single-quotes so the markdown code-span around the echoed name
+        cannot break."""
         sk, _ = keypair
-        nasty_name = "back`tick" + "x" * 40  # 49 chars total, contains `
-        body_obj = {"type": 2, "data": {"name": nasty_name},
-                    "application_id": "test-app-id-123", "token": "tok"}
-        body = json.dumps(body_obj).encode("utf-8")
+        nasty_sub = "back`tick" + "x" * 40  # 49 chars, contains `
+        body = _vex_body(nasty_sub)
         headers = _sign_body(sk, body)
 
         client = TestClient(app_with_router)
@@ -755,22 +789,19 @@ class TestApplicationCommandBranch:
         assert r.status_code == 200
         content = r.json()["data"]["content"]
         # Truncated: full 49-char name does NOT appear
-        assert nasty_name not in content
+        assert nasty_sub not in content
         # Backtick escaped: the original backtick from "back`tick" is gone
         assert "back`tick" not in content
         # But the safe rendering IS present
         assert "back'tick" in content
 
-    def test_help_command_returns_help_message(
+    def test_vex_help_returns_help_message(
         self, app_with_router, keypair
     ):
-        """POST /alerts/discord-interaction with type=2, name=help →
-        200 + RESPONSE_CHANNEL_MESSAGE containing the help text. Confirms
-        the new /help dispatch branch is wired and reachable."""
+        """POST /alerts/discord-interaction with /vex help →
+        200 + RESPONSE_CHANNEL_MESSAGE containing the help text."""
         sk, _ = keypair
-        body_obj = {"type": 2, "data": {"name": "help"},
-                    "application_id": "test-app-id-123", "token": "tok"}
-        body = json.dumps(body_obj).encode("utf-8")
+        body = _vex_body("help")
         headers = _sign_body(sk, body)
 
         client = TestClient(app_with_router)
@@ -783,6 +814,6 @@ class TestApplicationCommandBranch:
         content = j["data"]["content"]
         # Smoke-check: help message lists at least the canonical pieces
         assert "VEXONHQ Ops Bot" in content
-        assert "/resources" in content
-        assert "/help" in content
+        assert "/vex resources" in content
+        assert "/vex help" in content
         assert "Restart" in content

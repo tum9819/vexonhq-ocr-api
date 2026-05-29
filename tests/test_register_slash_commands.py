@@ -25,12 +25,16 @@ def test_dry_run_lists_resources_without_api_call():
         f"stdout={result.stdout}\nstderr={result.stderr}"
     )
     out = result.stdout.lower()
-    # Both commands the script registers must appear in the dry-run list
+    # The single top-level command + both subcommands must appear
+    assert "vex" in out
     assert "resources" in out
     assert "help" in out
     # Real guard against a live call is the "--dry-run early-return"
     # logic in the script; sanity-check that path emitted its marker.
     assert "dry-run" in out
+    # Sanity: dry-run announces bulk overwrite, not POST per command,
+    # so the user knows old commands will be removed on live run.
+    assert "bulk overwrite" in out or "put" in out
 
 
 def test_missing_env_returns_nonzero_in_live_mode():
