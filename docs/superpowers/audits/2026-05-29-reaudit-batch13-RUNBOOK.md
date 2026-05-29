@@ -91,4 +91,14 @@ Flow for every change: **ตรวจ → Backup tag → แก้ → เทส
 - ✅ **B2** other_income reclassify — applied to prod (`2026_05_29_reclassify_b2_other_income.sql`). Removed 78,026.98 non-revenue (43,500 owner capital + 34,526.98 inter-entity) from P&L income (2,041,200.69 → 1,963,173.71). 6 individual transfers (3,392.55) left as income pending TUM confirm.
 - ➡️ **A2** food-cost — moved to B (needs categorization of 1.2M NULL + code-name fix).
 
-**Open (Group B) — next:** B4 (vendor_bill vs vendor_purchase basis), A2/food-cost categorization, B5 tax (bookkeeper), B8/B9/B13 conventions, B3/B6/B7/B11/B12 latent/edge.
+**2026-05-30:**
+- ✅ **B4 + ACCOUNTING POLICY** — TUM chose CASH / BANK-STATEMENT basis. Removed Branch 8 (vendor_bill) from `v_daybook` (`2026_05_30_vdaybook_cashbasis_exclude_vendor_bill.sql`, applied to prod). P&L expense 2,204,769 → 1,503,179 (income unchanged 1,963,174). This (a) kills the B4 double-count (204k matched + the rest), and (b) auto-removes ~290k of junk vendor_bills dated 2022–2023/early-2025. Resulting monthly margins Nov–Apr: -0.7% / 31% / 15% / 30% / 18% / 2.5% (avg ~16%, realistic — vs the prior double-counted view that showed an overall LOSS).
+- ⚠️ **Data caveats surfaced:** (1) bank Statement PDF only covers 01 Nov 2025–30 Apr 2026 → **May P&L incomplete** (no May bank expenses; May shows a fake 81% margin until the May statement is imported). (2) The ~290k old-dated vendor_bills were OCR/date errors worth investigating separately for data hygiene (now out of P&L anyway).
+
+## ACCOUNTING POLICY (decided 2026-05-30) — CASH / STATEMENT BASIS
+- **Expense = actual money out**: bank statement debits + POS cash-drawer (`pos_cashflow`) + payroll/rent/utility + manual. Recognised when money leaves, ONCE.
+- **`vendor_bill` (OCR invoice) is NOT a P&L expense** — kept only for AP tracking, line-item detail, and slip/statement matching (the remark). Do NOT re-add Branch 8 to `v_daybook`.
+- **Slips** enrich each statement line with a remark/category (e.g. ค่านักดนตรี, salary) so monthly per-category totals are meaningful. Statement lines with no slip → flag "no slip" for TUM to review.
+- This is the standing monthly practice (recurs every export cycle).
+
+**Open (Group B) — next:** import May bank statement; A2/food-cost categorization (1.2M NULL + code-name fix `food_raw`/`beverage_raw`); slip→statement remark workflow + "no slip" flagging; B5 tax (bookkeeper); B8/B9/B13 conventions; B3/B6/B7/B11/B12 latent/edge.
