@@ -79,3 +79,16 @@ Flow for every change: **ตรวจ → Backup tag → แก้ → เทส
 2. **A3** bill_count (read pos_sales_daily.bill_count)
 3. **A1** AR sign bug (DB view migration — backup + A/B verify on Supabase; HIGH impact on profit)
 4. **A2** food-cost category (confirm backfill-vs-query approach first)
+
+---
+
+## PROGRESS LOG
+
+**2026-05-29 (this session):**
+- ✅ **A4** /pos/prices void filter — fixed (`menu_routes.py`), pushed `384d848`.
+- ✅ **A3** dashboard bill count — fixed (`phase2_routes.py`, reads `pos_sales_daily.bill_count`; April 73→660), pushed `384d848`.
+- ✅ **A1** v_daybook AR direction sign — applied to prod via Supabase (`2026_05_29_fix_vdaybook_ar_direction.sql`), pushed `b3e46ec`. Totals unchanged (ar_ap_entries empty) — latent bug closed. Also re-synced live v_daybook (delivery dedup + bank rider exclusion) into the repo, closing the drift.
+- ✅ **B2** other_income reclassify — applied to prod (`2026_05_29_reclassify_b2_other_income.sql`). Removed 78,026.98 non-revenue (43,500 owner capital + 34,526.98 inter-entity) from P&L income (2,041,200.69 → 1,963,173.71). 6 individual transfers (3,392.55) left as income pending TUM confirm.
+- ➡️ **A2** food-cost — moved to B (needs categorization of 1.2M NULL + code-name fix).
+
+**Open (Group B) — next:** B4 (vendor_bill vs vendor_purchase basis), A2/food-cost categorization, B5 tax (bookkeeper), B8/B9/B13 conventions, B3/B6/B7/B11/B12 latent/edge.
