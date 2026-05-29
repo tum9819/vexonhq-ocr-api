@@ -3650,6 +3650,7 @@ def pos_prices(months: int = Query(6), branch: str = Query(""), item: str = Quer
                     JOIN pos_bills b ON b.id = si.bill_id
                     WHERE b.sales_date BETWEEN %(start)s AND %(end)s
                       AND si.unit_price > 0
+                      AND b.bill_net > 0
                       {branch_filter}
                       {item_filter}
                     GROUP BY si.item_name, month
@@ -3717,6 +3718,7 @@ def pos_prices(months: int = Query(6), branch: str = Query(""), item: str = Quer
                     JOIN pos_bills b ON b.id = si.bill_id
                     WHERE b.sales_date BETWEEN %(start)s AND %(end)s
                       AND si.unit_price > 0
+                      AND b.bill_net > 0
                       AND si.item_name = ANY(%(items)s)
                       {branch_filter}
                     GROUP BY si.item_name, month

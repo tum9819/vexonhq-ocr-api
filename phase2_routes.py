@@ -271,9 +271,22 @@ def _summarize_month(cur, period_month: date, branch_code: str) -> dict:
     )
     row = cur.fetchone()
     sales_net          = float(row[0] or 0)
-    sales_bill_count   = int(row[1] or 0)
     expense_total      = float(row[2] or 0)
     expense_bill_count = int(row[3] or 0)
+
+    # Audit batch13 A3 (2026-05-29): the real customer bill count is the sum of
+    # pos_sales_daily.bill_count (FoodStory's own per-day bill tally), NOT a COUNT
+    # of v_daybook income rows. pos_sale is ONE aggregated row per day, so the old
+    # COUNT(... direction='income') returned ~operating-days (~30/mo) and the
+    # dashboard "จำนวนบิล" was wrong by ~20x (e.g. April showed 73, real = 660).
+    cur.execute(
+        """SELECT COALESCE(SUM(bill_count), 0)::int
+           FROM public.pos_sales_daily
+           WHERE branch_code = %s
+             AND sales_date >= %s AND sales_date < %s""",
+        (branch_code, period_month, pe),
+    )
+    sales_bill_count = int(cur.fetchone()[0] or 0)
 
     gross_profit = sales_net - expense_total
     # Session 15 fix: return 0.0 instead of None when sales_net = 0
