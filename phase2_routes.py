@@ -989,3 +989,32 @@ def category_trends(
         "branch":     branch,
         "note":       f"ข้อมูลค่าใช้จ่ายย้อนหลัง {months} เดือน (vendor_bills + manual_entries + bank_statement)"
     }
+
+
+# ============================================================
+# เงินเก็บร้าน (shop savings) — "ฝากเข้าร้าน" cash moved till -> savings account.
+# Internal transfer (asset->asset), excluded from P&L (Session 46). Reads v_shop_savings.
+# ============================================================
+
+@router.get("/savings/summary")
+def savings_summary():
+    """Per-month + cumulative cash set aside to the shop's savings account."""
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT month, entries, deposited, cumulative_savings
+                   FROM public.v_shop_savings
+                   ORDER BY month"""
+            )
+            months = _rows_to_dicts(cur)
+            cur.execute(
+                """SELECT COALESCE(SUM(amount), 0)::numeric
+                   FROM public.pos_cashflow_entries
+                   WHERE direction = 'expense'
+                     AND description ILIKE '%ฝากเข้าร้าน%'"""
+            )
+            total = float(cur.fetchone()[0] or 0)
+        return {"total": total, "months": months}
+    finally:
+        conn.close()
