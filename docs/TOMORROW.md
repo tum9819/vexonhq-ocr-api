@@ -1,85 +1,53 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-05-26 (Session 42 follow-up — Sentry paused, backend stable)
+**Last updated**: 2026-05-30 (Session 46 — cash basis + bank reconcile + slip system)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
+> Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
 
 ---
 
 ## What's live + stable
-
-- **Backend**: `https://api.marastation.com` — FastAPI, Coolify auto-deploy ✅
-- **Auth**: JWT dual-path — self-issued HS256 + Supabase ES256 via JWKS (Session 41) ✅
-- **Monitoring**: Uptime Robot → `/health/deep` every 5 min → Discord `@everyone` alerts ✅
-- **AI auto-diagnosis**: fires on 503, posts Thai/English summary to Discord `#ops` ✅
-- **DO snapshot**: auto every Sunday 03:00 BKK — new token with `image:create` scope ✅
-- **Tests**: 100/100 ✅ — `test_smoke.py` (63) + `test_workflow.py` (37)
-
----
-
-## Session 43 priorities
-
-### A. [OPTIONAL] Activate Sentry backend
-Code committed at `0f24462` — safe, no-ops when `SENTRY_DSN` not set.
-
-To activate:
-1. Sentry → `vexonhq-api` project → copy DSN
-2. Coolify → `vexonhq-ocr-api` → Environment Variables:
-   ```
-   SENTRY_DSN = https://...@....ingest.sentry.io/...
-   ```
-3. Redeploy → verify with:
-   ```powershell
-   python -c "import sentry_sdk; sentry_sdk.init(dsn='$env:SENTRY_DSN'); sentry_sdk.capture_message('backend test')"
-   ```
-   → Should appear in `vexonhq-api` Sentry within 30s
-
-### B. [NEXT] Playwright E2E backend coverage
-API-level E2E tests — separate session after Sentry stable.
+- **Backend** `https://api.marastation.com` — FastAPI, Coolify auto-deploy ✅
+- **P&L = CASH / bank-statement basis** — `vendor_bill` excluded from `v_daybook` (Branch 8 removed); ~16% net margin. AR sign bug fixed (latent). Owner/inter-entity credits excluded from revenue. ✅
+- **Bank statements Jun 2025 – May 2026 reconciled 12/12 ZERO DRIFT** vs each statement's own `รวมฝาก/รวมถอน` checksum (line-based parser rewrite + balance dedup key). ✅
+- **Slip-driven classification** — nightly `nightly_slip_reconcile` (02:00 BKK) pushes K+ slip memos → bank-row categories; manual `POST /slip/reconcile`; self-heals after re-import. ✅
+- **food-cost% ~15%** (cash COGS categorised; rises toward ~30% as bank supplier purchases categorise via slips). Cash musician fees (76k) now feed ภ.ง.ด.3. ✅
+- Tests / Uptime Robot / AI auto-diagnose / DO snapshot — unchanged from Session 42 ✅
 
 ---
 
-## How to run tests
+## Next session
 
-```powershell
-cd C:\Users\rapee\vexonhq-ocr-api
-.\.venv\Scripts\Activate.ps1
-$env:VEXONHQ_TEST_PASS = "ใส่รหัส"   # VEXONHQ_TEST_USER defaults to "vexonhq"
+### A. [HIGH] B5 — ภ.ง.ด.3 / WHT (needs bookkeeper input)
+3 generators disagree (`/export/pnd3`, `/export/pnd3-annual`, `/tax/wht-export`); 40(2) vs 40(8); hardcoded flat 3%. The WHT base is much cleaner now (cash musician 76k in via slips/keyword, amount-guessed false ones removed). Decide ONE shared WHT rule table + correct มาตรา/rate per payee type with the accountant, then collapse the 3 exports.
 
-# Full suite (100 tests, ~54s)
-python -m pytest tests/test_smoke.py tests/test_workflow.py -v
+### B. [MED] Let food-cost complete via slips
+Bank supplier purchases (เบียร์/เนื้อ) sit in `other_expense` until a slip memo categorises them. As TUM backfills slips via LINE, the nightly reconcile lifts food-cost% toward ~30%. Seeded memo rules: ค่าเนื้อ→raw_meat, ค่าเหล้า→raw_beverage, etc. (add more in `statement_rules` as memos require).
 
-# Syntax check only (~2s, no deps)
-.\verify.ps1
+### C. [MED] B8 / B9 / B13
+- B8 Lineman 32.1% commission is a hardcoded estimate (no actual payout column).
+- B9 delivery commission never shown as a cost line.
+- B13 `/pos/food-cost` recipe-estimate vs FoodStory actual cost reconcile.
 
-# Syntax + live smoke against deployed backend
-.\verify.ps1 -Smoke
-```
-
-> หลัง push ทุกครั้ง รอ 30-60s ให้ Coolify redeploy ก่อนรัน tests
+### D. [LOW] robustness
+- `food_cost` query hardcodes 6 COGS codes — could sum by `parent_code='food_cost'` so any new sub-code counts automatically (would also catch `food_raw`).
+- slip reconcile `_CAT_TO_SOURCE` doesn't list raw_meat/raw_veggies/etc. (defaults to `other_expense` source — harmless, both counted).
 
 ---
 
 ## Monitoring quick-ref
-
 | URL | Purpose |
 |-----|---------|
-| `https://api.marastation.com/health` | Basic health |
-| `https://api.marastation.com/health/deep` | Postgres + Supabase probe |
-| `https://api.marastation.com/cron/health` | Cron job status |
-| `https://api.marastation.com/auth/me` | Current user + role check |
+| `/health/deep` | Postgres + Supabase probe |
+| `/cron/health` | Cron job status — confirm `nightly_slip_reconcile` `run_count ≥ 1` after its first 02:00 run |
 
-### Scheduled checks
-- **Monday ≥ 08:00 BKK**: `Invoke-WebRequest https://api.marastation.com/cron/health | ConvertFrom-Json` → `weekly_summary.run_count >= 1`
-- **Sunday 2026-06-01**: check `weekly_do_snapshot.last_success_at` populated
+## After ANY KBank statement (re-)import
+```powershell
+python scripts/verify_statement_parse.py "<each KBank PDF>"   # must print PASS (zero drift)
+```
+Then the nightly job (or `POST /slip/reconcile`) re-matches slips + pushes memo categories. A re-import orphans slips (FK SET NULL) but the reconcile self-heals them.
 
----
-
-## Sentry account (created, not yet active)
-
-| Item | Value |
-|------|-------|
-| Org slug | `mara-00` |
-| Backend project | `vexonhq-api` ✅ DSN exists |
-| Frontend project | `vexonhq-frontend` ❌ not created yet |
-| Discord alert rules | Skipped — requires Sentry Team (paid) |
+## Backups
+- `bank_statement_entries_bak_20260530` (1033 rows) — pre-reimport snapshot, drop when confident.
+- Backup tags pushed before each Session-46 commit (`backup-pre-*-2026-05-30`).

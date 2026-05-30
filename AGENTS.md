@@ -401,4 +401,16 @@ async def detect_only(file: UploadFile = File(...)):
 ```
 Rule: any handler that calls pandas (`pd.read_excel`), psycopg2 (`cur.execute*` on big inputs), or other blocking C extensions must NOT be `async def` unless every blocking call is wrapped in `asyncio.to_thread()` or `BackgroundTasks`. Default to plain `def` for import paths — simpler, no foot-gun. (Audit B7-C3 / Session 36 incident class.)
 
-*Last updated: Session 45 follow-up #3, 2026-05-29 (Discord /vex namespace + pitfall #8 added).*
+**16. P&L is CASH / bank-statement basis (Session 46, 2026-05-30) — `vendor_bill` is NOT a P&L expense.**
+Expense = actual money out (bank statement debits + `pos_cashflow` + payroll/rent/utility + manual), counted once. The OCR'd supplier invoice (`vendor_bill`) is kept for AP / line-item detail / slip-match ONLY — it was REMOVED from `v_daybook` (Branch 8) because counting both the invoice and its bank/cash payment double-counted supplier cost. **Do NOT re-add Branch 8.** See `migrations/2026_05_30_vdaybook_cashbasis_exclude_vendor_bill.sql` and memory [[project-pnl-cash-basis]].
+
+**17. `v_daybook` in prod DRIFTS from the repo — always `pg_get_viewdef` the LIVE view before editing it.** (Session 46)
+Prod had uncommitted fixes (delivery dedup `GREATEST(net_total - rider_gross)`, bank rider-income exclusion) not in repo migration 17. Editing from the stale repo file would have regressed prod. A re-audit "delivery double-count" finding was a FALSE POSITIVE because it read the repo, not the live view. Capture any live-only definition back into a migration.
+
+**18. KBank statement parser is LINE-BASED; verify every import against the PDF's own `รวมฝาก/รวมถอน` checksum.** (Session 46, B6)
+`_extract_transactions` reads `date time type amount balance` from one text line and takes direction from the running-BALANCE delta (the old table-cell-index alignment silently dropped/misclassified wrapped rows — Nov–Apr drifted ~30k). After any statement import, run `python scripts/verify_statement_parse.py <pdf>` — parsed deposit/withdrawal count+sum MUST equal the statement's `รวมฝาก/รวมถอน` line. The dedup constraint `uq_bse_txn` includes `balance` so genuine identical same-day transfers aren't collapsed.
+
+**19. Expense classification is SLIP-MEMO-driven, not amount-guessed (Session 46).**
+The K+ slip memo (arrives via LINE → `slips` table) is the source of truth for what a bank transfer was FOR. `musician_fee` is assigned ONLY when a slip memo says "ค่าดนตรี" — the old "amount 600/700/2100/2800 → musician_fee" heuristic was REMOVED (inflated ภ.ง.ด.3 WHT, mis-tagged owner transfers). The nightly job `nightly_slip_reconcile` (02:00 BKK) = `slip_routes.reconcile_slips_to_statements()` re-matches slips and pushes their memo category onto the `bank_statement_entries` row the P&L reads; manual `POST /slip/reconcile`. No slip → `other_expense`. `pos_cashflow_entries.category_code` is FK-constrained to `expense_categories` (bank rows are not). Memory [[project-slip-classification]].
+
+*Last updated: Session 46, 2026-05-30 (cash basis + bank parser rewrite + slip-driven classification; pitfalls #16-19 added).*
