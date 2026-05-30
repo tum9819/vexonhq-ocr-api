@@ -1619,18 +1619,26 @@ def scorecard(month: str = "", branch: str = "thawi_watthana"):
         # The `if prev_net else 0` guards divide-by-zero. Not a bug.
         net_delta  = round((net_profit - prev_net) / abs(prev_net) * 100, 1) if prev_net else 0
 
-        # ── 4. Food Cost % ────────────────────────────────────
+        # ── 4. Food Cost % + Beverage Cost % ──────────────────
+        # Robust: sum by the food_cost / beverage_cost SUBTREE (parent_code), so any
+        # new COGS sub-code is counted automatically (was a hardcoded list that missed
+        # food_raw + the duplicate beverage_raw). Session 47.
         fc_sql = """
-            SELECT COALESCE(SUM(amount),0) AS food_cost
-            FROM public.v_daybook_pnl   -- audit B2-C3: exclude equity/transfer (was v_daybook)
+            SELECT
+              COALESCE(SUM(amount) FILTER (WHERE category_code IN (
+                  SELECT code FROM public.expense_categories WHERE code='food_cost' OR parent_code='food_cost')),0) AS food_cost,
+              COALESCE(SUM(amount) FILTER (WHERE category_code IN (
+                  SELECT code FROM public.expense_categories WHERE code='beverage_cost' OR parent_code='beverage_cost')),0) AS beverage_cost
+            FROM public.v_daybook_pnl
             WHERE direction='expense'
-              AND category_code IN ('food_cost','raw_meat','raw_veggies','raw_seasoning','raw_oil_gas','raw_beverage')
               AND TO_CHAR(entry_date,'YYYY-MM')=%s
               AND (%s='' OR branch_code=%s)
         """
         fc = q(fc_sql, (month, B, B))
-        food_cost    = float(fc.get("food_cost") or 0)
-        food_cost_pct = round(food_cost / this_rev * 100, 1) if this_rev else 0
+        food_cost     = float(fc.get("food_cost") or 0)
+        beverage_cost = float(fc.get("beverage_cost") or 0)
+        food_cost_pct     = round(food_cost / this_rev * 100, 1) if this_rev else 0
+        beverage_cost_pct = round(beverage_cost / this_rev * 100, 1) if this_rev else 0
 
         # ── 5. Budget Compliance ──────────────────────────────
         budget_sql = """
@@ -1714,12 +1722,23 @@ def scorecard(month: str = "", branch: str = "thawi_watthana"):
             },
             {
                 "key":      "food_cost",
-                "label":    "Food Cost %",
+                "label":    "ต้นทุนอาหาร",
                 "value":    food_cost_pct,
                 "display":  f"{food_cost_pct:.1f}%",
                 "vs_prev":  None,
                 "sub":      f"฿{food_cost:,.0f} จากรายรับ",
                 "status":   _score_status(food_cost_pct, 30, 40, higher_is_better=False),
+                "unit":     "%",
+                "link":     "/dashboard",
+            },
+            {
+                "key":      "beverage_cost",
+                "label":    "ต้นทุนเครื่องดื่ม",
+                "value":    beverage_cost_pct,
+                "display":  f"{beverage_cost_pct:.1f}%",
+                "vs_prev":  None,
+                "sub":      f"฿{beverage_cost:,.0f} จากรายรับ",
+                "status":   _score_status(beverage_cost_pct, 30, 40, higher_is_better=False),
                 "unit":     "%",
                 "link":     "/dashboard",
             },

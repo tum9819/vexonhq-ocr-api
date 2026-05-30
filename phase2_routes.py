@@ -473,28 +473,33 @@ def dashboard_overview(
             # ── Food Cost % (วัตถุดิบ / COGS categories) ─────────────────────
             food_cost_amt = 0.0
             food_cost_pct = 0.0
+            beverage_cost_amt = 0.0
+            beverage_cost_pct = 0.0
             try:
                 pe_fc = _next_month(month_start)
                 # Audit M4 fix (2026-05-27): was vendor_bills-only, understating
                 # food cost (cash + bank-transfer raw-material purchases missed).
-                # Now reads v_daybook_pnl across all expense sources with the
-                # same COGS category codes.
+                # Session 47: split food vs beverage by the food_cost / beverage_cost
+                # SUBTREE (robust -- any new COGS sub-code is counted automatically).
                 cur.execute(
-                    """SELECT COALESCE(SUM(d.amount), 0)::numeric
+                    """SELECT
+                         COALESCE(SUM(d.amount) FILTER (WHERE d.category_code IN (
+                             SELECT code FROM public.expense_categories WHERE code='food_cost' OR parent_code='food_cost')),0)::numeric AS food_cost,
+                         COALESCE(SUM(d.amount) FILTER (WHERE d.category_code IN (
+                             SELECT code FROM public.expense_categories WHERE code='beverage_cost' OR parent_code='beverage_cost')),0)::numeric AS beverage_cost
                        FROM public.v_daybook_pnl d
                        WHERE d.direction = 'expense'
                          AND COALESCE(d.branch_code, %s) = %s
-                         AND d.entry_date >= %s AND d.entry_date < %s
-                         AND d.category_code IN (
-                             'food_cost','raw_meat','raw_veggies',
-                             'raw_seasoning','raw_oil_gas','raw_beverage'
-                         )""",
+                         AND d.entry_date >= %s AND d.entry_date < %s""",
                     (branch, branch, month_start, pe_fc),
                 )
-                food_cost_amt = float(cur.fetchone()[0] or 0)
+                _fc_row = cur.fetchone()
+                food_cost_amt = float(_fc_row[0] or 0)
+                beverage_cost_amt = float(_fc_row[1] or 0)
                 sales_net_cur = current.get("sales_net", 0)
                 if sales_net_cur > 0:
                     food_cost_pct = round(food_cost_amt / sales_net_cur * 100, 1)
+                    beverage_cost_pct = round(beverage_cost_amt / sales_net_cur * 100, 1)
             except Exception as e:
                 logger.error("dashboard_overview: food_cost_pct failed: %s", e)
                 conn.rollback()
@@ -516,6 +521,10 @@ def dashboard_overview(
             "food_cost": {
                 "amount": food_cost_amt,
                 "pct": food_cost_pct,
+            },
+            "beverage_cost": {
+                "amount": beverage_cost_amt,
+                "pct": beverage_cost_pct,
             },
         }
     finally:
