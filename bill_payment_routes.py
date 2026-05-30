@@ -16,6 +16,7 @@ In main.py add:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import logging
@@ -402,9 +403,9 @@ async def slip_match(file: UploadFile = File(...)):
         raise HTTPException(400, "กรุณาอัพโหลดรูปภาพสลิป (JPG/PNG) ไม่ใช่ PDF")
     mime = "image/jpeg" if fname.endswith((".jpg", ".jpeg")) else "image/png"
 
-    # Call GPT Vision
+    # Call GPT Vision (blocking — run off the event loop so it doesn't freeze the server)
     try:
-        extracted = _call_gpt_vision_for_slip(image_bytes, mime)
+        extracted = await asyncio.to_thread(_call_gpt_vision_for_slip, image_bytes, mime)
     except Exception as e:
         log.error("slip_match: vision failed: %s", e)
         raise HTTPException(500, f"ไม่สามารถอ่านสลิปได้: {e}")

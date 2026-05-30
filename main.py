@@ -23,6 +23,7 @@ Required env vars (set in Coolify):
 import base64
 import io
 import json
+import asyncio
 import logging
 import os
 import tempfile
@@ -583,7 +584,9 @@ def health_deep(background_tasks: BackgroundTasks):
 async def do_ocr(file: UploadFile = File(...)):
     """Tesseract-only — returns raw text. Kept for backward compat."""
     contents = await file.read()
-    text = _run_tesseract(contents)
+    # Tesseract is CPU-blocking; run off the event loop so one OCR doesn't freeze
+    # the whole server (health checks would time out → UptimeRobot DOWN).
+    text = await asyncio.to_thread(_run_tesseract, contents)
     return {"success": True, "text": text, "filename": file.filename}
 
 
@@ -662,7 +665,20 @@ async def invoice_upload(file: UploadFile = File(...)):
     if not contents:
         raise HTTPException(400, "empty file")
 
-    is_pdf = (file.content_type == "application/pdf") or file.filename.lower().endswith(".pdf")
+    # Heavy work (PDF render + GPT Vision OCR + Supabase save) is CPU/IO-blocking and
+    # would freeze the async event loop for the entire upload — health checks then time
+    # out → UptimeRobot DOWN (same failure mode as the POS-import incident, fixed the
+    # same way). Run the whole pipeline in a worker thread so the loop stays responsive,
+    # especially for multi-page Makro PDFs.
+    return await asyncio.to_thread(
+        _process_upload, contents, file.filename, file.content_type or "",
+    )
+
+
+def _process_upload(contents: bytes, filename: str, content_type: str) -> dict[str, Any]:
+    """Heavy synchronous upload pipeline (PDF→images, OCR, GPT Vision, save to Supabase).
+    Runs in a thread via asyncio.to_thread so it never blocks the FastAPI event loop."""
+    is_pdf = (content_type == "application/pdf") or filename.lower().endswith(".pdf")
 
     if is_pdf:
         # Convert PDF → list of PNG images (1 per page)
@@ -675,11 +691,11 @@ async def invoice_upload(file: UploadFile = File(...)):
         if not page_images:
             raise HTTPException(400, "pdf has no readable pages")
 
-        log.info("processing PDF '%s' with %d page(s)", file.filename, len(page_images))
+        log.info("processing PDF '%s' with %d page(s)", filename, len(page_images))
 
         # Process each page through full pipeline.
         # multi-page merge in _save_invoice() handles merging same-invoice pages.
-        page_filename_base = os.path.splitext(file.filename)[0]
+        page_filename_base = os.path.splitext(filename)[0]
         last_result = None
         all_warnings: list[dict[str, str]] = []
 
@@ -697,7 +713,7 @@ async def invoice_upload(file: UploadFile = File(...)):
         return last_result
 
     # Single image path
-    result = _process_single_image(contents, file.filename, file.content_type or "image/jpeg")
+    result = _process_single_image(contents, filename, content_type or "image/jpeg")
     result["total_pages_processed"] = 1
     return result
 
@@ -2104,6 +2120,25 @@ def _save_invoice(
                 log.info("dedup matched by invoice_no fallback (vendor_name differed)")
         except Exception as e:
             log.warning("dedup lookup (invoice_no fallback) failed: %s", e)
+
+    # Whitelist payment_type to the DB check constraint chk_vb_payment_type
+    # (NULL or credit_card/transfer/cash/cheque/other). The OCR prompt asks for one
+    # of those, but the model sometimes returns a free-form value (e.g. a Thai credit
+    # term like "เงินเชื่อ" on a SINGHA invoice) which 23514-rejects the INSERT and
+    # the whole upload fails to save. Map known synonyms, drop anything else to None.
+    # Applied here (before merge/create) so BOTH the INSERT and the backfill-loop are
+    # covered. payment_type is user-editable in review; all other parsed fields are
+    # still stored verbatim in ocr_json below.
+    _pt = str(parsed.get("payment_type") or "").strip().lower()
+    parsed["payment_type"] = {
+        "credit_card": "credit_card", "creditcard": "credit_card", "credit card": "credit_card",
+        "credit": "credit_card", "บัตรเครดิต": "credit_card",
+        "transfer": "transfer", "bank_transfer": "transfer", "banktransfer": "transfer",
+        "wire": "transfer", "โอน": "transfer", "เงินโอน": "transfer", "โอนเงิน": "transfer",
+        "cash": "cash", "เงินสด": "cash",
+        "cheque": "cheque", "check": "cheque", "เช็ค": "cheque",
+        "other": "other",
+    }.get(_pt) or None
 
     if existing:
         # ---- MERGE PATH: append items + backfill any null header fields ----

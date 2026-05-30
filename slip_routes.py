@@ -35,6 +35,7 @@ Mounted via `app.include_router(slip_router)` in main.py.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -764,15 +765,17 @@ async def slip_upload(file: UploadFile = File(...), request: Request = None):
         )
 
     # ── 1) Upload to storage (don't fail the request if storage hiccups) ──
+    # Storage PUT + GPT-4o Vision are blocking I/O; run them off the event loop so a
+    # slip upload doesn't freeze the whole server (health-check timeout → DOWN).
     image_url: Optional[str] = None
     try:
-        image_url = _upload_slip_to_storage(contents, file.filename, mime)
+        image_url = await asyncio.to_thread(_upload_slip_to_storage, contents, file.filename, mime)
     except Exception:
         log.exception("storage upload failed (continuing without raw_image_url)")
 
     # ── 2) GPT-4o Vision OCR ──
     try:
-        parsed = _run_slip_vision(contents, mime)
+        parsed = await asyncio.to_thread(_run_slip_vision, contents, mime)
     except Exception as e:
         log.exception("slip vision failed")
         raise HTTPException(500, f"slip vision OCR failed: {e}")
