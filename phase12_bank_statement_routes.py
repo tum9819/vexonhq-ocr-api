@@ -391,7 +391,7 @@ async def upload_statement(
                         (import_batch_id, txn_date, description, debit, credit, balance,
                          category_code, source_type, match_status, branch_code)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (txn_date, description, debit, credit, branch_code) DO NOTHING
+                    ON CONFLICT (txn_date, description, debit, credit, balance, branch_code) DO NOTHING
                 """, (
                     batch_id,
                     r["txn_date"],
