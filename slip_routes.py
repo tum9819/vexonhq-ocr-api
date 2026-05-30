@@ -605,6 +605,128 @@ def _match_slip(slip_id: str, actor: Optional[str]) -> dict:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Nightly reconcile — push slip memo categories ONTO the matched bank rows
+# ════════════════════════════════════════════════════════════════════════════
+# The slip's K+ memo is the gold signal for what a bank transfer was FOR. The
+# P&L reads the category off bank_statement_entries, so this is the missing pipe:
+# slip memo -> category -> written onto the bank row. Runs nightly (02:00 BKK,
+# registered in line_bot_routes) and on demand via POST /slip/reconcile.
+
+# Slip category_code -> bank_statement_entries.source_type. EVERY mapping here is
+# COUNTED in the cash-basis P&L (a slip proves real money left for that purpose).
+# Unlisted categories fall back to 'other_expense' (also counted).
+_CAT_TO_SOURCE: dict[str, str] = {
+    "musician_fee": "payroll_expense",
+    "staff_salary": "payroll_expense",
+    "rent":         "rent_expense",
+    "utility":      "utility_expense",
+    "food_raw":     "vendor_purchase",
+    "beverage_raw": "vendor_purchase",
+    "bank_fee":     "bank_fee",
+    "tax":          "tax_expense",
+}
+
+
+def _source_for_category(category_code: Optional[str]) -> str:
+    return _CAT_TO_SOURCE.get(category_code or "", "other_expense")
+
+
+def reconcile_slips_to_statements(actor: Optional[str] = "nightly_job") -> dict:
+    """Reconcile slips against bank_statement_entries and push each matched
+    slip's memo-derived category ONTO its bank row so the P&L reflects it.
+
+    Pass 1: re-match every still-unmatched / needs_review slip (new statements
+            or newly-uploaded slips may now pair up).
+    Pass 2: for every slip matched to exactly one bank row, classify it from its
+            memo + recipient name and write category_code + a COUNTED source_type
+            onto the bank_statement_entries row.
+
+    Bank rows with no slip keep their import default ('other_expense'). Bank rows
+    TUM categorised by hand (match_status='manual') are never overwritten.
+    Idempotent — safe to run nightly and on demand.
+    """
+    rematched = 0
+    categorized = 0
+
+    # ── Pass 1: re-match loose slips (each _match_slip manages its own conn) ──
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM public.slips "
+                "WHERE match_status IN ('unmatched', 'needs_review')"
+            )
+            loose_ids = [str(r[0]) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    for sid in loose_ids:
+        try:
+            res = _match_slip(sid, actor)
+            if res.get("status") in ("matched_stmt", "matched_full"):
+                rematched += 1
+        except Exception:
+            log.exception("reconcile: re-match failed slip=%s", sid)
+
+    # ── Pass 2: push memo category onto the matched bank rows ──
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, recipient_name, memo, matched_statement_id
+                FROM public.slips
+                WHERE match_status IN ('matched_stmt', 'matched_full')
+                  AND matched_statement_id IS NOT NULL
+                """
+            )
+            matched_slips = cur.fetchall()
+
+        for sid, recipient_name, memo, stmt_id in matched_slips:
+            category_code, _src = _classify_slip_category(conn, recipient_name, memo)
+            if not category_code:
+                continue  # no memo/name signal — leave the bank row's default
+            source_type = _source_for_category(category_code)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE public.bank_statement_entries
+                        SET category_code = %s,
+                            source_type   = %s,
+                            match_status  = 'auto'
+                        WHERE id = %s
+                          AND match_status <> 'manual'
+                          AND (category_code IS DISTINCT FROM %s
+                               OR source_type IS DISTINCT FROM %s)
+                        """,
+                        (category_code, source_type, str(stmt_id),
+                         category_code, source_type),
+                    )
+                    if cur.rowcount:
+                        categorized += 1
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                log.exception("reconcile: push category failed slip=%s stmt=%s",
+                              sid, stmt_id)
+
+        result = {"rematched": rematched, "categorized": categorized,
+                  "matched_slips": len(matched_slips)}
+        log.info("Slip reconcile done: %s", result)
+        return result
+    finally:
+        conn.close()
+
+
+@router.post("/slip/reconcile")
+def manual_reconcile(request: Request = None):
+    """'Reconcile now' button — runs the same job the 02:00 BKK scheduler runs."""
+    actor = _current_username(request) if request else None
+    return reconcile_slips_to_statements(actor=actor or "manual")
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # POST /slip/upload — main entry point
 # ════════════════════════════════════════════════════════════════════════════
 

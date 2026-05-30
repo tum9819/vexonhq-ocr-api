@@ -271,17 +271,13 @@ def _classify(row: dict, rules: list[dict]) -> dict:
     direction = "income" if row["credit"] > 0 else "expense"
     amount = row["credit"] if row["credit"] > 0 else row["debit"]
 
-    # Special: musician fee by amount pattern (expense to individual).
-    # source_type 'payroll_expense' so it counts in P&L (the previous
-    # 'bank_statement' tag put it in the excluded-from-P&L bucket — bug
-    # that hid ~฿20k/month of real performer payments).
-    if direction == "expense" and int(amount) in MUSICIAN_AMOUNTS:
-        # Check it's a transfer to a person (not a company/service)
-        is_company = any(w in desc for w in ["บจก", "หจก", "บริษัท", "ห้าง", "ร้าน", "จำกัด"])
-        if not is_company:
-            return {**row, "direction": direction, "amount": amount,
-                    "category_code": "musician_fee", "source_type": "payroll_expense",
-                    "match_status": "auto"}
+    # NOTE (audit batch13, 2026-05-30): the old "amount == 600/700/2100/2800 to an
+    # individual -> musician_fee" heuristic was REMOVED. It mis-tagged owner/reimburse
+    # transfers (e.g. to co-owner นุศรา) as musician fees and inflated the ภ.ง.ด.3 WHT.
+    # Musician fees are now driven by the SLIP MEMO ("ค่าดนตรี") via the nightly slip
+    # reconcile (slip_routes.reconcile_slips_to_statements), which is TUM's policy:
+    # category comes from the slip note, not the amount. MUSICIAN_AMOUNTS is kept only
+    # for reference / any future slip-amount cross-check.
 
     # Built-in patterns (delivery payouts, utilities, payroll, etc.) —
     # consulted BEFORE the DB rule table so the common Thai-banking labels

@@ -1652,6 +1652,31 @@ except Exception as e:
     log.error("Failed to register weekly_do_snapshot job: %s", e)
 
 
+# Nightly slip↔statement reconcile (audit batch13, 2026-05-30): re-match slips
+# uploaded via LINE + push their memo category onto the bank rows so the P&L
+# reflects slip-verified categories. Fires automatically — TUM never has to
+# remember to press anything; backfilled slips get picked up the next night.
+@_heartbeat("nightly_slip_reconcile", expected_interval_hours=24)
+def _scheduled_slip_reconcile():
+    from slip_routes import reconcile_slips_to_statements
+    result = reconcile_slips_to_statements(actor="nightly_job")
+    log.info("Nightly slip reconcile: %s", result)
+
+
+try:
+    _scheduler.add_job(
+        _scheduled_slip_reconcile,
+        trigger="cron",
+        hour=2,
+        minute=0,
+        id="nightly_slip_reconcile",
+        replace_existing=True,
+    )
+    log.info("Nightly slip reconcile scheduler started — fires daily 02:00 Asia/Bangkok")
+except Exception as e:
+    log.error("Failed to register nightly_slip_reconcile job: %s", e)
+
+
 # Option A + LINE Alert (2026-05-27): VPS health monitor every 15 min.
 # Checks disk, RAM, containers, API health — fires LINE alert on issue.
 try:
