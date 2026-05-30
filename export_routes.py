@@ -188,7 +188,7 @@ def _build_category_summary(month: str) -> openpyxl.Workbook:
                        SELECT TO_CHAR(entry_date, 'YYYY-MM') AS month,
                               category_code,
                               SUM(amount) AS actual_amount
-                       FROM public.v_daybook
+                       FROM public.v_daybook_pnl
                        WHERE direction = 'expense' AND category_code IS NOT NULL
                        GROUP BY 1, 2
                    ) a ON a.month = b.month AND a.category_code = b.category_code
@@ -204,7 +204,7 @@ def _build_category_summary(month: str) -> openpyxl.Workbook:
                           COALESCE(ec.name_th, d.category_code) AS name_th,
                           COALESCE(ec.name_en, '') AS name_en,
                           SUM(d.amount) AS actual_amount
-                   FROM public.v_daybook d
+                   FROM public.v_daybook_pnl d
                    LEFT JOIN public.expense_categories ec ON ec.code = d.category_code
                    WHERE d.direction = 'expense'
                      AND d.category_code IS NOT NULL
@@ -309,7 +309,7 @@ def _build_category_summary(month: str) -> openpyxl.Workbook:
                           COALESCE(ec.name_en, '') AS name_en,
                           COUNT(*) AS cnt,
                           SUM(d.amount) AS total_amount
-                   FROM public.v_daybook d
+                   FROM public.v_daybook_pnl d
                    LEFT JOIN public.expense_categories ec ON ec.code = d.category_code
                    WHERE d.direction = 'income'
                      AND TO_CHAR(d.entry_date, 'YYYY-MM') = %s
@@ -383,7 +383,7 @@ def _build_daybook(month: str) -> openpyxl.Workbook:
                           CASE WHEN d.direction = 'income'  THEN d.amount ELSE NULL END AS income,
                           CASE WHEN d.direction = 'expense' THEN d.amount ELSE NULL END AS expense,
                           d.branch_code
-                   FROM public.v_daybook d
+                   FROM public.v_daybook_pnl d
                    LEFT JOIN public.expense_categories ec ON ec.code = d.category_code
                    WHERE d.entry_date BETWEEN %s AND %s
                    ORDER BY d.entry_date, d.direction DESC, d.amount DESC""",
@@ -481,7 +481,7 @@ def _build_pnd3(month: str) -> openpyxl.Workbook:
     ws.row_dimensions[1].height = 30
 
     ws.merge_cells("A2:H2")
-    ws.cell(row=2, column=1, value=f"เดือน: {label}   |   ผู้จ่ายเงิน: ร้าน มรสวรรค์ เสียบ เผาไฟ")
+    ws.cell(row=2, column=1, value=f"เดือน: {label}   |   ผู้จ่ายเงิน: ร้านสถานีหม่าล่า  เลขที่ 255/4 ถ.พุทธมณฑลสาย 2 แขวงศาลาธรรมสพน์ เขตทวีวัฒนา กรุงเทพมหานคร 10170")
     ws.cell(row=2, column=1).font = FONT_BODY
     ws.cell(row=2, column=1).alignment = CENTER
     ws.row_dimensions[2].height = 20
@@ -506,7 +506,7 @@ def _build_pnd3(month: str) -> openpyxl.Workbook:
                           amount,
                           category_code,
                           source
-                   FROM public.v_daybook
+                   FROM public.v_daybook_pnl
                    WHERE direction = 'expense'
                      AND entry_date BETWEEN %s AND %s
                      AND (
@@ -538,7 +538,7 @@ def _build_pnd3(month: str) -> openpyxl.Workbook:
         _data_cell(ws, row, 2, date_str, align=CENTER, fill=fill)
         _data_cell(ws, row, 3, r["name"], fill=fill)
         _data_cell(ws, row, 4, "", align=CENTER, fill=fill)  # เลขประจำตัว (กรอกเอง)
-        _data_cell(ws, row, 5, "ค่าจ้างชั่วคราว (40(2))", fill=fill)
+        _data_cell(ws, row, 5, "ค่าดนตรี - เงินได้อื่น มาตรา 40(8)", fill=fill)
         _data_cell(ws, row, 6, "3%", align=CENTER, fill=fill)
         _data_cell(ws, row, 7, amount, align=RIGHT, num_format='#,##0.00', fill=fill)
         _data_cell(ws, row, 8, tax, align=RIGHT, num_format='#,##0.00', fill=fill)
@@ -651,7 +651,7 @@ def export_summary(month: str = Query(..., description="YYYY-MM")):
                 """SELECT COUNT(*) AS cnt,
                           COALESCE(SUM(CASE WHEN direction='income'  THEN amount ELSE 0 END),0) AS total_income,
                           COALESCE(SUM(CASE WHEN direction='expense' THEN amount ELSE 0 END),0) AS total_expense
-                   FROM public.v_daybook
+                   FROM public.v_daybook_pnl
                    WHERE entry_date BETWEEN %s AND %s""",
                 (first, last),
             )
@@ -662,7 +662,7 @@ def export_summary(month: str = Query(..., description="YYYY-MM")):
             cur.execute(
                 """SELECT COUNT(*) AS cnt,
                           COALESCE(SUM(amount * 0.03), 0) AS total_wht
-                   FROM public.v_daybook
+                   FROM public.v_daybook_pnl
                    WHERE direction = 'expense'
                      AND entry_date BETWEEN %s AND %s
                      AND (category_code IN ('musician_fee', 'freelance', 'pnd3')
@@ -676,7 +676,7 @@ def export_summary(month: str = Query(..., description="YYYY-MM")):
             cur.execute(
                 """SELECT COUNT(DISTINCT category_code) AS cats,
                           COALESCE(SUM(amount), 0) AS total_spend
-                   FROM public.v_daybook
+                   FROM public.v_daybook_pnl
                    WHERE direction = 'expense'
                      AND category_code IS NOT NULL
                      AND entry_date BETWEEN %s AND %s""",

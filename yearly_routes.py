@@ -240,7 +240,7 @@ def export_yearly(
 
     # Title
     ws.merge_cells("A1:H1")
-    cell(1, 1, f"รายงาน P&L ประจำปี {year} — ร้าน มรสวรรค์ เสียบ เผาไฟ", FONT_TITLE, CENTER)
+    cell(1, 1, f"รายงาน P&L ประจำปี {year} — ร้านสถานีหม่าล่า", FONT_TITLE, CENTER)
     ws.row_dimensions[1].height = 32
 
     # Header row
@@ -363,7 +363,7 @@ def export_pnd3_annual(
 
     # Title
     ws.merge_cells("A1:H1")
-    c = ws.cell(row=1, column=1, value=f"สรุปภาษีเงินได้หัก ณ ที่จ่าย (ภ.ง.ด.3) ประจำปี {year} — ร้านมรสวรรค์")
+    c = ws.cell(row=1, column=1, value=f"สรุปภาษีเงินได้หัก ณ ที่จ่าย (ภ.ง.ด.3) ประจำปี {year} — ร้านสถานีหม่าล่า")
     c.font = FONT_T; c.alignment = CENTER
     ws.row_dimensions[1].height = 30
 
@@ -398,7 +398,7 @@ def export_pnd3_annual(
         _c(3, date_str, CENTER)
         _c(4, r["name"])
         _c(5, "", CENTER)          # เลขผู้เสียภาษี — กรอกเอง
-        _c(6, "ค่าจ้างชั่วคราว (40(2))")
+        _c(6, "ค่าดนตรี - เงินได้อื่น มาตรา 40(8)")
         _c(7, amount, RIGHT, FONT_B, '#,##0.00')
         _c(8, tax,    RIGHT, FONT_B, '#,##0.00')
         ws.row_dimensions[row_n].height = 18

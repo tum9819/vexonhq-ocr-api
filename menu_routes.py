@@ -1225,7 +1225,6 @@ _REVENUE_SOURCE_META = {
     "manual":               {"label": "รายรับอื่นๆ (Manual)", "color": "#8B5CF6", "group": "other"},
     "ar_payment":           {"label": "รับชำระ AR",        "color": "#06B6D4", "group": "other"},
     "pos_cashflow":         {"label": "POS Cashflow",      "color": "#10B981", "group": "other"},
-    "bank_statement":       {"label": "Bank Transfer",     "color": "#F59E0B", "group": "other"},
 }
 
 @router.get("/revenue/breakdown")
@@ -1246,7 +1245,7 @@ def revenue_breakdown(months: int = 6, branch: str = "thawi_watthana"):
                        source,
                        COUNT(*)    AS tx_count,
                        SUM(amount) AS total
-                   FROM public.v_daybook
+                   FROM public.v_daybook_pnl
                    WHERE direction = 'income'
                      AND entry_date >= %s
                      AND (%s = '' OR branch_code = %s)
@@ -1279,7 +1278,7 @@ def revenue_breakdown(months: int = 6, branch: str = "thawi_watthana"):
                        TO_CHAR(DATE_TRUNC('month', entry_date), 'YYYY-MM') AS month,
                        source,
                        SUM(amount) AS total
-                   FROM public.v_daybook
+                   FROM public.v_daybook_pnl
                    WHERE direction = 'income'
                      AND entry_date >= %s
                      AND (%s = '' OR branch_code = %s)
@@ -1641,7 +1640,7 @@ def scorecard(month: str = "", branch: str = "thawi_watthana"):
             FROM public.budget_targets bt
             LEFT JOIN (
                 SELECT COALESCE(category_code,'other') AS category_code, SUM(amount) AS actual
-                FROM public.v_daybook
+                FROM public.v_daybook_pnl   -- audit: budget actuals on P&L basis (was v_daybook)
                 WHERE direction='expense' AND TO_CHAR(entry_date,'YYYY-MM')=%s
                   AND (%s='' OR branch_code=%s)
                 GROUP BY 1
@@ -1656,7 +1655,7 @@ def scorecard(month: str = "", branch: str = "thawi_watthana"):
         # ── 6. Delivery Revenue % ─────────────────────────────
         del_sql = """
             SELECT COALESCE(SUM(amount),0) AS delivery_rev
-            FROM public.v_daybook
+            FROM public.v_daybook_pnl
             WHERE direction='income'
               AND source IN ('rider_income_grab','rider_income_lineman')
               AND TO_CHAR(entry_date,'YYYY-MM')=%s
@@ -1681,7 +1680,7 @@ def scorecard(month: str = "", branch: str = "thawi_watthana"):
         # ── 8. Top Expense Category ───────────────────────────
         top_exp_sql = """
             SELECT category_code, SUM(amount) AS total
-            FROM public.v_daybook
+            FROM public.v_daybook_pnl   -- audit: top expense on P&L basis (was v_daybook; excluded equity/savings ranked falsely)
             WHERE direction='expense' AND TO_CHAR(entry_date,'YYYY-MM')=%s
               AND (%s='' OR branch_code=%s)
               AND category_code IS NOT NULL

@@ -5,8 +5,9 @@ Endpoints:
   GET  /tax/wht-summary?month=YYYY-MM          — WHT data for the month
   GET  /tax/wht-export?month=YYYY-MM           — Download XLSX for accountant
 
-WHT Categories (from bank_statement_entries):
-  musician_fee  → มาตรา 40(8)  → 3% WHT
+WHT Categories (from v_daybook_pnl — cash-basis P&L; musician_fee lives in pos_cashflow,
+NOT bank_statement_entries, so the old source returned an empty report every month):
+  musician_fee  → มาตรา 40(8) เงินได้อื่น  → 3% WHT   [TUM-confirmed 2026-05-30; all 3 pnd3 generators now 40(8)]
   rent          → มาตรา 40(5)  → 5% WHT
 
 Usage:
@@ -106,15 +107,15 @@ def wht_summary(
                 """
                 SELECT
                     category_code,
-                    txn_date,
-                    description,
-                    debit::numeric AS amount
-                FROM public.bank_statement_entries
-                WHERE branch_code = %s
-                  AND txn_date BETWEEN %s AND %s
+                    entry_date          AS txn_date,
+                    COALESCE(label, counterparty, '') AS description,
+                    amount::numeric     AS amount
+                FROM public.v_daybook_pnl
+                WHERE (branch_code = %s OR branch_code IS NULL)
+                  AND entry_date BETWEEN %s AND %s
+                  AND direction = 'expense'
                   AND category_code = ANY(%s)
-                  AND debit > 0
-                ORDER BY category_code, txn_date
+                ORDER BY category_code, entry_date
                 """,
                 (branch_code, start, end, categories),
             )
@@ -240,7 +241,7 @@ def wht_export(
     ws["A1"].alignment = center
 
     ws.merge_cells("A2:G2")
-    ws["A2"] = f"ร้านมาราสเตชั่น  |  ครบกำหนดนำส่ง: {data['due_date_th']}"
+    ws["A2"] = f"ร้านสถานีหม่าล่า (เขตทวีวัฒนา กทม.)  |  ครบกำหนดนำส่ง: {data['due_date_th']}"
     ws["A2"].font = Font(name="TH Sarabun New", size=12, color="555555")
     ws["A2"].alignment = center
 
