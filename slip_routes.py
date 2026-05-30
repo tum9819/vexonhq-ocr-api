@@ -652,9 +652,16 @@ def reconcile_slips_to_statements(actor: Optional[str] = "nightly_job") -> dict:
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
+            # Re-match any slip that isn't validly linked yet — including slips
+            # orphaned by a statement RE-IMPORT (deleting bank_statement_entries
+            # fires ON DELETE SET NULL on matched_statement_id but leaves the old
+            # match_status, so we also re-match anything whose link is now NULL).
+            # 'rejected' slips stay rejected (TUM marked them irrelevant).
             cur.execute(
                 "SELECT id FROM public.slips "
-                "WHERE match_status IN ('unmatched', 'needs_review')"
+                "WHERE match_status <> 'rejected' "
+                "  AND (match_status IN ('unmatched', 'needs_review') "
+                "       OR matched_statement_id IS NULL)"
             )
             loose_ids = [str(r[0]) for r in cur.fetchall()]
     finally:
