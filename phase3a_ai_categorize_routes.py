@@ -37,7 +37,8 @@ except ImportError:
 logger = logging.getLogger("phase3a_ai_categorize")
 router = APIRouter(tags=["phase3a-ai-categorize"])
 
-LLM_MODEL = "gpt-4o-mini"
+from llm import MODELS  # task->model registry (Step 2 consolidation)
+LLM_MODEL = MODELS["categorize"]
 # Pricing as of 2026-05 (per 1M tokens)
 LLM_PRICE_INPUT_PER_1M = 0.15
 LLM_PRICE_OUTPUT_PER_1M = 0.60
@@ -163,16 +164,8 @@ Examples:
 
 def _call_llm(prompt: str) -> dict:
     """Call OpenAI gpt-4o-mini. Returns dict with category_code, confidence, reason, tokens."""
-    try:
-        from openai import OpenAI
-    except ImportError:
-        raise HTTPException(500, "openai package not installed. Add 'openai>=1.0.0' to requirements.txt")
-
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise HTTPException(500, "OPENAI_API_KEY not set in environment")
-
-    client = OpenAI(api_key=api_key)
+    from llm import get_openai
+    client = get_openai()
     try:
         response = client.chat.completions.create(
             model=LLM_MODEL,

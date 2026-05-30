@@ -37,7 +37,7 @@ import pypdfium2 as pdfium
 import pytesseract
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from openai import OpenAI
+from llm import get_openai  # OpenAI client factory lives in llm.py (Step 2 AI consolidation)
 from PIL import Image
 from pydantic import BaseModel
 from supabase import Client, create_client
@@ -215,7 +215,6 @@ log = logging.getLogger("vexonhq-ocr")
 # Clients (lazy init — won't crash on import if env missing)
 # ============================================================
 _supabase_client: Optional[Client] = None
-_openai_client: Optional[OpenAI] = None
 
 
 def get_supabase() -> Client:
@@ -225,15 +224,6 @@ def get_supabase() -> Client:
             raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set")
         _supabase_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
     return _supabase_client
-
-
-def get_openai() -> OpenAI:
-    global _openai_client
-    if _openai_client is None:
-        if not OPENAI_API_KEY:
-            raise RuntimeError("OPENAI_API_KEY must be set")
-        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    return _openai_client
 
 
 # ============================================================

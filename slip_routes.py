@@ -48,10 +48,11 @@ from typing import Any, Optional
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel
 
+from llm import get_openai  # OpenAI client factory (Step 2 consolidation — no circular dep)
+
 try:
     from main import (  # type: ignore
         get_db_conn,
-        get_openai,
         get_supabase,
         SUPABASE_STORAGE_BUCKET,
         OPENAI_VISION_MODEL,
@@ -60,7 +61,6 @@ except ImportError:
     # Fallback so this module can be unit-tested standalone.
     import psycopg2
     from supabase import create_client
-    from openai import OpenAI
 
     SUPABASE_STORAGE_BUCKET = os.environ.get("SUPABASE_STORAGE_BUCKET", "uploads")
     OPENAI_VISION_MODEL = os.environ.get("OPENAI_VISION_MODEL", "gpt-4o")
@@ -73,9 +73,6 @@ except ImportError:
             os.environ["SUPABASE_URL"],
             os.environ["SUPABASE_SERVICE_KEY"],
         )
-
-    def get_openai():
-        return OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 log = logging.getLogger("slips")
 router = APIRouter(tags=["slips"])

@@ -158,7 +158,7 @@ def classify_items_batch(
     if openai_client is None:
         # Local import to keep this module standalone for unit tests that
         # mock the client.
-        from main import get_openai
+        from llm import get_openai
         openai_client = get_openai()
 
     # Mark empty inputs upfront so the model doesn't waste tokens on them.

@@ -1408,32 +1408,19 @@ def _handle_recipe_suggest() -> str:
             for n, u, p, _ in ingredients
         ) or "ยังไม่มีราคาวัตถุดิบ"
 
-        payload = _json.dumps({
-            "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 512,
-            "system": "คุณคือเชฟ AI ของร้านมาลาปิ้งย่าง ตอบภาษาไทย กระชับ",
-            "messages": [{"role": "user", "content":
-                f"วัตถุดิบในร้าน:\n{stock_text}\n\nราคาวัตถุดิบ:\n{ingr_text}\n\n"
-                "แนะนำ 3 เมนูที่ทำได้จากวัตถุดิบนี้ รูปแบบ:\n"
-                "1. ชื่อเมนู — ต้นทุน ~XX บาท | ราคาขาย XXX | GP XX%\n"
-                "วัตถุดิบ: ...\n\n"
-                "ตอบสั้น ไม่เกิน 10 บรรทัด"
-            }],
-        }).encode("utf-8")
-
-        req = _req.Request(
-            "https://api.anthropic.com/v1/messages",
-            data=payload,
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            method="POST",
+        from llm import call_anthropic
+        user_msg = (
+            f"วัตถุดิบในร้าน:\n{stock_text}\n\nราคาวัตถุดิบ:\n{ingr_text}\n\n"
+            "แนะนำ 3 เมนูที่ทำได้จากวัตถุดิบนี้ รูปแบบ:\n"
+            "1. ชื่อเมนู — ต้นทุน ~XX บาท | ราคาขาย XXX | GP XX%\n"
+            "วัตถุดิบ: ...\n\n"
+            "ตอบสั้น ไม่เกิน 10 บรรทัด"
         )
-        with _req.urlopen(req, timeout=25) as resp:
-            data = _json.loads(resp.read().decode("utf-8"))
-            answer = data["content"][0]["text"].strip()
+        answer = call_anthropic(
+            "menu_reco", user_msg,
+            system="คุณคือเชฟ AI ของร้านมาลาปิ้งย่าง ตอบภาษาไทย กระชับ",
+            max_tokens=512, timeout=25,
+        )
 
         return f"🍽️ AI แนะนำเมนูวันนี้\n{'─'*22}\n{answer}"
 

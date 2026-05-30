@@ -1174,40 +1174,21 @@ def ai_link_ingredients(
 ]
 qty_used = ปริมาณต่อ 1 จาน/แก้ว/ไม้ ใช้หน่วยเดียวกับ unit ของวัตถุดิบ"""
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        raise HTTPException(500, "ANTHROPIC_API_KEY not configured")
-
-    payload = json.dumps({
-        "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 1024,
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": user_prompt}],
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=payload,
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        method="POST",
-    )
+    from llm import call_anthropic, LLMError
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            raw = data["content"][0]["text"].strip()
-            if "```" in raw:
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-                raw = raw.split("```")[0]
-            suggestions = json.loads(raw.strip())
-    except urllib.error.HTTPError as e:
-        body_err = e.read().decode("utf-8", errors="replace")
-        raise HTTPException(502, f"Claude API error {e.code}: {body_err}")
+        raw = call_anthropic(
+            "recipe_suggest", user_prompt, system=system_prompt,
+            max_tokens=1024, timeout=30,
+        )
+    except LLMError as e:
+        raise HTTPException(e.status_for_http(), f"Claude API error: {e.detail}")
+    if "```" in raw:
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.split("```")[0]
+    try:
+        suggestions = json.loads(raw.strip())
     except json.JSONDecodeError:
         raise HTTPException(502, "Claude returned invalid JSON")
 
@@ -1352,41 +1333,22 @@ def ai_suggest_menus(body: Optional[AISuggestRequest] = None):
   }}
 ]"""
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        raise HTTPException(500, "ANTHROPIC_API_KEY not configured")
-
-    payload = json.dumps({
-        "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 1024,
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": user_prompt}],
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=payload,
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        method="POST",
-    )
+    from llm import call_anthropic, LLMError
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            raw = data["content"][0]["text"].strip()
-            # Strip markdown code block if present
-            if "```" in raw:
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-                raw = raw.split("```")[0]
-            suggestions = json.loads(raw.strip())
-    except urllib.error.HTTPError as e:
-        body_err = e.read().decode("utf-8", errors="replace")
-        raise HTTPException(502, f"Claude API error {e.code}: {body_err}")
+        raw = call_anthropic(
+            "recipe_draft", user_prompt, system=system_prompt,
+            max_tokens=1024, timeout=30,
+        )
+    except LLMError as e:
+        raise HTTPException(e.status_for_http(), f"Claude API error: {e.detail}")
+    # Strip markdown code block if present
+    if "```" in raw:
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.split("```")[0]
+    try:
+        suggestions = json.loads(raw.strip())
     except json.JSONDecodeError:
         raise HTTPException(502, "Claude returned invalid JSON")
 

@@ -92,44 +92,23 @@ _SYSTEM_PROMPT = (
 
 
 def _call_claude_filter(query: str) -> SearchFilter:
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        raise HTTPException(500, "ANTHROPIC_API_KEY not configured")
-
-    payload = json.dumps({
-        "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 256,
-        "system": _SYSTEM_PROMPT,
-        "messages": [{"role": "user", "content": query}],
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=payload,
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        method="POST",
-    )
+    from llm import call_anthropic, LLMError
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            raw = data["content"][0]["text"].strip()
-            if "```" in raw:
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            parsed = json.loads(raw)
-            return SearchFilter(**parsed)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise HTTPException(502, f"Claude API error {e.code}: {body}")
+        raw = call_anthropic(
+            "search_filter", query, system=_SYSTEM_PROMPT,
+            max_tokens=256, timeout=20,
+        )
+    except LLMError as e:
+        raise HTTPException(e.status_for_http(), f"Claude API error: {e.detail}")
+    if "```" in raw:
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    try:
+        parsed = json.loads(raw)
     except json.JSONDecodeError as e:
         raise HTTPException(502, f"Claude returned invalid JSON: {e}")
-    except Exception as e:
-        raise HTTPException(502, f"Claude call failed: {e}")
+    return SearchFilter(**parsed)
 
 
 def _build_and_run_query(f: SearchFilter, limit: int) -> list:

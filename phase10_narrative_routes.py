@@ -120,35 +120,11 @@ def _push_line(text: str) -> None:
 
 def _call_claude(prompt: str) -> str:
     """Call Claude API and return the text response."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        raise HTTPException(500, "ANTHROPIC_API_KEY not configured in env")
-
-    payload = json.dumps({
-        "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 1024,
-        "messages": [{"role": "user", "content": prompt}],
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=payload,
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        method="POST",
-    )
+    from llm import call_anthropic, LLMError
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data["content"][0]["text"].strip()
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise HTTPException(502, f"Claude API error {e.code}: {body}")
-    except Exception as e:
-        raise HTTPException(502, f"Claude API failed: {e}")
+        return call_anthropic("narrative", prompt, max_tokens=1024, timeout=30)
+    except LLMError as e:
+        raise HTTPException(e.status_for_http(), f"Claude API error: {e.detail}")
 
 
 # ─── Data gathering ─────────────────────────────────────────────────────────────

@@ -43,13 +43,9 @@ except Exception:  # pragma: no cover — module ships in same repo
 
 log = logging.getLogger("auto_diagnose")
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 DISCORD_OPS_WEBHOOK_URL = os.environ.get("DISCORD_OPS_WEBHOOK_URL", "")
-
-# Model choice rationale: Haiku 4.5 is more than enough to read a
-# Postgres / Supabase error string and explain it in 3-5 sentences.
-# Upgrade to Sonnet later only if Haiku diagnoses prove off-target.
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_DIAGNOSE_MODEL", "claude-haiku-4-5")
+# Anthropic key + model are centralised in llm.py now (MODELS["diagnose"] reads
+# the same ANTHROPIC_DIAGNOSE_MODEL env). Step 2 AI consolidation.
 
 # Rate-limit window per error_type (seconds). Prevents the every-5-min
 # Uptime Robot polling from spamming Discord during a sustained outage.
@@ -166,41 +162,18 @@ def _anthropic_call(
     (logged, never raised — this runs as BackgroundTask and must not
     crash the response).
     """
-    if not ANTHROPIC_API_KEY:
-        log.warning(
-            "auto_diagnose: ANTHROPIC_API_KEY not set — skipping call"
-        )
-        return None
-
-    payload = {
-        "model": ANTHROPIC_MODEL,
-        "max_tokens": max_tokens,
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": user_msg}],
-    }
-    body = json.dumps(payload).encode("utf-8")
-
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-        },
-        method="POST",
-    )
+    from llm import call_anthropic, LLMError
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        # Anthropic response shape: {"content": [{"type":"text","text":"..."}]}
-        blocks = data.get("content", [])
-        text_parts = [b.get("text", "") for b in blocks if b.get("type") == "text"]
-        return "\n".join(text_parts).strip() or None
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace")[:400]
-        log.error("auto_diagnose: Anthropic API %s: %s", e.code, detail)
+        return call_anthropic(
+            "diagnose", user_msg, system=system_prompt,
+            max_tokens=max_tokens, timeout=timeout,
+        ) or None
+    except LLMError as e:
+        if e.status == 500:
+            log.warning("auto_diagnose: %s — skipping call", e.detail)
+        else:
+            log.error("auto_diagnose: Anthropic API %s: %s", e.status, e.detail)
         return None
     except Exception:
         log.exception("auto_diagnose: Anthropic API call failed")

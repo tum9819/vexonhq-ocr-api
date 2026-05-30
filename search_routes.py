@@ -66,11 +66,8 @@ SYSTEM_PROMPT = """คุณช่วยแปลง query ภาษาไทย
 
 def _gpt_parse(q: str) -> dict:
     try:
-        from openai import OpenAI
-        key = os.environ.get("OPENAI_API_KEY", "")
-        if not key:
-            raise RuntimeError("no key")
-        client = OpenAI(api_key=key)
+        from llm import get_openai
+        client = get_openai()
         resp = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[
