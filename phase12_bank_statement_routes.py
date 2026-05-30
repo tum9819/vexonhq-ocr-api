@@ -113,88 +113,74 @@ def _extract_transactions(pdf_bytes: bytes) -> list[dict]:
       starts with "โอนไป"       → expense (debit)
       starts with "เพื่อชำระ"   → expense (debit)
     """
-    rows = []
+    # Line-based parser (audit batch13 B6 fix, 2026-05-30). The previous version
+    # split the date/amount/detail table cells independently by "\n" and aligned
+    # them by index, which drifted whenever a description wrapped to a 2nd line or
+    # a transaction type wasn't จาก/โอนไป/เพื่อชำระ — silently dropping/misclassifying
+    # rows (Nov-Apr drifted ~26-31k vs the statement's own รวมฝาก/รวมถอน checksum).
+    #
+    # KBank text lines read as:  DD-MM-YY HH:MM <type> <amount> <balance> <channel> <detail>
+    # Direction is taken from the running-BALANCE delta (the balance column is ground
+    # truth): balance up => income/credit, balance down => expense/debit. The type word
+    # ("รับ..." vs "โอน...") is only a fallback for the very first row. Wrapped lines
+    # (no leading date) append to the previous transaction's detail.
+    # Verified zero-drift vs both production statements by scripts/verify_statement_parse.py.
+    rows: list[dict] = []
+    prev_balance: Optional[float] = None
+    _date_time = re.compile(r"^(\d{2})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})\s+(.*)$")
+    _money = re.compile(r"\d[\d,]*\.\d{2}")
+
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
-            tables = page.extract_tables()
-
-            # ── KBank format: look for table with 6 columns ──
-            data_table = None
-            for t in tables:
-                if len(t) >= 2 and len(t[1]) >= 6:
-                    data_table = t
-                    break
-
-            if data_table is None:
-                continue
-
-            data_row = data_table[1]   # all transactions packed in one row
-
-            col_date   = str(data_row[0] or "")
-            col_amount = str(data_row[2] or "")
-            col_detail = str(data_row[5] or "")
-
-            # ── Parse dates: skip "ยอดยกมา" opening-balance line ──
-            date_entries: list[date] = []
-            for line in col_date.split("\n"):
-                line = line.strip()
-                # Must have HH:MM to be a real transaction (not opening balance)
-                m = re.match(r"(\d{2})-(\d{2})-(\d{2})\s+\d{2}:\d{2}", line)
-                if not m:
-                    continue
-                d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3)) + 2000
-                try:
-                    date_entries.append(date(y, mo, d))
-                except ValueError:
-                    pass
-
-            # ── Parse amounts ──
-            amount_entries: list[float] = []
-            for line in col_amount.split("\n"):
-                line = line.strip()
-                val = _clean_number(line)
-                if val > 0:
-                    amount_entries.append(val)
-
-            # ── Parse details: merge wrapped continuation lines ──
-            # New entry starts with "จาก", "โอนไป", or "เพื่อชำระ"
-            INCOME_PREFIXES  = ("จาก",)
-            EXPENSE_PREFIXES = ("โอนไป", "เพื่อชำระ")
-            ALL_PREFIXES     = INCOME_PREFIXES + EXPENSE_PREFIXES
-
-            detail_entries: list[str] = []
-            current = ""
-            for line in col_detail.split("\n"):
-                line = line.strip()
+            text = page.extract_text() or ""
+            for raw in text.split("\n"):
+                line = raw.strip()
                 if not line:
                     continue
-                if any(line.startswith(p) for p in ALL_PREFIXES):
-                    if current:
-                        detail_entries.append(current)
-                    current = line
-                else:
-                    current = (current + " " + line).strip() if current else line
-            if current:
-                detail_entries.append(current)
+                m = _date_time.match(line)
+                if not m:
+                    # wrapped continuation of the previous transaction's detail
+                    if rows and "ยอดยก" not in line and not line.startswith("รวม"):
+                        rows[-1]["description"] = (rows[-1]["description"] + " " + line).strip()
+                    continue
 
-            # ── Align and build rows ──
-            n = min(len(date_entries), len(amount_entries), len(detail_entries))
-            for i in range(n):
-                txn_date = date_entries[i]
-                amount   = amount_entries[i]
-                detail   = detail_entries[i]
+                dd, mo, yy = int(m.group(1)), int(m.group(2)), int(m.group(3)) + 2000
+                rest = m.group(6).strip()
 
-                if any(detail.startswith(p) for p in INCOME_PREFIXES):
-                    credit, debit = amount, 0.0
+                # opening/closing balance carry line ("ยอดยกมา/ยอดยกไป <bal>") — reset
+                # the running-balance baseline (handles page breaks) but is not a txn.
+                if "ยอดยกมา" in rest or "ยอดยกไป" in rest:
+                    bal = _money.findall(rest)
+                    if bal:
+                        prev_balance = float(bal[-1].replace(",", ""))
+                    continue
+
+                monies = list(_money.finditer(rest))
+                if len(monies) < 2:
+                    continue  # a real txn line always carries amount + running balance
+
+                amount = float(monies[0].group().replace(",", ""))
+                balance = float(monies[1].group().replace(",", ""))
+                detail = rest[monies[1].end():].strip()
+                type_word = rest.split()[0]
+
+                if prev_balance is not None:
+                    is_income = (balance - prev_balance) > 0
                 else:
-                    credit, debit = 0.0, amount
+                    is_income = type_word.startswith("รับ") or "ดอกเบี้ย" in type_word
+                prev_balance = balance
+
+                try:
+                    txn_date = date(yy, mo, dd)
+                except ValueError:
+                    continue
 
                 rows.append({
                     "txn_date":    txn_date,
                     "description": detail,
-                    "debit":       debit,
-                    "credit":      credit,
-                    "balance":     0.0,
+                    "debit":       0.0 if is_income else amount,
+                    "credit":      amount if is_income else 0.0,
+                    "balance":     balance,
                 })
 
     return rows
@@ -339,7 +325,22 @@ def _classify(row: dict, rules: list[dict]) -> dict:
             except ValueError:
                 pass
 
-    # No rule matched
+    # No rule matched — CASH-BASIS default (audit batch13, 2026-05-30).
+    # P&L is now cash/statement basis, so every real money movement must be
+    # reflected correctly:
+    #   - an unclassified EXPENSE (money actually left the account) is a real cost
+    #     -> count it as 'other_expense' (the old 'bank_statement' tag is EXCLUDED
+    #     from P&L, which under cash basis would silently drop a real expense).
+    #     match_status='auto' so it is not filtered out of v_daybook (Branch 7 drops
+    #     needs_review); it stays uncategorized (category_code 'other_expense') and can
+    #     be refined later.
+    #   - an unclassified INCOME stays OUT of P&L until TUM confirms it is genuine
+    #     revenue (it could be owner capital / an inter-entity transfer — cf. B2), so
+    #     it goes to the review queue and is excluded ('bank_statement').
+    if direction == "expense":
+        return {**row, "direction": direction, "amount": amount,
+                "category_code": "other_expense", "source_type": "other_expense",
+                "match_status": "auto"}
     return {**row, "direction": direction, "amount": amount,
             "category_code": None, "source_type": "bank_statement",
             "match_status": "needs_review"}
