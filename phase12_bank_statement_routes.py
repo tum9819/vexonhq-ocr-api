@@ -51,6 +51,7 @@ class ClassifyRequest(BaseModel):
     source_type: Optional[str] = "bank_statement"
     save_rule: bool = False        # ถ้า True → บันทึก rule สำหรับครั้งต่อไป
     rule_type: Optional[str] = "name"   # keyword / name / amount_pattern
+    lender: Optional[str] = None   # written to notes when tagging a loan row
 
 
 class AddRuleRequest(BaseModel):
@@ -483,10 +484,11 @@ def classify_entry(entry_id: str, body: ClassifyRequest):
                 UPDATE public.bank_statement_entries
                 SET category_code = %s,
                     source_type   = %s,
-                    match_status  = 'manual'
+                    match_status  = 'manual',
+                    notes         = COALESCE(%s, notes)
                 WHERE id = %s
                 RETURNING id, description, amount, direction
-            """, (body.category_code, body.source_type, entry_id))
+            """, (body.category_code, body.source_type, body.lender, entry_id))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(404, "ไม่พบรายการนี้")
