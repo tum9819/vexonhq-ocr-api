@@ -1,9 +1,33 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-05-31 (Session 49 — full-system audit: 19 code findings + 2 platform breaches)
+**Last updated**: 2026-05-31 (Session 50 — loan tracking เงินยืม Phase 1)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
+
+---
+
+## 🟢 Session 50 (2026-05-31) — Loan tracking (เงินยืม) Phase 1
+
+Trigger: co-owner นุศรา lent the shop money (slip 33,000 / memo "ยืม 33,000 คืนแล้ว 15,000" → ค้าง 18,000). A loan is financing, NOT P&L — both legs must be excluded. Spec + plan: `docs/superpowers/{specs,plans}/2026-05-31-loan-tracking*`. See AGENTS.md #36.
+
+### ✅ Applied LIVE to prod Supabase this session (additive views, NOT via git push)
+- `v_daybook_pnl` extended to exclude `loan_in` + `loan_repayment` (`migrations/2026_05_31_loan_sources_pnl_exclude.sql`). A/B proof: Apr totals unchanged with loan rows present.
+- New `v_loan_balance` view — per-lender borrowed/repaid/outstanding, grouped by `bank_statement_entries.notes` (`migrations/2026_05_31_v_loan_balance.sql`). Verified: outstanding=18,000 on the fixture.
+
+### ✅ FIXED in code this session (awaiting TUM push + Coolify deploy)
+- `loan_routes.py` (new) — `GET /loans` + `GET /loans/{lender}` (JWT-gated); registered in `main.py`.
+- `POST /classify/{entry_id}` now takes optional `lender` → written to `notes` (COALESCE; already sets `match_status='manual'`).
+- Loan exclusion spliced into inline `source NOT IN` lists: `pnl_routes.py` (5), `cashflow_routes.py` (3), `line_bot_routes.py` (2), `phase2_routes.py` (2), `phase10_narrative_routes.py` macro.
+- `tests/test_smoke.py` probes `/loans`. `verify.ps1` compileall ✅. Final review: APPROVED_WITH_NITS (no blockers).
+
+### 👉 NEXT for TUM
+1. Push the code (paste block provided) → Coolify deploy → `verify.ps1 -Smoke` once VPS CPU < 30%.
+2. Tag this slip: on `/bank-statement` set the นุศรา money-in row to `loan_in` with lender "นุศรา"; tag the repayment-out rows as `loan_repayment` (lender "นุศรา") — only the ones whose slip memo says คืนยืม (NOT the ค่าเนื้อ reimbursements).
+3. Dashboard loan card = follow-up in the `VEXONHQ` frontend repo (consumes `GET /loans`).
+
+### 🟡 Phase 2 (pending, separate plan) — auto-tag from memo
+Seed `statement_rules` keywords ("ยืม"→loan_in/income, "คืนยืม"→loan_repayment/expense) + wire the loan category→source mapping into the slip→statement reconcile. Touches `slip_routes.py` + scheduler (coordination zone) → its own spec/plan.
 
 ---
 

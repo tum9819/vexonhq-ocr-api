@@ -186,14 +186,15 @@ Record the income and expense totals (baseline).
 
 - [ ] **Step 2: Insert two TEMP loan rows (match_status='manual' so they enter v_daybook)**
 
+NOTE: `direction` and `amount` on `bank_statement_entries` are GENERATED columns (derived from debit/credit) — do NOT insert them or you get `cannot insert a non-DEFAULT value into column "direction"`. Set debit/credit; the generated columns compute.
 Run (`execute_sql`):
 ```sql
 INSERT INTO public.bank_statement_entries
-  (txn_date, description, debit, credit, balance, direction, amount,
+  (txn_date, description, debit, credit, balance,
    category_code, source_type, match_status, branch_code, notes)
 VALUES
-  ('2026-04-15','TEST loan_in นุศรา',0,33000,0,'income',33000,'loan','loan_in','manual','thawi_watthana','__TEST_LOAN__'),
-  ('2026-04-16','TEST loan_repayment นุศรา',15000,0,0,'expense',15000,'loan','loan_repayment','manual','thawi_watthana','__TEST_LOAN__');
+  ('2026-04-15','TEST loan_in นุศรา',0,33000,0,'loan','loan_in','manual','thawi_watthana','__TEST_LOAN__'),
+  ('2026-04-16','TEST loan_repayment นุศรา',15000,0,0,'loan','loan_repayment','manual','thawi_watthana','__TEST_LOAN__');
 ```
 
 - [ ] **Step 3: Re-run the baseline query — totals MUST be unchanged**
@@ -455,11 +456,11 @@ Expected: no output.
 
 Insert one unreviewed test row, classify it as a loan with a lender, confirm it lands in `v_loan_balance`, then clean up. Run (`execute_sql`) one statement at a time:
 ```sql
--- a) create an unreviewed test row
+-- a) create an unreviewed test row (direction/amount are GENERATED — omit them)
 INSERT INTO public.bank_statement_entries
-  (txn_date, description, debit, credit, balance, direction, amount,
+  (txn_date, description, debit, credit, balance,
    source_type, match_status, branch_code)
-VALUES ('2026-04-20','TEST classify นุศรา',0,33000,0,'income',33000,
+VALUES ('2026-04-20','TEST classify นุศรา',0,33000,0,
         'bank_statement','needs_review','thawi_watthana')
 RETURNING id;
 ```

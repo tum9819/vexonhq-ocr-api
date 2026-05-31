@@ -182,8 +182,9 @@ Expected once the trigger data is tagged: `lender='นุศรา', borrowed=33
 v_daybook. These drove the §3.2 `match_status='manual'` rule and the §3.3 view rewrite.)
 
 **Migrations (idempotent; commit to repo before applying):**
-- `2026_05_31_loan_sources_pnl_exclude.sql` — extend `v_daybook_pnl` exclusion + seed
-  `statement_rules` loan keywords.
+- `2026_05_31_loan_sources_pnl_exclude.sql` — extend `v_daybook_pnl` exclusion. (The
+  `statement_rules` loan-keyword seeding belongs to the §3.2 auto-tag path → **Phase 2**, not this
+  migration.)
 - `2026_05_31_v_loan_balance.sql` — the balance view.
 
 **Code:** splice `loan_in` / `loan_repayment` into the inline exclusion lists in `pnl_routes.py`
