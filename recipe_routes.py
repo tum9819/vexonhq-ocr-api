@@ -1256,7 +1256,7 @@ def ai_suggest_menus(body: Optional[AISuggestRequest] = None):
         with conn.cursor() as cur:
             # 1. Get current stock (latest snapshot)
             cur.execute("""
-                SELECT ii.item_name, ii.qty, ii.unit
+                SELECT ii.item_name, ii.qty_in_stock, ii.unit
                 FROM public.pos_inventory_items ii
                 JOIN public.pos_inventory_snapshots s ON s.id = ii.snapshot_id
                 WHERE s.branch_code = %s
