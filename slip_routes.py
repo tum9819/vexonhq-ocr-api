@@ -41,6 +41,7 @@ import io
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import date, datetime
 from typing import Any, Optional
@@ -633,11 +634,32 @@ _CAT_TO_SOURCE: dict[str, str] = {
     "beverage_raw": "vendor_purchase",
     "bank_fee":     "bank_fee",
     "tax":          "tax_expense",
+    "loan_repayment": "loan_repayment",
 }
 
 
 def _source_for_category(category_code: Optional[str]) -> str:
     return _CAT_TO_SOURCE.get(category_code or "", "other_expense")
+
+
+_LENDER_TITLE_RE = re.compile(r'^(?:น\.ส\.?|นางสาว|นาย|นาง)\s*')
+
+
+def _normalize_lender(name: Optional[str]) -> Optional[str]:
+    """Canonical short lender name for grouping loans by person.
+
+    Strips a Thai title prefix, drops '+' padding / extra whitespace, and returns
+    the FIRST name token so the slip's recipient ("น.ส. นุศรา ปรางม++") and TUM's
+    hand-typed lender ("นุศรา") collapse to the same key in v_loan_balance.
+    Returns None for blank input (so COALESCE leaves notes untouched).
+    """
+    if not name:
+        return None
+    s = name.replace('+', ' ').strip()
+    s = _LENDER_TITLE_RE.sub('', s).strip()
+    if not s:
+        return None
+    return s.split()[0]
 
 
 def reconcile_slips_to_statements(actor: Optional[str] = "nightly_job") -> dict:
@@ -703,6 +725,13 @@ def reconcile_slips_to_statements(actor: Optional[str] = "nightly_job") -> dict:
             if not category_code:
                 continue  # no memo/name signal — leave the bank row's default
             source_type = _source_for_category(category_code)
+            # Loan repayments: also stamp the lender (normalized) onto notes so the
+            # per-lender ledger (v_loan_balance groups by notes) nets borrow vs repay.
+            lender_notes = (
+                _normalize_lender(recipient_name)
+                if category_code == "loan_repayment"
+                else None
+            )
             try:
                 with conn.cursor() as cur:
                     cur.execute(
@@ -710,14 +739,16 @@ def reconcile_slips_to_statements(actor: Optional[str] = "nightly_job") -> dict:
                         UPDATE public.bank_statement_entries
                         SET category_code = %s,
                             source_type   = %s,
-                            match_status  = 'auto'
+                            match_status  = 'auto',
+                            notes         = COALESCE(%s, notes)
                         WHERE id = %s
                           AND match_status <> 'manual'
                           AND (category_code IS DISTINCT FROM %s
-                               OR source_type IS DISTINCT FROM %s)
+                               OR source_type IS DISTINCT FROM %s
+                               OR (%s IS NOT NULL AND notes IS DISTINCT FROM %s))
                         """,
-                        (category_code, source_type, str(stmt_id),
-                         category_code, source_type),
+                        (category_code, source_type, lender_notes, str(stmt_id),
+                         category_code, source_type, lender_notes, lender_notes),
                     )
                     if cur.rowcount:
                         categorized += 1
