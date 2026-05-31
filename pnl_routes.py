@@ -96,7 +96,8 @@ def pnl_daily(
                   AND d.source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
                             'bank_statement', 'vendor_payment',
                             'grab_payout', 'lineman_payout',
-                            'pos_cash_deposit', 'cash_withdrawal')
+                            'pos_cash_deposit', 'cash_withdrawal',
+                            'loan_in', 'loan_repayment')
                 GROUP BY d.entry_date
                 ORDER BY d.entry_date
             """, (branch_code, from_date, to_date))
@@ -166,7 +167,8 @@ def pnl_monthly(
                   AND d.source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
                             'bank_statement', 'vendor_payment',
                             'grab_payout', 'lineman_payout',
-                            'pos_cash_deposit', 'cash_withdrawal')
+                            'pos_cash_deposit', 'cash_withdrawal',
+                            'loan_in', 'loan_repayment')
                 GROUP BY TO_CHAR(d.entry_date, 'YYYY-MM')
                 ORDER BY month
             """, (branch_code, year))
@@ -242,7 +244,8 @@ def pnl_by_category(
                   AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
                             'bank_statement', 'vendor_payment',
                             'grab_payout', 'lineman_payout',
-                            'pos_cash_deposit', 'cash_withdrawal')
+                            'pos_cash_deposit', 'cash_withdrawal',
+                            'loan_in', 'loan_repayment')
             """, (branch_code, from_date, to_date))
             sales_net = float(cur.fetchone()[0] or 0)
 
@@ -261,7 +264,8 @@ def pnl_by_category(
                   AND d.source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
                             'bank_statement', 'vendor_payment',
                             'grab_payout', 'lineman_payout',
-                            'pos_cash_deposit', 'cash_withdrawal')
+                            'pos_cash_deposit', 'cash_withdrawal',
+                            'loan_in', 'loan_repayment')
                 GROUP BY d.category_code, ec.name_th
                 ORDER BY expense DESC
             """, (branch_code, from_date, to_date))
@@ -279,7 +283,8 @@ def pnl_by_category(
                   AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
                             'bank_statement', 'vendor_payment',
                             'grab_payout', 'lineman_payout',
-                            'pos_cash_deposit', 'cash_withdrawal')
+                            'pos_cash_deposit', 'cash_withdrawal',
+                            'loan_in', 'loan_repayment')
                 GROUP BY category_code
             """, (branch_code, prev_from, prev_to))
             prev_map = {
