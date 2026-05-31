@@ -1192,6 +1192,16 @@ qty_used = ปริมาณต่อ 1 จาน/แก้ว/ไม้ ใช
     except json.JSONDecodeError:
         raise HTTPException(502, "Claude returned invalid JSON")
 
+    # Claude (Haiku) sometimes wraps the array in an object {"suggestions":[...]}
+    # or returns a single object — iterating a dict would yield str keys and
+    # crash s.get(...) with AttributeError (-> 500). Normalize to a list.
+    if isinstance(suggestions, dict):
+        suggestions = (suggestions.get("suggestions")
+                       or suggestions.get("ingredients")
+                       or suggestions.get("data") or [])
+    if not isinstance(suggestions, list):
+        raise HTTPException(502, "Claude returned unexpected JSON shape")
+
     # ── Apply: INSERT จริงถ้า apply=true ──────────────────────
     applied = 0
     skipped = 0
@@ -1206,6 +1216,8 @@ qty_used = ปริมาณต่อ 1 จาน/แก้ว/ไม้ ใช
         try:
             with conn2.cursor() as cur:
                 for s in suggestions:
+                    if not isinstance(s, dict):
+                        continue
                     ing_id = s.get("ingredient_id")
                     qty    = float(s.get("qty_used") or 0)
                     if not ing_id or qty <= 0:
@@ -1351,6 +1363,14 @@ def ai_suggest_menus(body: Optional[AISuggestRequest] = None):
         suggestions = json.loads(raw.strip())
     except json.JSONDecodeError:
         raise HTTPException(502, "Claude returned invalid JSON")
+
+    # Normalize so the client always receives a list (Claude may wrap in an object).
+    if isinstance(suggestions, dict):
+        suggestions = (suggestions.get("suggestions")
+                       or suggestions.get("menus")
+                       or suggestions.get("data") or [])
+    if not isinstance(suggestions, list):
+        suggestions = []
 
     return {
         "suggestions": suggestions,

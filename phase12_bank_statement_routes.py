@@ -20,6 +20,7 @@ Flow:
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
@@ -140,7 +141,9 @@ def _extract_transactions(pdf_bytes: bytes) -> list[dict]:
                 m = _date_time.match(line)
                 if not m:
                     # wrapped continuation of the previous transaction's detail
-                    if rows and "ยอดยก" not in line and not line.startswith("รวม"):
+                    # (guard kept identical to scripts/verify_statement_parse.py so the
+                    #  two parsers cannot drift — AGENTS #18)
+                    if rows and "ยอดยก" not in line and "รวม" not in line[:4]:
                         rows[-1]["description"] = (rows[-1]["description"] + " " + line).strip()
                     continue
 
@@ -361,6 +364,15 @@ async def upload_statement(
     if len(pdf_bytes) > 20 * 1024 * 1024:
         raise HTTPException(400, "ไฟล์ใหญ่เกิน 20MB")
 
+    # AGENTS #3/#10/#15/#23: pdfplumber parse (multi-page) + the per-row INSERT
+    # loop are blocking/CPU-bound. Run them OFF the event loop so a monthly
+    # statement upload does not freeze uvicorn -> /health/deep timeout ->
+    # UptimeRobot DOWN + the in-process Discord bot dies.
+    return await asyncio.to_thread(_process_statement_upload, pdf_bytes, branch_code)
+
+
+def _process_statement_upload(pdf_bytes: bytes, branch_code: str) -> dict:
+    """Sync worker: parse PDF, classify rows, insert. Runs in a thread (off loop)."""
     # Parse PDF
     try:
         raw_rows = _extract_transactions(pdf_bytes)

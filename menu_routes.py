@@ -2727,7 +2727,7 @@ def pos_categories(
 # ──────────────────────────────────────────────────────────────────────────────
 @router.get("/pos/calendar")
 def pos_calendar(
-    year:   int = Query(None),
+    year:   int = Query(None, ge=2000, le=2100),
     month:  int = Query(None),
     branch: str = Query(""),
 ):
@@ -2995,11 +2995,18 @@ def pos_compare(
             y, m = int(p[:4]), int(p[5:7])
         except Exception:
             raise ValueError(f"Invalid period: {p}")
+        # Validate ranges BEFORE monthrange/date — month=13 or year=0 parse to a
+        # valid int but then raise ValueError, which previously escaped as a 500.
+        if not (1 <= m <= 12) or not (2000 <= y <= 2100):
+            raise ValueError(f"Invalid period: {p}")
         _, last = calendar.monthrange(y, m)
         return date(y, m, 1), date(y, m, last)
 
-    start_a, end_a = parse_period(period_a)
-    start_b, end_b = parse_period(period_b)
+    try:
+        start_a, end_a = parse_period(period_a)
+        start_b, end_b = parse_period(period_b)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="period must be YYYY-MM with month 01-12")
 
     branch_sql = "AND b.branch_code = %(branch)s" if branch else ""
 
@@ -3778,16 +3785,22 @@ def pos_goals(
     import calendar as cal
     from datetime import date
     today = date.today()
+    # Build first_day/days_in_month inside the try so a malformed month (e.g.
+    # '2026-13' or '0000-05') falls back to today instead of an uncaught 500 —
+    # date()/monthrange() raise ValueError on month>12 or year 0.
     if month:
         try:
             y, m = int(month[:4]), int(month[5:7])
+            first_day = date(y, m, 1)
+            days_in_month = cal.monthrange(y, m)[1]
         except Exception:
             y, m = today.year, today.month
+            first_day = date(y, m, 1)
+            days_in_month = cal.monthrange(y, m)[1]
     else:
         y, m = today.year, today.month
-
-    first_day = date(y, m, 1)
-    days_in_month = cal.monthrange(y, m)[1]
+        first_day = date(y, m, 1)
+        days_in_month = cal.monthrange(y, m)[1]
     last_day = date(y, m, days_in_month)
 
     if y == today.year and m == today.month:

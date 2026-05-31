@@ -761,6 +761,7 @@ def _scheduled_daily_digest():
         log.info("Scheduled digest sent OK for %s", yesterday)
     except Exception as e:
         log.error("Scheduled digest FAILED for %s: %s", yesterday, e)
+        raise  # let @_heartbeat record the failure so /cron/health + Uptime Robot catch a silently-dead push
 
 
 # ─────────────────────────────────────────────
@@ -782,6 +783,7 @@ def _scheduled_ap_due_reminder():
             log.info("AP due reminder: ไม่มีบิลครบกำหนดใน 3 วันข้างหน้า")
     except Exception as e:
         log.error("AP due reminder FAILED: %s", e)
+        raise  # let @_heartbeat record the failure (false-healthy fix)
 
 
 # ─────────────────────────────────────────────
@@ -832,17 +834,17 @@ def _build_weekly_summary() -> str:
 
         # Top 3 expense categories
         cur.execute("""
-            SELECT COALESCE(cat.name, d.category_code, 'อื่นๆ') AS cat_name,
+            SELECT COALESCE(cat.name_th, d.category_code, 'อื่นๆ') AS cat_name,
                    COALESCE(SUM(d.amount), 0) AS total
             FROM public.v_daybook d
-            LEFT JOIN public.categories cat ON cat.code = d.category_code
+            LEFT JOIN public.expense_categories cat ON cat.code = d.category_code
             WHERE d.entry_date BETWEEN %s AND %s
               AND d.direction = 'expense'
               AND d.source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
                             'bank_statement', 'vendor_payment',
                             'grab_payout', 'lineman_payout',
                             'pos_cash_deposit', 'cash_withdrawal')
-            GROUP BY COALESCE(cat.name, d.category_code, 'อื่นๆ')
+            GROUP BY COALESCE(cat.name_th, d.category_code, 'อื่นๆ')
             ORDER BY total DESC
             LIMIT 3
         """, (week_start.isoformat(), week_end.isoformat()))
@@ -899,6 +901,7 @@ def _scheduled_weekly_summary():
         log.info("Weekly summary sent OK")
     except Exception as e:
         log.error("Weekly summary FAILED: %s", e)
+        raise  # let @_heartbeat record the failure (false-healthy fix)
 
 
 # Start scheduler when module loads (FastAPI startup)
@@ -1570,6 +1573,7 @@ def _scheduled_daily_stock_digest():
         log.info("Daily stock digest sent OK")
     except Exception as e:
         log.error("Daily stock digest FAILED: %s", e)
+        raise  # let @_heartbeat record the failure (false-healthy fix)
 
 
 # Phase 67 (Session 16): register the 07:00 BKK job — must be AFTER the
@@ -1668,8 +1672,12 @@ except Exception as e:
 # Checks disk, RAM, containers, API health — fires LINE alert on issue.
 try:
     from health_monitor import health_check_job as _health_check_job
+    # P1.2: wrap with @_heartbeat so the watchdog itself is monitored — it now
+    # appears in job_heartbeat and /cron/health flags it stale if it dies.
+    # expected_interval_hours=1 => 2h stale window for a 15-min job (tolerant of one miss).
+    _hb_health_check_job = _heartbeat("vps_health_monitor", expected_interval_hours=1)(_health_check_job)
     _scheduler.add_job(
-        _health_check_job,
+        _hb_health_check_job,
         trigger="interval",
         minutes=15,
         id="vps_health_monitor",
@@ -1682,10 +1690,11 @@ except Exception as e:
 
 def _verify_signature(body: bytes, signature: str) -> bool:
     secret = os.environ.get("LINE_CHANNEL_SECRET", "")
-    if not secret:
-        return True  # skip verification if secret not set
+    if not secret or not signature:
+        return False  # fail closed: no secret configured or no signature header => reject
     digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).digest()
-    return base64.b64encode(digest).decode() == signature
+    expected = base64.b64encode(digest).decode()
+    return hmac.compare_digest(expected, signature)
 
 
 SOURCE_LABELS_SHORT = {
@@ -1939,8 +1948,11 @@ async def line_webhook(
     """Receive LINE webhook events and dispatch to background processor."""
     body = await request.body()
 
-    if x_line_signature and not _verify_signature(body, x_line_signature):
-        log.warning("LINE webhook: invalid signature")
+    # Fail closed: a missing X-Line-Signature header (or unset secret) must NOT
+    # bypass verification — LINE always sends a valid signature, so anything
+    # without one is forged (would otherwise burn paid Claude/OpenAI + spam LINE).
+    if not _verify_signature(body, x_line_signature or ""):
+        log.warning("LINE webhook: invalid or missing signature")
         raise HTTPException(status_code=403, detail="Invalid signature")
 
     try:

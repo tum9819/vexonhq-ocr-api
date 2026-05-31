@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import time
 from typing import Any
 
@@ -395,7 +396,7 @@ def discord_restart_test(secret: str = Query("")):
         raise HTTPException(
             500, "ALERTS_WEBHOOK_SECRET env var not configured on backend"
         )
-    if secret != ALERTS_WEBHOOK_SECRET:
+    if not secrets.compare_digest(secret, ALERTS_WEBHOOK_SECRET):
         raise HTTPException(401, "Invalid secret query param")
 
     if not di.is_bot_configured():

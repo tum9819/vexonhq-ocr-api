@@ -1,9 +1,17 @@
 """
 VEXONHQ Phase 39 — AI Search (ค้นหาบิลด้วยภาษาไทย)
 =====================================================
+
+!!! UNUSED / DEAD CODE — superseded by phase11_search_routes.py !!!
+This router is NOT registered in main.py (main.py imports phase11_search_routes
+as `search_router`). The live search surface is /search/receipt, /search/suggestions,
+/search/empty-hints from phase11_search_routes.py. The endpoints below
+(/search/query, /search/health) do NOT exist in production. Do not "bugfix" here
+expecting a prod effect — edit phase11_search_routes.py instead. (Security audit 2026-05-31, finding #13.)
+
 GPT-4o-mini แปลง query ภาษาธรรมชาติ → filters → SQL บน v_daybook + vendor_bills
 
-Endpoints:
+Endpoints (NOT registered):
   POST /search/query   {"q": "...", "limit": 20}
   GET  /search/health
 """

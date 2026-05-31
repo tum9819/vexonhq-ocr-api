@@ -300,7 +300,13 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse as StarletteJSONResponse
 
-PUBLIC_PATHS = {"/", "/health", "/health/deep", "/cron/health", "/auth/login", "/auth/logout", "/docs", "/openapi.json", "/redoc", "/ap/due-reminder", "/stock/alert", "/alerts/uptime-webhook", "/alerts/test-telegram", "/alerts/discord-interaction", "/alerts/discord-restart-test", "/line/webhook", "/snapshots/status", "/snapshots/auto-rotate", "/menu/public", "/ai/exec"}
+# Security audit 2026-05-31 (finding #8): removed "/ap/due-reminder" and
+# "/stock/alert" from PUBLIC_PATHS. They were unauthenticated yet returned
+# AP/supplier financial rows and could be spammed to push to TUM's LINE. The
+# in-process APScheduler fires these digests via internal functions
+# (_scheduled_ap_due_reminder / _scheduled_daily_stock_digest), NOT via HTTP, so
+# requiring JWT here breaks nothing — only anonymous internet callers are blocked.
+PUBLIC_PATHS = {"/", "/health", "/health/deep", "/cron/health", "/auth/login", "/auth/logout", "/docs", "/openapi.json", "/redoc", "/alerts/uptime-webhook", "/alerts/test-telegram", "/alerts/discord-interaction", "/alerts/discord-restart-test", "/line/webhook", "/snapshots/status", "/snapshots/auto-rotate", "/menu/public", "/ai/exec"}
 
 class JWTAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: StarletteRequest, call_next):
@@ -401,11 +407,13 @@ async def _all_exceptions_handler(request: StarletteRequest, exc: Exception):
         request.method,
         request.url.path,
     )
+    # Do NOT echo str(exc) to the client: psycopg2/connection errors embed the
+    # DB host:port, and some library exceptions leak internal config. The full
+    # traceback is already logged above (log.exception) for debugging in Coolify.
     return StarletteJSONResponse(
         status_code=500,
         content={
             "detail": f"internal server error: {type(exc).__name__}",
-            "message": str(exc)[:300],
         },
     )
 

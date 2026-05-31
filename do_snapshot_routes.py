@@ -49,6 +49,7 @@ import datetime as _dt
 import json
 import logging
 import os
+import secrets
 import urllib.error
 import urllib.request
 from typing import Any, Optional
@@ -344,7 +345,7 @@ def snapshot_status(secret: str = Query("")):
         raise HTTPException(
             500, "ALERTS_WEBHOOK_SECRET env var not configured on backend"
         )
-    if secret != ALERTS_WEBHOOK_SECRET:
+    if not secrets.compare_digest(secret, ALERTS_WEBHOOK_SECRET):
         raise HTTPException(401, "Invalid secret query param")
     if not is_do_configured():
         raise HTTPException(
@@ -395,7 +396,7 @@ def trigger_auto_rotate(secret: str = Query("")):
         raise HTTPException(
             500, "ALERTS_WEBHOOK_SECRET env var not configured on backend"
         )
-    if secret != ALERTS_WEBHOOK_SECRET:
+    if not secrets.compare_digest(secret, ALERTS_WEBHOOK_SECRET):
         raise HTTPException(401, "Invalid secret query param")
     if not is_do_configured():
         raise HTTPException(

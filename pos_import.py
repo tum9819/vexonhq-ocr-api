@@ -1157,8 +1157,18 @@ def _process_import_background(
                         if bid:
                             it["bill_id"] = bid[0]
                     rows = [r for r in rows if "bill_id" in r]
-                    cols = list(rows[0].keys()) if rows else []
                     if rows:
+                        # Idempotent re-import: clear prior line items for these bills
+                        # before inserting. There is NO UNIQUE(bill_id,line_no), so a
+                        # re-exported file (new hash, same bills) would otherwise insert a
+                        # 2nd copy of every line and inflate menu analytics. Delete+insert
+                        # share this transaction (commit below) so a mid-failure rolls both
+                        # back — the bill never ends up with zero items.
+                        bill_ids = list({r["bill_id"] for r in rows})
+                        cur.execute(
+                            "DELETE FROM public.pos_sales_items WHERE bill_id = ANY(%s)",
+                            (bill_ids,))
+                        cols = list(rows[0].keys())
                         cur.executemany(
                             "INSERT INTO public.pos_sales_items ({}) VALUES ({})".format(
                                 ",".join(cols), _values_clause(rows, cols)),
@@ -1435,8 +1445,18 @@ def import_pos_excel_sync(
                         if bid:
                             it["bill_id"] = bid[0]
                     rows = [r for r in rows if "bill_id" in r]
-                    cols = list(rows[0].keys()) if rows else []
                     if rows:
+                        # Idempotent re-import: clear prior line items for these bills
+                        # before inserting. There is NO UNIQUE(bill_id,line_no), so a
+                        # re-exported file (new hash, same bills) would otherwise insert a
+                        # 2nd copy of every line and inflate menu analytics. Delete+insert
+                        # share this transaction (commit below) so a mid-failure rolls both
+                        # back — the bill never ends up with zero items.
+                        bill_ids = list({r["bill_id"] for r in rows})
+                        cur.execute(
+                            "DELETE FROM public.pos_sales_items WHERE bill_id = ANY(%s)",
+                            (bill_ids,))
+                        cols = list(rows[0].keys())
                         cur.executemany(
                             "INSERT INTO public.pos_sales_items ({}) VALUES ({})".format(
                                 ",".join(cols), _values_clause(rows, cols)),
@@ -1502,6 +1522,13 @@ def import_pos_excel_sync(
                 detail={"message": "ไฟล์นี้นำเข้าไปแล้ว ข้ามซ้ำโดยอัตโนมัติ"},
             )
         logger.exception("POS import (sync) failed")
+        # Clear the aborted transaction first, else the error-status UPDATE
+        # itself fails ("current transaction is aborted") and the row stays
+        # stuck at status='parsing' forever (mirrors the dup-key branch above).
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         try:
             with conn.cursor() as cur:
                 cur.execute(

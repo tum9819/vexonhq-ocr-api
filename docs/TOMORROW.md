@@ -1,9 +1,33 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-05-30 (Session 47 — system-auditor round: export/analytics/WHT cash-basis fix)
+**Last updated**: 2026-05-31 (Session 49 — full-system audit: 19 code findings + 2 platform breaches)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
+
+---
+
+## 🔴 Session 49 (2026-05-31) — full-system audit results
+
+**Baseline before audit:** compileall ✅, unit 88 ✅, live smoke 64/64 ✅ (system was running fine; this was a latent-bug hunt). 9-dimension workflow → **19 findings, all verified against live prod DB (0 false-positive)** + completeness critic found 2 platform-layer breaches the code audit missed.
+
+### ✅ FIXED LIVE this session (already applied to prod Supabase — NOT via git push)
+- **GAP 1 — RLS breach (was an ACTIVE unauthenticated financial-data leak).** 57/59 public tables had RLS off → the public anon key (shipped in the frontend bundle) could `GET /rest/v1/pos_bills|bank_statement_entries|vendor_bills|counterparties` directly, bypassing the backend. **Enabled RLS on all 57** (`migrations/2026_05_31_enable_rls_all_public_tables.sql`). Backend uses service_role (BYPASSRLS) → unaffected (smoke 64/64 after). anon REST now returns `[]`. Reversible per-table.
+- **GAP 2 — `uploads` bucket (240 slips/statements/invoices) was world-listable + anon-uploadable.** Dropped the 4 over-permissive storage.objects policies (`migrations/2026_05_31_lock_uploads_bucket_policies.sql`). Enumeration + anon-upload now denied; public-URL download (dashboard) still works.
+
+### ✅ FIXED in code this session (awaiting TUM push)
+URGENT: #7 LINE webhook signature bypass (missing-header short-circuit → anon Claude/OpenAI credit burn + LINE spam) → fail-closed + `hmac.compare_digest`. (Verified prod has `LINE_CHANNEL_SECRET` set, so safe.)
+NEXT: #2 weekly LINE digest joined non-existent `public.categories` (digest never sent) → `expense_categories`/`name_th` (validated live); #3 bank-statement upload froze the loop → `asyncio.to_thread`; #6 recipe AI-link `json.loads` not shape-checked → list-guard; #8 `/ap/due-reminder`+`/stock/alert` removed from PUBLIC_PATHS (were anon, leaked AP data / LINE-spam); #11 4 digest crons swallowed exceptions (false-healthy /cron/health) → re-`raise`; #12 POS sync import aborted-txn no rollback (stuck status='parsing') → rollback first; #14 POS line-item re-import double-counts (no dedup) → delete-by-bill before insert.
+MONITOR (one-liners): #9 5× secret `!=` → `secrets.compare_digest`; #10 global 500 handler stopped echoing `str(exc)` (leaked DB host); #13 marked dead `search_routes.py`; #15 `vps_health_monitor` now `@_heartbeat`; #16 KBank guard synced to verify script; #17/#18/#19 `/pos/calendar`+`/goals`+`/compare` 422 instead of 500 on bad date input.
+
+### 🟡 Follow-ups (decisions / data / out-of-repo)
+1. **#1 ภ.ง.ด.3 / WHT — needs accountant.** 3 generators use different category sets + rates; the `rent` 5% WHT row (8,000 baht in 2026-04) is captured by `/tax/wht-summary` but DROPPED by `/export/pnd3` + `/export/pnd3-annual` (they hard-code 3% on musician_fee/freelance/pnd3 only). Decide the canonical category list + rates, then unify the 3 generators on one shared dict. Not auto-changed (touches filed tax numbers).
+2. **#14 + #12 data cleanup (TUM chose "later").** Code now prevents future dups, but prod still holds **4,311 duplicated (bill_id,line_no) pairs / 1,506 exact-dup rows = 96,290 baht surplus** in `pos_sales_items` (inflates menu analytics only — NOT P&L) + 1 stuck `pos_imports` row (id `02618313-…`, status='parsing'). Cleanup SQL ready; run after the dedup fix deploys. 2,805 divergent-content dup groups need a re-import of the affected bill_detail files (can't auto-resolve).
+3. **GAP 2 full private+signed (deferred).** Make `uploads` truly private + serve via signed URLs — needs storage_path persistence (`_upload_to_storage` currently discards it) + read-time signing in bill/slip detail endpoints + frontend coordination + backfill.
+4. **MONITOR left as-is (correctly low value):** #4 dormant Telegram webhook urllib block, #5 Discord `/vex resources` 100ms psutil block.
+
+### Critic residual platform risks (TUM to accept or schedule)
+26× `security_definer_view` (incl. `v_daybook_pnl` — DON'T flip to invoker while RLS is on, or P&L reads empty), 8× `function_search_path_mutable`, `auth_leaked_password_protection` off. All low priority on a single-tenant service-role DB.
 
 ---
 

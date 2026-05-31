@@ -42,6 +42,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import urllib.error
 import urllib.request
 
@@ -123,7 +124,7 @@ async def uptime_webhook(request: Request, secret: str = Query("")):
     """
     if not ALERTS_WEBHOOK_SECRET:
         raise HTTPException(500, "ALERTS_WEBHOOK_SECRET env var not configured on backend")
-    if secret != ALERTS_WEBHOOK_SECRET:
+    if not secrets.compare_digest(secret, ALERTS_WEBHOOK_SECRET):
         raise HTTPException(401, "Invalid secret query param")
 
     body = await _parse_webhook_body(request)
@@ -185,7 +186,7 @@ def test_telegram(secret: str = Query("")):
     """
     if not ALERTS_WEBHOOK_SECRET:
         raise HTTPException(500, "ALERTS_WEBHOOK_SECRET not configured")
-    if secret != ALERTS_WEBHOOK_SECRET:
+    if not secrets.compare_digest(secret, ALERTS_WEBHOOK_SECRET):
         raise HTTPException(401, "Invalid secret")
 
     try:
