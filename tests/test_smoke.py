@@ -116,6 +116,9 @@ AUTHED_ROUTES = [
     ("GET", "/bank-statement/history"),
     ("GET", "/bank-statement/review"),
 
+    # Loan ledger (เงินยืม) — Phase 1 (GET without auth → 401 = route exists)
+    ("GET", "/loans"),
+
     # Cashflow + Budget
     ("GET", "/cashflow/forecast"),
     ("GET", "/cashflow/summary"),
