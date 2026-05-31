@@ -78,6 +78,17 @@ log = logging.getLogger("slips")
 router = APIRouter(tags=["slips"])
 
 
+def _sign_uploads_url(url):
+    """Proxy to main._sign_uploads_url — the uploads bucket is private (2026-05-31
+    GAP 2) so stored public URLs must be signed at read time. Lazy import avoids the
+    circular-import-at-load problem; returns the URL unchanged if main isn't importable."""
+    try:
+        from main import _sign_uploads_url as _impl  # noqa: PLC0415
+        return _impl(url)
+    except Exception:
+        return url
+
+
 def _current_username(request: Request) -> Optional[str]:
     """Read JWT subject stamped by main.py middleware."""
     return getattr(request.state, "username", None)
@@ -827,7 +838,7 @@ async def slip_upload(file: UploadFile = File(...), request: Request = None):
                 "success":     True,
                 "slip_id":     existing_id,
                 "parsed":      parsed,
-                "preview_url": image_url,
+                "preview_url": _sign_uploads_url(image_url),
                 "duplicate":   True,
                 "message":     "สลิปนี้มีในระบบแล้ว — ไม่ได้บันทึกซ้ำ",
                 "match":       {"status": "duplicate", "existing_slip_id": existing_id},
@@ -938,7 +949,7 @@ async def slip_upload(file: UploadFile = File(...), request: Request = None):
         "success":      True,
         "slip_id":      new_id,
         "parsed":       parsed,
-        "preview_url":  image_url,
+        "preview_url":  _sign_uploads_url(image_url),
         "canonical_sku":        sku,
         "canonical_confidence": conf,
         "statement_category_code": resolved_category,
@@ -1019,6 +1030,8 @@ def list_slips(
                 for k in ("amount", "fee", "canonical_confidence"):
                     if d.get(k) is not None:
                         d[k] = float(d[k])
+                if d.get("raw_image_url"):
+                    d["raw_image_url"] = _sign_uploads_url(d["raw_image_url"])  # uploads bucket private (GAP 2)
                 slips.append(d)
 
             # Total count for pagination
@@ -1099,6 +1112,8 @@ def get_slip(slip_id: str):
     for k in ("amount", "fee", "canonical_confidence"):
         if d.get(k) is not None:
             d[k] = float(d[k])
+    if d.get("raw_image_url"):
+        d["raw_image_url"] = _sign_uploads_url(d["raw_image_url"])  # uploads bucket private (GAP 2)
     return {"success": True, "slip": d}
 
 

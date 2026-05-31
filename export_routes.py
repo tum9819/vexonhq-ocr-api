@@ -496,10 +496,15 @@ def _build_pnd3(month: str) -> openpyxl.Workbook:
         "ประเภทเงินได้", "อัตราภาษี", "ยอดเงิน (฿)", "ภาษีที่หัก (฿)"
     ], row=4)
 
+    # Single source of truth for which categories are ภ.ง.ด.3 + their per-category
+    # WHT rate (audit #1: this generator + yearly + /tax/wht-summary must agree).
+    from tax_routes import WHT_RULES  # noqa: PLC0415
+    wht_cats = list(WHT_RULES.keys())
+
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            # ดึงรายการ musician_fee + freelancer จาก v_daybook
+            # ดึงรายการที่ต้องหัก ณ ที่จ่าย (musician_fee/rent/service_fee) จาก v_daybook_pnl
             cur.execute(
                 """SELECT entry_date,
                           COALESCE(label, counterparty, 'ไม่ระบุชื่อ') AS name,
@@ -509,13 +514,9 @@ def _build_pnd3(month: str) -> openpyxl.Workbook:
                    FROM public.v_daybook_pnl
                    WHERE direction = 'expense'
                      AND entry_date BETWEEN %s AND %s
-                     AND (
-                         category_code IN ('musician_fee', 'freelance', 'pnd3')
-                         OR (amount IN (600, 700, 2100, 2800)
-                             AND category_code = 'musician_fee')
-                     )
+                     AND category_code = ANY(%s)
                    ORDER BY entry_date, amount""",
-                (first, last),
+                (first, last, wht_cats),
             )
             pnd_rows = _rows_to_dicts(cur)
     finally:
@@ -530,7 +531,10 @@ def _build_pnd3(month: str) -> openpyxl.Workbook:
         d = r["entry_date"]
         date_str = d.strftime("%d/%m/%Y") if hasattr(d, "strftime") else str(d)
         amount = float(r["amount"])
-        tax = round(amount * 0.03, 2)
+        rule = WHT_RULES.get(r["category_code"],
+                             {"label": "ค่าบริการ", "section": "มาตรา 40(8)", "wht_pct": 3.0})
+        pct = float(rule["wht_pct"])
+        tax = round(amount * pct / 100, 2)   # per-category rate (rent=5%, others=3%) — not a flat 3%
         total_amount += amount
         total_tax += tax
 
@@ -538,8 +542,8 @@ def _build_pnd3(month: str) -> openpyxl.Workbook:
         _data_cell(ws, row, 2, date_str, align=CENTER, fill=fill)
         _data_cell(ws, row, 3, r["name"], fill=fill)
         _data_cell(ws, row, 4, "", align=CENTER, fill=fill)  # เลขประจำตัว (กรอกเอง)
-        _data_cell(ws, row, 5, "ค่าดนตรี - เงินได้อื่น มาตรา 40(8)", fill=fill)
-        _data_cell(ws, row, 6, "3%", align=CENTER, fill=fill)
+        _data_cell(ws, row, 5, f'{rule["label"]} - {rule["section"]}', fill=fill)
+        _data_cell(ws, row, 6, f"{pct:g}%", align=CENTER, fill=fill)
         _data_cell(ws, row, 7, amount, align=RIGHT, num_format='#,##0.00', fill=fill)
         _data_cell(ws, row, 8, tax, align=RIGHT, num_format='#,##0.00', fill=fill)
         ws.row_dimensions[row].height = 18

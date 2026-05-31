@@ -189,6 +189,12 @@ def search_receipts(
                 params + [limit, offset],
             )
             results = _rows_to_dicts(cur)
+        # uploads bucket is private (2026-05-31 GAP 2) — sign each preview URL so
+        # the authed dashboard can still render the thumbnail.
+        from main import _sign_uploads_url  # noqa: PLC0415
+        for r in results:
+            if r.get("preview_url"):
+                r["preview_url"] = _sign_uploads_url(r["preview_url"])
         return {"results": results, "total": total}
     finally:
         conn.close()
@@ -232,6 +238,13 @@ def get_receipt(receipt_id: str):
                 (str(uid),),
             )
             header["attachments"] = _rows_to_dicts(cur)
+            # uploads bucket is private (2026-05-31 GAP 2) — sign preview + each attachment
+            from main import _sign_uploads_url  # noqa: PLC0415
+            if header.get("preview_url"):
+                header["preview_url"] = _sign_uploads_url(header["preview_url"])
+            for a in header["attachments"]:
+                if a.get("file_url"):
+                    a["file_url"] = _sign_uploads_url(a["file_url"])
 
             cur.execute(
                 """SELECT severity, code, message, field, resolved

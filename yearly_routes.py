@@ -324,6 +324,11 @@ def export_pnd3_annual(
     except ImportError:
         raise HTTPException(500, "openpyxl not installed")
 
+    # Single source of truth for ภ.ง.ด.3 categories + per-category WHT rate
+    # (audit #1: this annual generator must agree with /export/pnd3 + /tax/wht-summary).
+    from tax_routes import WHT_RULES  # noqa: PLC0415
+    wht_cats = list(WHT_RULES.keys())
+
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -334,12 +339,12 @@ def export_pnd3_annual(
                        COALESCE(label, counterparty, 'ไม่ระบุชื่อ') AS name,
                        amount,
                        category_code
-                   FROM public.v_daybook
+                   FROM public.v_daybook_pnl
                    WHERE direction = 'expense'
                      AND EXTRACT(YEAR FROM entry_date) = %s
-                     AND category_code IN ('musician_fee', 'freelance', 'pnd3')
+                     AND category_code = ANY(%s)
                    ORDER BY entry_date, amount""",
-                (year,),
+                (year, wht_cats),
             )
             rows = _rows_to_dicts(cur)
     finally:
@@ -382,7 +387,10 @@ def export_pnd3_annual(
         d = r["entry_date"]
         date_str = d if isinstance(d, str) else str(d)
         amount = float(r["amount"])
-        tax = round(amount * 0.03, 2)
+        rule = WHT_RULES.get(r["category_code"],
+                             {"label": "ค่าบริการ", "section": "มาตรา 40(8)", "wht_pct": 3.0})
+        pct = float(rule["wht_pct"])
+        tax = round(amount * pct / 100, 2)   # per-category rate (rent=5%, others=3%)
         grand_amt += amount
         grand_tax += tax
 
@@ -398,7 +406,7 @@ def export_pnd3_annual(
         _c(3, date_str, CENTER)
         _c(4, r["name"])
         _c(5, "", CENTER)          # เลขผู้เสียภาษี — กรอกเอง
-        _c(6, "ค่าดนตรี - เงินได้อื่น มาตรา 40(8)")
+        _c(6, f'{rule["label"]} - {rule["section"]}')
         _c(7, amount, RIGHT, FONT_B, '#,##0.00')
         _c(8, tax,    RIGHT, FONT_B, '#,##0.00')
         ws.row_dimensions[row_n].height = 18

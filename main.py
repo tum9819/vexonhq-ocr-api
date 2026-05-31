@@ -779,7 +779,7 @@ def _process_single_image(
         "merged": merged,
         "parsed": parsed,
         "warnings": final_warnings,
-        "preview_url": file_url,
+        "preview_url": _sign_uploads_url(file_url),
     }
 
 
@@ -2053,6 +2053,32 @@ def _upload_to_storage(image_bytes: bytes, file_name: str, mime_type: Optional[s
     )
     public_url = sb.storage.from_(bucket).get_public_url(storage_path)
     return public_url, storage_path
+
+
+def _sign_uploads_url(url: Optional[str], expires_in: int = 86400) -> Optional[str]:
+    """Turn a stored public 'uploads' URL into a fresh signed URL.
+
+    Security hardening 2026-05-31 (GAP 2): the `uploads` bucket (OCR'd
+    statements/slips/invoices) is private, so the old
+    `.../object/public/uploads/<path>` URLs no longer resolve. Read endpoints
+    wrap stored URLs through this so the authed dashboard still renders the
+    image (the signature in the URL authorizes the GET — `<img>` tags can't
+    send a JWT header). Safe to wrap any value: None / non-uploads URLs pass
+    through unchanged, and signing failure falls back to the original URL.
+    """
+    if not url or "/object/public/" not in url:
+        return url
+    try:
+        after = url.split("/object/public/", 1)[1]   # "<bucket>/<path>"
+        bucket, _, path = after.partition("/")
+        if bucket != SUPABASE_STORAGE_BUCKET or not path:
+            return url
+        sb = get_supabase()
+        res = sb.storage.from_(bucket).create_signed_url(path, expires_in)
+        return (res.get("signedURL") or res.get("signedUrl") or url) if isinstance(res, dict) else url
+    except Exception:
+        log.warning("sign uploads url failed", exc_info=True)
+        return url
 
 
 # ============================================================

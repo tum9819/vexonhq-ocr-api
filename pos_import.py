@@ -1250,7 +1250,7 @@ def _process_import_background(
                 conn2 = get_db_conn()
                 with conn2.cursor() as cur2:
                     cur2.execute(
-                        "UPDATE public.pos_imports SET status='error', "
+                        "UPDATE public.pos_imports SET status='failed', "
                         "error_message=%s WHERE id=%s",
                         (err_str[:2000], import_id))
                     conn2.commit()
@@ -1532,7 +1532,7 @@ def import_pos_excel_sync(
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE public.pos_imports SET status='error', "
+                    "UPDATE public.pos_imports SET status='failed', "
                     "error_message=%s WHERE id=%s",
                     (str(e)[:2000], import_id))
                 conn.commit()
