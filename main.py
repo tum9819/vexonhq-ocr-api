@@ -69,6 +69,7 @@ from menu_public_routes import router as menu_public_router
 from tax_routes import router as tax_router
 from rules_routes import router as rules_router
 from slip_routes import router as slip_router
+from loan_routes import router as loan_router
 from store_context_routes import router as store_context_router
 from auth_routes import router as auth_router, verify_token
 from alerts_webhook_routes import router as alerts_router
@@ -288,6 +289,7 @@ app.include_router(do_snapshot_router)
 app.include_router(ai_exec_router)
 app.include_router(rules_router)
 app.include_router(slip_router)
+app.include_router(loan_router)
 app.include_router(store_context_router)
 # ============================================================
 # JWT Auth Middleware — protects all routes except public ones
