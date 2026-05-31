@@ -473,6 +473,46 @@ def get_review_items(
         conn.close()
 
 
+@router.get("/search")
+def search_entries(
+    q: str = Query(""),
+    limit: int = Query(50),
+):
+    """ค้นหารายการ statement ทุก match_status (เพื่อแก้หมวดแถวที่จัดอัตโนมัติไปแล้ว).
+
+    Match on description (ILIKE). Returns the current category_code/source_type/notes
+    so the UI can show how each row is tagged now. Empty/short query → no results
+    (avoid dumping the whole table).
+    """
+    term = (q or "").strip()
+    if len(term) < 2:
+        return {"items": []}
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, txn_date, description, debit, credit, balance,
+                       direction, amount, match_status, category_code, source_type, notes
+                FROM public.bank_statement_entries
+                WHERE description ILIKE %s
+                ORDER BY txn_date DESC
+                LIMIT %s
+            """, (f"%{term}%", limit))
+            cols = ["id", "txn_date", "description", "debit", "credit", "balance",
+                    "direction", "amount", "match_status", "category_code",
+                    "source_type", "notes"]
+            rows = []
+            for r in cur.fetchall():
+                row = dict(zip(cols, r))
+                row["txn_date"] = str(row["txn_date"])
+                for f in ["debit", "credit", "balance", "amount"]:
+                    row[f] = float(row[f] or 0)
+                rows.append(row)
+        return {"items": rows}
+    finally:
+        conn.close()
+
+
 @router.post("/classify/{entry_id}")
 def classify_entry(entry_id: str, body: ClassifyRequest):
     """TUM จัดหมวดรายการที่ needs_review ด้วยมือ"""
