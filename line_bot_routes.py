@@ -824,7 +824,8 @@ def _build_weekly_summary() -> str:
               AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
                             'bank_statement', 'vendor_payment',
                             'grab_payout', 'lineman_payout',
-                            'pos_cash_deposit', 'cash_withdrawal')
+                            'pos_cash_deposit', 'cash_withdrawal',
+                            'loan_in', 'loan_repayment')
         """, (week_start.isoformat(), week_end.isoformat()))
         row = cur.fetchone()
         income  = float(row[0])
@@ -843,7 +844,8 @@ def _build_weekly_summary() -> str:
               AND d.source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
                             'bank_statement', 'vendor_payment',
                             'grab_payout', 'lineman_payout',
-                            'pos_cash_deposit', 'cash_withdrawal')
+                            'pos_cash_deposit', 'cash_withdrawal',
+                            'loan_in', 'loan_repayment')
             GROUP BY COALESCE(cat.name_th, d.category_code, 'อื่นๆ')
             ORDER BY total DESC
             LIMIT 3

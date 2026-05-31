@@ -54,7 +54,8 @@ _EXCLUDED_SOURCES_SQL = (
     "'owner_capital', 'owner_advance', 'transfer_error', "
     "'bank_statement', 'vendor_payment', "
     "'grab_payout', 'lineman_payout', "
-    "'pos_cash_deposit', 'cash_withdrawal'"
+    "'pos_cash_deposit', 'cash_withdrawal', "
+    "'loan_in', 'loan_repayment'"
     ")"
 )
 

@@ -66,7 +66,8 @@ def cashflow_forecast(days: int = Query(30, ge=7, le=90, description="Forecast w
               AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
                             'bank_statement', 'vendor_payment',
                             'grab_payout', 'lineman_payout',
-                            'pos_cash_deposit', 'cash_withdrawal')
+                            'pos_cash_deposit', 'cash_withdrawal',
+                            'loan_in', 'loan_repayment')
         """, (lookback_start.isoformat(), (today - timedelta(days=1)).isoformat()))
         row = cur.fetchone()
         total_inc = float(row[0] or 0)
@@ -86,7 +87,8 @@ def cashflow_forecast(days: int = Query(30, ge=7, le=90, description="Forecast w
               AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
                             'bank_statement', 'vendor_payment',
                             'grab_payout', 'lineman_payout',
-                            'pos_cash_deposit', 'cash_withdrawal')
+                            'pos_cash_deposit', 'cash_withdrawal',
+                            'loan_in', 'loan_repayment')
             GROUP BY entry_date
             ORDER BY entry_date
         """, (lookback_start.isoformat(), (today - timedelta(days=1)).isoformat()))
@@ -197,7 +199,8 @@ def cashflow_summary():
               AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
                             'bank_statement', 'vendor_payment',
                             'grab_payout', 'lineman_payout',
-                            'pos_cash_deposit', 'cash_withdrawal')
+                            'pos_cash_deposit', 'cash_withdrawal',
+                            'loan_in', 'loan_repayment')
         """, (month_start.isoformat(), today.isoformat()))
         row = cur.fetchone()
         mtd_income  = float(row[0] or 0)
