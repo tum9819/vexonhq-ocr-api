@@ -89,6 +89,14 @@ so TUM can set a row to `loan_in` / `loan_repayment` by hand on the bank-stateme
 required for the trigger slip (`33000-15000` has no "ยืม" keyword). Going forward, writing memos
 that include "เงินยืม" / "คืนยืม" makes auto-tagging work.
 
+**Lender capture (drives the per-lender ledger):** because there is no name column (§3.5), the
+reclassify endpoint is extended so that when `source_type` is a loan type, the request also carries
+a `lender` string written to `bank_statement_entries.notes` (e.g. `"นุศรา"`), AND it sets
+`match_status='manual'` so the row leaves `needs_review` and appears in `v_daybook`. The auto path
+sets the loan `source_type` from the memo but leaves `notes` for TUM to fill on the dashboard (or a
+later iteration can derive it from the matched slip's name) — until `notes` is set, the row groups
+under "ไม่ระบุผู้ให้ยืม".
+
 **Direction guard (the trap):** rules are bound to income vs expense separately, so นุศรา's
 *outgoing* shop-expense transfers (e.g. memo "ค่าเนื้อ") are NOT mistagged as loans — only a
 transfer whose memo literally says "คืนยืม" becomes `loan_repayment`. This matches the existing
@@ -96,33 +104,54 @@ memo-driven policy (AGENTS #19, memory `project_slip_classification`).
 
 ### 3.3 Balance view + endpoint (API contract for the dashboard)
 
-`public.v_loan_balance` — aggregate per lender (grouped by `counterparty`):
+**Revised after live-DB verification (see §3.5):** `v_daybook` hard-codes `counterparty = NULL`
+for every bank row, and `bank_statement_entries` has NO structured name column — the lender name
+lives only in free-text `description`. So the ledger groups by the **`notes` column** (the chosen
+lender label, set at tag time) and reads `bank_statement_entries` **directly** (not `v_daybook`).
+
+`public.v_loan_balance` — aggregate per lender (grouped by `notes`):
 
 ```sql
 CREATE OR REPLACE VIEW public.v_loan_balance AS
 SELECT
-  counterparty AS lender,
-  COALESCE(SUM(amount) FILTER (WHERE source = 'loan_in'), 0)        AS borrowed,
-  COALESCE(SUM(amount) FILTER (WHERE source = 'loan_repayment'), 0) AS repaid,
-  COALESCE(SUM(amount) FILTER (WHERE source = 'loan_in'), 0)
-    - COALESCE(SUM(amount) FILTER (WHERE source = 'loan_repayment'), 0) AS outstanding,
-  MAX(entry_date) AS last_activity,
-  COUNT(*)        AS txn_count
-FROM public.v_daybook
-WHERE source IN ('loan_in', 'loan_repayment')
-GROUP BY counterparty;
+  COALESCE(NULLIF(btrim(notes), ''), 'ไม่ระบุผู้ให้ยืม')                  AS lender,
+  COALESCE(SUM(amount) FILTER (WHERE source_type = 'loan_in'), 0)        AS borrowed,
+  COALESCE(SUM(amount) FILTER (WHERE source_type = 'loan_repayment'), 0) AS repaid,
+  COALESCE(SUM(amount) FILTER (WHERE source_type = 'loan_in'), 0)
+    - COALESCE(SUM(amount) FILTER (WHERE source_type = 'loan_repayment'), 0) AS outstanding,
+  MAX(txn_date) AS last_activity,
+  COUNT(*)      AS txn_count
+FROM public.bank_statement_entries
+WHERE source_type IN ('loan_in', 'loan_repayment')
+GROUP BY 1;
 ```
 
-Light name normalization in the view (trim + strip คำนำหน้า like "น.ส./นาย/นาง") so the same
-lender does not split into two rows ("นุศรา" vs "น.ส. นุศรา ป"). Exact expression verified at
-implementation time against live data.
+(Verified columns exist on `bank_statement_entries`: `notes`, `amount`, `source_type`, `txn_date`.)
 
 New `loan_routes.py` (registered in `main.py`; behind JWT, NOT in `PUBLIC_PATHS`):
-- `GET /loans` → `[{lender, borrowed, repaid, outstanding, last_activity, txn_count}]`
-- `GET /loans/{lender}` → per-lender entry list (each loan_in / loan_repayment row: date, amount,
-  memo, source) for the dashboard drill-in.
+- `GET /loans` → `[{lender, borrowed, repaid, outstanding, last_activity, txn_count}]` from `v_loan_balance`
+- `GET /loans/{lender}` → per-lender entry list (each loan row: `txn_date`, `amount`, `direction`,
+  `source_type`, `description`) from `bank_statement_entries WHERE notes = %s AND source_type IN (...)`.
 
-Expected for the trigger case: `borrowed=33000, repaid=15000, outstanding=18000`.
+Expected once the trigger data is tagged: `lender='นุศรา', borrowed=33000, repaid=15000, outstanding=18000`.
+
+### 3.5 Live-DB verification results (2026-05-31, project `mara-ai-prod`)
+
+- ✅ **No CHECK constraint on `bank_statement_entries.source_type`** — `loan_in` / `loan_repayment`
+  can be written freely (only `match_status` has a CHECK: `auto|manual|needs_review`).
+- ⚠️ **`v_daybook` bank branch** = `SELECT ... bse.source_type AS source, ..., NULL::text AS counterparty
+  ... WHERE bse.match_status <> 'needs_review' AND source_type NOT IN ('rider_income_*')`. Two consequences:
+  (a) counterparty is always NULL for bank rows → cannot group the ledger by it (drove the §3.3 rewrite);
+  (b) a row with `match_status='needs_review'` is **excluded from `v_daybook` entirely** → when tagging
+  a loan row via reclassify, also set `match_status='manual'` so it surfaces in the daybook and is
+  caught by the P&L exclusion.
+- ⚠️ **Trigger slip (33,000, 30 พ.ค.) is NOT imported yet** — latest bank data is 30 เม.ย. Existing
+  นุศรา money-in rows currently sit as `source_type='bank_statement'`, `category_code='other_income'`
+  → already excluded from P&L (safe). Tests use a fixture, not this row.
+- ⚠️ **Repayment (ร้าน→นุศรา) is textually identical to reimbursement** — both read
+  `K PLUS โอนไป BAY X0648 น.ส. นุศรา`. Only the slip memo distinguishes `loan_repayment` from a real
+  `other_expense` (ค่าเนื้อ ฯลฯ). TUM owns that judgment per row; auto-tag only fires on an explicit
+  "คืนยืม" memo keyword.
 
 ### 3.4 Edge cases
 
@@ -137,16 +166,20 @@ Expected for the trigger case: `borrowed=33000, repaid=15000, outstanding=18000`
 ## 4. Testing & rollout
 
 1. `ast.parse` every touched `.py`.
-2. **A/B P&L proof** — for a month containing loan rows, income / expense / profit totals are
-   **identical before vs after** (proves loan rows do not leak into P&L); cross-check `/pnl/monthly`.
+2. **A/B P&L proof of the exclusion mechanism** — insert a TEMP `loan_in` and `loan_repayment`
+   row (match_status='manual') in a test month, confirm `/pnl/monthly` income / expense / profit are
+   **unchanged by them** (they are excluded), then delete the temp rows.
+   ⚠️ Note: separately *re-tagging an existing `other_expense` repayment → `loan_repayment`* WILL
+   reduce that month's expense (it correctly leaves the P&L) — that is an intended correction, not a
+   regression. The A/B proof is about the mechanism, not historical immutability.
 3. `rg "FROM public\.v_daybook\b"` leaves no P&L path missing the loan exclusion.
-4. `pytest` for `/loans` (นุศรา fixture → outstanding = 18,000).
+4. `pytest` for `/loans` (fixture: a `loan_in` 33,000 + `loan_repayment` 15,000 with `notes='นุศรา'`
+   → `outstanding = 18,000`).
 5. `.\verify.ps1` (and `-Smoke` after deploy once VPS CPU < 30%, per memory `smoke_after_deploy_wait`).
 
-**Pre-implementation DB verifications (do these FIRST — AGENTS #34 class):**
-- `SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='public.bank_statement_entries'::regclass AND contype='c'` — confirm NO CHECK constraint on `source_type` would reject `loan_in` / `loan_repayment` (if one exists, extend it in a migration, else the reclassify UPDATE 500s like the `pos_imports.status='error'` bug).
-- `pg_get_viewdef('public.v_daybook')` — confirm the bank-statement branch surfaces `source_type` as `v_daybook.source` (so the new values actually appear in the daybook + are caught by the exclusion). The live view may DRIFT from the repo migration (AGENTS #17) — read the live definition, do not trust the repo file.
-- Confirm `counterparty` is populated for bank rows (the group-by key in `v_loan_balance`); if some bank rows carry the name elsewhere, adjust the view's lender expression.
+**Pre-implementation DB verifications — DONE 2026-05-31, results recorded in §3.5.** (No CHECK on
+`source_type`; v_daybook counterparty is NULL for bank rows; needs_review rows are dropped from
+v_daybook. These drove the §3.2 `match_status='manual'` rule and the §3.3 view rewrite.)
 
 **Migrations (idempotent; commit to repo before applying):**
 - `2026_05_31_loan_sources_pnl_exclude.sql` — extend `v_daybook_pnl` exclusion + seed
@@ -154,8 +187,10 @@ Expected for the trigger case: `borrowed=33000, repaid=15000, outstanding=18000`
 - `2026_05_31_v_loan_balance.sql` — the balance view.
 
 **Code:** splice `loan_in` / `loan_repayment` into the inline exclusion lists in `pnl_routes.py`
-and `cashflow_routes.py`; add the loan mapping to slip-reconcile; new `loan_routes.py` + register
-in `main.py`.
+and `cashflow_routes.py`; extend the reclassify PUT (`phase12_bank_statement_routes.py`) to accept
+an optional `lender` (→ `notes`) and to set `match_status='manual'` when `source_type` is a loan
+type; add the loan keyword rules + slip-reconcile mapping; new `loan_routes.py` + register in
+`main.py`.
 
 **Workflow (AGENTS 6-step):** Backup tag `origin/main` → edit → test หลายรอบ → confirm → hand TUM a
 single PowerShell paste block (no `Co-Authored-By:` trailer) → **TUM pushes** (Claude never pushes).
