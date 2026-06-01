@@ -662,16 +662,24 @@ def export_summary(month: str = Query(..., description="YYYY-MM")):
             r = cur.fetchone()
             daybook_rows, total_income, total_expense = int(r[0]), float(r[1]), float(r[2])
 
-            # pnd3 stats (musician_fee + freelance)
+            # pnd3 stats — use the SAME per-category WHT_RULES as the other 4 generators.
+            # (audit AUD-TAX-01: this preview used flat 3% + a phantom-category/amount
+            # heuristic AGENTS #19 had removed, so it under-reported rent's 5% WHT and
+            # disagreed with the actual pnd3 export.)
+            from tax_routes import WHT_RULES  # local import avoids any router import-order issue
+            _wht_keys = list(WHT_RULES.keys())
+            _wht_case = " ".join("WHEN category_code = %s THEN amount * %s" for _ in _wht_keys)
+            _wht_params: list = []
+            for _k in _wht_keys:
+                _wht_params.extend([_k, WHT_RULES[_k]["wht_pct"] / 100.0])
             cur.execute(
-                """SELECT COUNT(*) AS cnt,
-                          COALESCE(SUM(amount * 0.03), 0) AS total_wht
+                f"""SELECT COUNT(*) AS cnt,
+                          COALESCE(SUM(CASE {_wht_case} ELSE 0 END), 0) AS total_wht
                    FROM public.v_daybook_pnl
                    WHERE direction = 'expense'
                      AND entry_date BETWEEN %s AND %s
-                     AND (category_code IN ('musician_fee', 'freelance', 'pnd3')
-                          OR (amount IN (600, 700, 2100, 2800) AND category_code = 'musician_fee'))""",
-                (first, last),
+                     AND category_code = ANY(%s)""",
+                tuple(_wht_params) + (first, last, _wht_keys),
             )
             r2 = cur.fetchone()
             pnd3_rows, total_wht = int(r2[0]), float(r2[1])

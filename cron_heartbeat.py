@@ -45,6 +45,11 @@ router = APIRouter(prefix="/cron", tags=["cron"])
 
 F = TypeVar("F", bound=Callable[..., object])
 
+# Every @heartbeat-decorated job_id registers here at import time, so /cron/health
+# can flag a job that has NEVER written a heartbeat row (dead-on-arrival) — which a
+# table-only read would miss entirely (audit CEO-REL-01).
+_REGISTERED_JOBS: set[str] = set()
+
 
 def _get_conn():
     """Open a Postgres connection. Mirrors main.get_db_conn but falls
@@ -125,6 +130,7 @@ def heartbeat(job_id: str, expected_interval_hours: int = 24) -> Callable[[F], F
     expected_interval_hours: how often this job runs (24=daily, 168=weekly).
     /cron/health flags a job stale when last_run > 2× this value.
     """
+    _REGISTERED_JOBS.add(job_id)  # track expected jobs for missing-job detection (CEO-REL-01)
     def deco(fn: F) -> F:
         @functools.wraps(fn)
         def wrapped(*args, **kwargs):
@@ -215,8 +221,22 @@ def cron_health():
             "stale": is_stale,
         })
 
+    # Jobs DECORATED with @heartbeat but never having written a row are invisible to
+    # the table read above — surface them so a dead-on-arrival job can't hide
+    # (audit CEO-REL-01). Kept at HTTP 200 (status "degraded") when that is the ONLY
+    # issue, so a freshly-deployed job awaiting its first scheduled run doesn't trip a
+    # false Uptime Robot DOWN; stale jobs still return 503.
+    present_ids = {j["job_id"] for j in jobs}
+    missing_jobs = sorted(_REGISTERED_JOBS - present_ids)
+    if any_stale:
+        status = "stale"
+    elif missing_jobs:
+        status = "degraded"
+    else:
+        status = "healthy"
     body = {
-        "status": "stale" if any_stale else "healthy",
+        "status": status,
         "jobs": jobs,
+        "missing_jobs": missing_jobs,
     }
     return JSONResponse(status_code=503 if any_stale else 200, content=body)

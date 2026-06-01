@@ -527,10 +527,13 @@ def classify_entry(entry_id: str, body: ClassifyRequest, _admin: dict = Depends(
                 SET category_code = %s,
                     source_type   = %s,
                     match_status  = 'manual',
-                    notes         = COALESCE(%s, notes)
+                    notes         = COALESCE(%s, notes),
+                    classified_by = %s,
+                    classified_at = now()
                 WHERE id = %s
                 RETURNING id, description, amount, direction
-            """, (body.category_code, body.source_type, body.lender, entry_id))
+            """, (body.category_code, body.source_type, body.lender,
+                  (_admin or {}).get("sub"), entry_id))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(404, "ไม่พบรายการนี้")
