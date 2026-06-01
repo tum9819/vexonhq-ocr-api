@@ -1,0 +1,14 @@
+-- Security: pos_sales_items_dedup_bak_20260531 (the Session-49b dedup backup of
+-- pos_sales_items) was created without RLS — the lone public table that slipped the
+-- Session-49 hardening baseline (every public table RLS-on, no policy; backend uses
+-- service_role/psycopg2 DATABASE_URL = BYPASSRLS). Its sibling backup
+-- bank_statement_entries_bak_20260530 already has RLS on; this matches it.
+--
+-- It holds a copy of POS line-item data (same sensitivity as pos_sales_items, which IS
+-- protected), so leaving it anon-readable re-opens the exact gap Session-49 closed.
+-- Enabling RLS with NO policy denies anon/PostgREST while leaving the psycopg2 backend
+-- 100% functional. The table has no readers besides ad-hoc backup inspection.
+--
+-- Reversible:  ALTER TABLE public.pos_sales_items_dedup_bak_20260531 DISABLE ROW LEVEL SECURITY;
+-- (Or DROP TABLE it once the dedup is confirmed long-stable — TUM's call.)
+ALTER TABLE public.pos_sales_items_dedup_bak_20260531 ENABLE ROW LEVEL SECURITY;
