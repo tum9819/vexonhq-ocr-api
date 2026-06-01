@@ -374,6 +374,65 @@ async def upload_statement(
     return await asyncio.to_thread(_process_statement_upload, pdf_bytes, branch_code)
 
 
+def _read_pdf_summary_totals(pdf_bytes: bytes) -> dict:
+    """Read the KBank statement's own รวมฝาก/รวมถอน summary line — its built-in
+    checksum. Returns {"dep_n","dep_sum","wd_n","wd_sum"} (None where not found).
+    Mirrors scripts/verify_statement_parse.pdf_checksum — keep in sync (AGENTS #18)."""
+    num = re.compile(r"(\d+)\s+รายการ\s+([\d,]+\.\d{2})")
+    out = {"dep_n": None, "dep_sum": None, "wd_n": None, "wd_sum": None}
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            for ln in (page.extract_text() or "").split("\n"):
+                if "รวมฝาก" in ln:
+                    g = num.search(ln)
+                    if g:
+                        out["dep_n"], out["dep_sum"] = int(g.group(1)), float(g.group(2).replace(",", ""))
+                elif "รวมถอน" in ln:
+                    g = num.search(ln)
+                    if g:
+                        out["wd_n"], out["wd_sum"] = int(g.group(1)), float(g.group(2).replace(",", ""))
+    return out
+
+
+def _statement_checksum(pdf_bytes: bytes, raw_rows: list) -> dict:
+    """Compare parsed deposit/withdrawal totals against the statement's own
+    รวมฝาก/รวมถอน checksum (audit AUD-DATA-01). Best-effort: if the summary line
+    isn't found OR the read fails, returns available=False (can't verify) rather
+    than blocking the import. Never raises."""
+    try:
+        chk = _read_pdf_summary_totals(pdf_bytes)
+    except Exception:
+        logger.exception("checksum: failed to read statement summary line")
+        return {"ok": None, "available": False}
+
+    dep_n = sum(1 for r in raw_rows if (r.get("credit") or 0) > 0)
+    dep_sum = round(sum((r.get("credit") or 0) for r in raw_rows), 2)
+    wd_n = sum(1 for r in raw_rows if (r.get("debit") or 0) > 0)
+    wd_sum = round(sum((r.get("debit") or 0) for r in raw_rows), 2)
+
+    has_dep = chk["dep_sum"] is not None
+    has_wd = chk["wd_sum"] is not None
+    if not has_dep and not has_wd:
+        return {"ok": None, "available": False}
+
+    dep_ok = (not has_dep) or (dep_n == chk["dep_n"] and abs(dep_sum - chk["dep_sum"]) < 0.01)
+    wd_ok = (not has_wd) or (wd_n == chk["wd_n"] and abs(wd_sum - chk["wd_sum"]) < 0.01)
+    return {
+        "ok": bool(dep_ok and wd_ok),
+        "available": True,
+        "deposits": {
+            "parsed_count": dep_n, "parsed_sum": dep_sum,
+            "statement_count": chk["dep_n"], "statement_sum": chk["dep_sum"],
+            "drift_sum": round(dep_sum - chk["dep_sum"], 2) if has_dep else None,
+        },
+        "withdrawals": {
+            "parsed_count": wd_n, "parsed_sum": wd_sum,
+            "statement_count": chk["wd_n"], "statement_sum": chk["wd_sum"],
+            "drift_sum": round(wd_sum - chk["wd_sum"], 2) if has_wd else None,
+        },
+    }
+
+
 def _process_statement_upload(pdf_bytes: bytes, branch_code: str) -> dict:
     """Sync worker: parse PDF, classify rows, insert. Runs in a thread (off loop)."""
     # Parse PDF
@@ -416,8 +475,36 @@ def _process_statement_upload(pdf_bytes: bytes, branch_code: str) -> dict:
                     branch_code,
                 ))
         conn.commit()
-        logger.info("Bank statement batch %s: %d rows (%d auto, %d review)",
-                    batch_id, len(classified), auto_count, review_count)
+
+        # AUD-DATA-01: verify the parse against the statement's own รวมฝาก/รวมถอน
+        # checksum and surface a LOUD warning instead of a silent success when the
+        # numbers don't line up (the Nov-Apr/May ~10-31k silent-drift class). Import
+        # still happens (don't lose data); the response flags the drift + sets
+        # checksum_ok so the frontend can show a red banner.
+        chk = _statement_checksum(pdf_bytes, raw_rows)
+        base_msg = (
+            f"นำเข้าสำเร็จ {len(classified)} รายการ "
+            f"(จัดหมวดอัตโนมัติ {auto_count} รายการ, รอจัดหมวด {review_count} รายการ)"
+        )
+        if chk.get("available") and chk.get("ok") is False:
+            d = chk.get("deposits") or {}
+            w = chk.get("withdrawals") or {}
+            message = (
+                base_msg
+                + " *** เตือน: ยอดที่อ่านได้ไม่ตรงกับใบ statement"
+                + f" — รวมฝากต่าง {(d.get('drift_sum') or 0):+,.2f} บาท"
+                + f", รวมถอนต่าง {(w.get('drift_sum') or 0):+,.2f} บาท."
+                + " กรุณาตรวจไฟล์/รูปแบบก่อนใช้ตัวเลขนี้"
+            )
+        elif chk.get("available") and chk.get("ok"):
+            message = base_msg + " ยอดรวมฝาก/รวมถอนตรงกับใบ statement (ตรวจ checksum แล้ว)"
+        elif not chk.get("available"):
+            message = base_msg + " (หมายเหตุ: ไม่พบบรรทัดสรุปรวมฝาก/รวมถอนในไฟล์ ตรวจ checksum อัตโนมัติไม่ได้)"
+        else:
+            message = base_msg
+
+        logger.info("Bank statement batch %s: %d rows (%d auto, %d review) checksum_ok=%s",
+                    batch_id, len(classified), auto_count, review_count, chk.get("ok"))
 
         return {
             "success": True,
@@ -425,11 +512,9 @@ def _process_statement_upload(pdf_bytes: bytes, branch_code: str) -> dict:
             "total_rows": len(classified),
             "auto_classified": auto_count,
             "needs_review": review_count,
-            "message": (
-                f"นำเข้าสำเร็จ {len(classified)} รายการ "
-                f"(จัดหมวดอัตโนมัติ {auto_count} รายการ, "
-                f"รอจัดหมวด {review_count} รายการ)"
-            ),
+            "checksum_ok": chk.get("ok"),
+            "checksum": chk,
+            "message": message,
         }
     except Exception as e:
         conn.rollback()
