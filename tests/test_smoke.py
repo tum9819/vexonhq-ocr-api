@@ -109,6 +109,9 @@ AUTHED_ROUTES = [
     # Recipes + Ingredients (Phase 31)
     ("GET", "/recipes"),
     ("GET", "/ingredients"),
+    # Selling Price Calculator (RestoSheet gap #15) — channel config + per-recipe forward calc
+    ("GET", "/recipes/pricing/channels"),
+    ("GET", "/recipes/00000000-0000-0000-0000-000000000000/pricing"),
 
     # AR/AP + Bills + Bank statement
     ("GET", "/ar-ap/list"),
