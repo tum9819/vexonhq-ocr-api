@@ -26,8 +26,10 @@ from typing import Any, Optional
 from uuid import UUID
 
 import psycopg2
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
+
+from auth_routes import _require_admin_role  # admin-only gate for money-mutation endpoints (audit AUD-TAX-02)
 
 try:
     from main import get_db_conn  # type: ignore
@@ -176,7 +178,7 @@ def list_bills_payment(
 # ─────────────────────────────────────────────────────────
 
 @router.patch("/bills/payment/{bill_id}")
-def update_bill_payment(bill_id: str, body: BillPaymentPatch):
+def update_bill_payment(bill_id: str, body: BillPaymentPatch, _admin: dict = Depends(_require_admin_role)):
     """Update payment_status (and optionally paid_date) for a confirmed bill."""
     if body.payment_status not in VALID_STATUSES:
         raise HTTPException(400, f"payment_status must be one of {sorted(VALID_STATUSES)}")
@@ -370,7 +372,7 @@ def _call_gpt_vision_for_slip(image_bytes: bytes, mime: str) -> dict:
 
 
 @router.post("/bills/payment/slip-match")
-async def slip_match(file: UploadFile = File(...)):
+async def slip_match(file: UploadFile = File(...), _admin: dict = Depends(_require_admin_role)):
     """
     Phase 32 — อัพโหลดสลิปโอนเงิน → GPT Vision อ่านยอด →
     จับคู่กับ vendor_bills ที่ค้างชำระยอดใกล้เคียง

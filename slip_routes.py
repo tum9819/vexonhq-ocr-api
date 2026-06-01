@@ -46,8 +46,10 @@ import uuid
 from datetime import date, datetime
 from typing import Any, Optional
 
-from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel
+
+from auth_routes import _require_admin_role  # admin-only gate for money-mutation endpoints (audit AUD-TAX-02)
 
 from llm import get_openai, openai_chat  # OpenAI factory + logged chat wrapper
 
@@ -768,7 +770,7 @@ def reconcile_slips_to_statements(actor: Optional[str] = "nightly_job") -> dict:
 
 
 @router.post("/slip/reconcile")
-def manual_reconcile(request: Request = None):
+def manual_reconcile(request: Request = None, _admin: dict = Depends(_require_admin_role)):
     """'Reconcile now' button — runs the same job the 02:00 BKK scheduler runs."""
     actor = _current_username(request) if request else None
     return reconcile_slips_to_statements(actor=actor or "manual")
@@ -1154,7 +1156,7 @@ def get_slip(slip_id: str):
 # ════════════════════════════════════════════════════════════════════════════
 
 @router.patch("/slip/{slip_id}")
-def patch_slip(slip_id: str, body: SlipUpdate, request: Request):
+def patch_slip(slip_id: str, body: SlipUpdate, request: Request, _admin: dict = Depends(_require_admin_role)):
     _validate_uuid_param("slip_id", slip_id)
     actor = _current_username(request)
     updates: list[tuple[str, Any]] = []
@@ -1251,7 +1253,7 @@ def patch_slip(slip_id: str, body: SlipUpdate, request: Request):
 # ════════════════════════════════════════════════════════════════════════════
 
 @router.delete("/slip/{slip_id}")
-def delete_slip(slip_id: str, request: Request):
+def delete_slip(slip_id: str, request: Request, _admin: dict = Depends(_require_admin_role)):
     _validate_uuid_param("slip_id", slip_id)
     actor = _current_username(request)
     conn = get_db_conn()
@@ -1281,6 +1283,7 @@ def slips_rematch_all(
     request: Request,
     status: Optional[str] = Query(None, description="unmatched / matched_stmt / matched_full / needs_review / rejected — limit to one status"),
     month:  Optional[str] = Query(None, description="YYYY-MM filter on transfer_date"),
+    _admin: dict = Depends(_require_admin_role),
 ):
     """
     Bulk re-run the 3-way matcher + category cascade against every slip
@@ -1376,7 +1379,7 @@ def slips_rematch_all(
 
 
 @router.post("/slip/{slip_id}/match")
-def slip_match(slip_id: str, request: Request):
+def slip_match(slip_id: str, request: Request, _admin: dict = Depends(_require_admin_role)):
     """
     Re-run the matcher (useful after TUM imports a statement PDF that
     landed AFTER this slip was uploaded). Idempotent. Also re-resolves
@@ -1419,7 +1422,7 @@ def slip_match(slip_id: str, request: Request):
 # ════════════════════════════════════════════════════════════════════════════
 
 @router.post("/slip/{slip_id}/manual-match")
-def slip_manual_match(slip_id: str, body: ManualMatchRequest, request: Request):
+def slip_manual_match(slip_id: str, body: ManualMatchRequest, request: Request, _admin: dict = Depends(_require_admin_role)):
     """
     Manually pin a slip to a specific statement row and/or invoice. Used
     when the auto-matcher returns `ambiguous` or when TUM wants to undo
@@ -1505,7 +1508,7 @@ def slip_manual_match(slip_id: str, body: ManualMatchRequest, request: Request):
 # ════════════════════════════════════════════════════════════════════════════
 
 @router.post("/slip/{slip_id}/reject")
-def slip_reject(slip_id: str, request: Request):
+def slip_reject(slip_id: str, request: Request, _admin: dict = Depends(_require_admin_role)):
     _validate_uuid_param("slip_id", slip_id)
     actor = _current_username(request)
     conn = get_db_conn()
@@ -1543,6 +1546,7 @@ def slip_override_category(
     slip_id: str,
     body: CategoryOverrideRequest,
     request: Request,
+    _admin: dict = Depends(_require_admin_role),
 ):
     """
     Manually pin a slip's accounting category, overriding whatever the

@@ -31,8 +31,10 @@ from typing import Optional
 
 import psycopg2
 import pdfplumber
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
+
+from auth_routes import _require_admin_role  # admin-only gate for money-mutation endpoints (audit AUD-TAX-02)
 
 try:
     from main import get_db_conn  # type: ignore
@@ -514,7 +516,7 @@ def search_entries(
 
 
 @router.post("/classify/{entry_id}")
-def classify_entry(entry_id: str, body: ClassifyRequest):
+def classify_entry(entry_id: str, body: ClassifyRequest, _admin: dict = Depends(_require_admin_role)):
     """TUM จัดหมวดรายการที่ needs_review ด้วยมือ"""
     conn = get_db_conn()
     try:
@@ -560,7 +562,7 @@ def classify_entry(entry_id: str, body: ClassifyRequest):
 
 
 @router.post("/add-rule")
-def add_rule(body: AddRuleRequest):
+def add_rule(body: AddRuleRequest, _admin: dict = Depends(_require_admin_role)):
     """เพิ่ม rule ใหม่สำหรับการจัดหมวดอัตโนมัติในครั้งถัดไป"""
     conn = get_db_conn()
     try:

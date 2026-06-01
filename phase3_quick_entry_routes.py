@@ -20,8 +20,10 @@ from datetime import date, datetime, timedelta
 from typing import Any, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+
+from auth_routes import _require_admin_role  # admin-only gate for money-mutation endpoints (audit AUD-TAX-02)
 
 try:
     from main import get_db_conn  # type: ignore
@@ -250,7 +252,7 @@ def quick_summary():
 
 
 @router.post("/quick-entries")
-def create_entry(body: QuickEntryCreate):
+def create_entry(body: QuickEntryCreate, _admin: dict = Depends(_require_admin_role)):
     """Create a manual entry."""
     if body.direction not in VALID_DIRECTIONS:
         raise HTTPException(400, f"direction must be one of {sorted(VALID_DIRECTIONS)}")
@@ -288,7 +290,7 @@ def create_entry(body: QuickEntryCreate):
 
 
 @router.delete("/quick-entries/{entry_id}")
-def delete_entry(entry_id: str):
+def delete_entry(entry_id: str, _admin: dict = Depends(_require_admin_role)):
     """Hard delete a manual entry (no audit trail — these are tiny cash records)."""
     eid = _parse_uuid(entry_id, "entry_id")
     conn = get_db_conn()

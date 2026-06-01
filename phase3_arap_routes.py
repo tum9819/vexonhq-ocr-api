@@ -42,8 +42,10 @@ from datetime import date, datetime, timedelta
 from typing import Any, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+
+from auth_routes import _require_admin_role  # admin-only gate for money-mutation endpoints (audit AUD-TAX-02)
 
 # Reuse main.get_db_conn (same pattern as pos_import.py + phase2_routes.py)
 try:
@@ -229,7 +231,7 @@ def list_counterparties(
 
 
 @router.post("/counterparties")
-def create_counterparty(body: CounterpartyCreate):
+def create_counterparty(body: CounterpartyCreate, _admin: dict = Depends(_require_admin_role)):
     """Create a new vendor/customer. Auto-generates code if not provided."""
     if not body.name or not body.name.strip():
         raise HTTPException(400, "name is required")
@@ -269,7 +271,7 @@ def create_counterparty(body: CounterpartyCreate):
 
 
 @router.patch("/counterparties/{cp_id}")
-def patch_counterparty(cp_id: str, body: CounterpartyPatch):
+def patch_counterparty(cp_id: str, body: CounterpartyPatch, _admin: dict = Depends(_require_admin_role)):
     """Edit counterparty fields. Only non-null fields are updated."""
     cp_uuid = _parse_uuid(cp_id, "cp_id")
 
@@ -300,7 +302,7 @@ def patch_counterparty(cp_id: str, body: CounterpartyPatch):
 
 
 @router.delete("/counterparties/{cp_id}")
-def soft_delete_counterparty(cp_id: str):
+def soft_delete_counterparty(cp_id: str, _admin: dict = Depends(_require_admin_role)):
     """Soft delete (is_active = false). Preserves history."""
     cp_uuid = _parse_uuid(cp_id, "cp_id")
     conn = get_db_conn()
@@ -425,7 +427,7 @@ def get_entry_with_payments(entry_id: str):
 
 
 @router.post("/ar-ap/entries")
-def create_entry(body: EntryCreate):
+def create_entry(body: EntryCreate, _admin: dict = Depends(_require_admin_role)):
     """Manually create an AR or AP entry."""
     if body.direction not in VALID_DIRECTIONS:
         raise HTTPException(400, f"direction must be one of {sorted(VALID_DIRECTIONS)}")
@@ -468,7 +470,7 @@ def create_entry(body: EntryCreate):
 
 
 @router.patch("/ar-ap/entries/{entry_id}")
-def patch_entry(entry_id: str, body: EntryPatch):
+def patch_entry(entry_id: str, body: EntryPatch, _admin: dict = Depends(_require_admin_role)):
     """Edit doc_no, due_date, category_code, notes on an existing entry."""
     eid = _parse_uuid(entry_id, "entry_id")
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
@@ -498,7 +500,7 @@ def patch_entry(entry_id: str, body: EntryPatch):
 
 
 @router.delete("/ar-ap/entries/{entry_id}")
-def cancel_entry(entry_id: str, body: CancelBody = CancelBody()):
+def cancel_entry(entry_id: str, body: CancelBody = CancelBody(), _admin: dict = Depends(_require_admin_role)):
     """Cancel an entry (status='cancelled'). Does NOT physically delete (preserves audit trail).
     Existing payments are kept but trigger ignores them (status guard)."""
     eid = _parse_uuid(entry_id, "entry_id")
@@ -529,7 +531,7 @@ def cancel_entry(entry_id: str, body: CancelBody = CancelBody()):
 # ============================================================
 
 @router.post("/ar-ap/payments")
-def create_payment(body: PaymentCreate):
+def create_payment(body: PaymentCreate, _admin: dict = Depends(_require_admin_role)):
     """Record a payment. Trigger auto-updates entry.amount_paid + status."""
     eid = _parse_uuid(body.entry_id, "entry_id")
     if body.amount <= 0:
@@ -608,7 +610,7 @@ def create_payment(body: PaymentCreate):
 
 
 @router.delete("/ar-ap/payments/{payment_id}")
-def delete_payment(payment_id: str):
+def delete_payment(payment_id: str, _admin: dict = Depends(_require_admin_role)):
     """Reverse a payment. Trigger recomputes entry.amount_paid + status."""
     pid = _parse_uuid(payment_id, "payment_id")
     conn = get_db_conn()

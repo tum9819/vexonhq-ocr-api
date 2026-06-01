@@ -28,8 +28,10 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
+
+from auth_routes import _require_admin_role  # admin-only gate for money-mutation endpoints (audit AUD-TAX-02)
 
 try:
     from main import get_db_conn  # type: ignore
@@ -104,7 +106,7 @@ def list_statement_rules():
 
 
 @router.post("/statement-rules")
-def create_statement_rule(body: StatementRuleIn, request: Request):
+def create_statement_rule(body: StatementRuleIn, request: Request, _admin: dict = Depends(_require_admin_role)):
     actor = _current_username(request)
     if body.rule_type not in ("keyword", "name", "amount_pattern"):
         raise HTTPException(400, f"invalid rule_type {body.rule_type!r}")
@@ -159,7 +161,7 @@ def create_statement_rule(body: StatementRuleIn, request: Request):
 
 
 @router.delete("/statement-rules/{rule_id}")
-def delete_statement_rule(rule_id: str, request: Request):
+def delete_statement_rule(rule_id: str, request: Request, _admin: dict = Depends(_require_admin_role)):
     actor = _current_username(request)
     conn = get_db_conn()
     try:
@@ -214,7 +216,7 @@ def list_vendor_aliases(active_only: bool = False):
 
 
 @router.post("/vendor-aliases")
-def create_vendor_alias(body: VendorAliasIn, request: Request):
+def create_vendor_alias(body: VendorAliasIn, request: Request, _admin: dict = Depends(_require_admin_role)):
     actor = _current_username(request)
     keyword = body.product_keyword.strip().lower()
     if not keyword:
@@ -252,7 +254,7 @@ def create_vendor_alias(body: VendorAliasIn, request: Request):
 
 
 @router.delete("/vendor-aliases/{alias_id}")
-def delete_vendor_alias(alias_id: str, request: Request):
+def delete_vendor_alias(alias_id: str, request: Request, _admin: dict = Depends(_require_admin_role)):
     actor = _current_username(request)
     conn = get_db_conn()
     try:
