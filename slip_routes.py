@@ -258,6 +258,29 @@ def _run_slip_vision(image_bytes: bytes, mime_type: str) -> dict[str, Any]:
         return json.loads(cleaned)
 
 
+def _slip_tamper_signal(existing_amount, existing_ref, new_ref, new_amount):
+    """F11 (anti-tamper): a bank transfer's ref_no is globally unique per transaction.
+    If a freshly-uploaded slip carries the SAME ref_no as one already in the system but
+    a DIFFERENT amount, the slip image was likely edited (the amount was changed). Return
+    a dict describing the mismatch so the caller can warn the user, or None when it is a
+    genuine duplicate / no ref_no / amounts agree.
+    """
+    new_ref = (new_ref or "").strip()
+    if not new_ref:
+        return None
+    if (existing_ref or "").strip() != new_ref:
+        return None
+    if existing_amount is None or new_amount is None:
+        return None
+    if abs(float(existing_amount) - float(new_amount)) <= 0.01:
+        return None
+    return {
+        "existing_amount": float(existing_amount),
+        "uploaded_amount": float(new_amount),
+        "ref_no": new_ref,
+    }
+
+
 def _find_duplicate_slip(
     conn,
     transfer_date,
@@ -868,14 +891,38 @@ async def slip_upload(file: UploadFile = File(...), request: Request = None):
         )
         if existing_id:
             log.info("slip upload duplicate detected — returning existing id=%s", existing_id)
+            # F11 (anti-tamper): a bank ref_no is globally unique per transaction, so if
+            # this duplicate was caught by a matching ref_no but the UPLOADED amount differs
+            # from the stored one, the slip image may have been edited. Surface a loud warning
+            # instead of silently de-duping (the original stored slip is kept either way).
+            tamper = None
+            new_ref = (parsed.get("ref_no") or "").strip()
+            if new_ref:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT amount, ref_no FROM public.slips WHERE id = %s", (existing_id,))
+                    erow = cur.fetchone()
+                if erow:
+                    tamper = _slip_tamper_signal(erow[0], erow[1], new_ref, amount)
+                    if tamper:
+                        log.warning("slip TAMPER signal: ref_no=%s stored=%.2f uploaded=%.2f",
+                                    new_ref, tamper["existing_amount"], tamper["uploaded_amount"])
+            message = "สลิปนี้มีในระบบแล้ว — ไม่ได้บันทึกซ้ำ"
+            if tamper:
+                message = (
+                    f"*** เตือน: เลขอ้างอิงเดียวกัน (ref {new_ref}) แต่ยอดไม่ตรง — "
+                    f"ในระบบ {tamper['existing_amount']:,.2f} แต่ที่อัปมา {amount:,.2f} บาท "
+                    f"อาจเป็นสลิปที่ถูกแก้ตัวเลข กรุณาตรวจสอบก่อนใช้"
+                )
             return {
-                "success":     True,
-                "slip_id":     existing_id,
-                "parsed":      parsed,
-                "preview_url": _sign_uploads_url(image_url),
-                "duplicate":   True,
-                "message":     "สลิปนี้มีในระบบแล้ว — ไม่ได้บันทึกซ้ำ",
-                "match":       {"status": "duplicate", "existing_slip_id": existing_id},
+                "success":        True,
+                "slip_id":        existing_id,
+                "parsed":         parsed,
+                "preview_url":    _sign_uploads_url(image_url),
+                "duplicate":      True,
+                "tamper_warning": bool(tamper),
+                "tamper":         tamper,
+                "message":        message,
+                "match":          {"status": "duplicate", "existing_slip_id": existing_id},
             }
 
         sku, conf = _classify_memo(conn, parsed.get("memo"))
