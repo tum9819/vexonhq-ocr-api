@@ -123,3 +123,23 @@ def test_summarize_counts_wins_and_recommends():
 def test_summarize_empty():
     s = summarize([])
     assert s["cases"] == 0
+
+
+# ── golden-set generator: pure row→expected mapping (no DB) ──
+def test_bill_row_to_expected_shape():
+    from tools.gen_golden_from_confirmed import bill_row_to_expected
+    import datetime as _dt
+
+    row = {
+        "vendor_name": "ร้านเดโม", "invoice_no": "INV-1", "bill_date": _dt.date(2026, 4, 1),
+        "merchant_tax_id": "0105500000000", "subtotal": 100, "vat": 7, "amount": 107,
+    }
+    items = [{"product_name": "หมู", "qty": 2, "total": 100}]
+    exp = bill_row_to_expected(row, items)
+    assert exp["vendor_name"] == "ร้านเดโม"
+    assert exp["bill_date"] == "2026-04-01"          # date → ISO string
+    assert exp["amount"] == 107.0                     # numeric coercion
+    assert exp["items"][0]["product_name"] == "หมู"
+    # the result must be directly scorable
+    r = score_case(exp, exp)
+    assert r["overall"] == 1.0

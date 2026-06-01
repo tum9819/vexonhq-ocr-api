@@ -20,6 +20,7 @@ import calendar
 import json
 import logging
 import os
+import re
 import urllib.request
 import urllib.error
 from datetime import date, datetime
@@ -126,6 +127,69 @@ def _call_claude(prompt: str) -> str:
         return call_anthropic("narrative", prompt, max_tokens=1024, timeout=30)
     except LLMError as e:
         raise HTTPException(e.status_for_http(), f"Claude API error: {e.detail}")
+
+
+# ─── Hallucination guard (audit F7) ──────────────────────────────────────────
+# The AI prose could print a baht figure that does NOT match v_daybook_pnl. We
+# DON'T rewrite the text (risky on a money report) — we extract every number from
+# the prose and flag any that matches no known-true value, so it's logged +
+# surfaced for a human. Advisory only.
+
+# A baht-ish figure: optional ฿, digits with optional thousands commas + decimals.
+_NUM_RE = re.compile(r"฿?\s?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)")
+
+
+def _known_values(current: dict, prev: dict | None) -> list[float]:
+    """All true figures the narrative is allowed to cite."""
+    vals: list[float] = [
+        current["total_income"], current["total_expense"], current["net"],
+        float(current["txn_count"]),
+    ]
+    for s in current.get("income_by_source", []):
+        vals.append(s["amount"])
+    for e in current.get("top_expenses", []):
+        vals.append(e["amount"])
+    if prev:
+        vals += [prev["total_income"], prev["total_expense"], prev["net"],
+                 float(prev["txn_count"])]
+        for s in prev.get("income_by_source", []):
+            vals.append(s["amount"])
+        for e in prev.get("top_expenses", []):
+            vals.append(e["amount"])
+    return [abs(v) for v in vals]
+
+
+def _verify_narrative(text: str, known: list[float]) -> dict:
+    """Extract baht figures from the prose and flag any that match no known
+    value (±1%, or ±1 for small integers). Non-mutating; returns a report.
+
+    Skips obvious non-money tokens: 4-digit years (2025/2026/Buddhist 2569) and
+    any number immediately followed by '%' (margins/percent changes)."""
+    unmatched: list[float] = []
+    checked = 0
+    for m in _NUM_RE.finditer(text):
+        # Skip percentages: number directly followed by % (ignoring spaces).
+        tail = text[m.end():m.end() + 2]
+        if tail.lstrip().startswith("%"):
+            continue
+        raw = m.group(1).replace(",", "")
+        try:
+            n = float(raw)
+        except ValueError:
+            continue
+        # Skip year-like bare integers (no comma, no ฿) in the AD/BE range.
+        had_baht = "฿" in m.group(0)
+        if not had_baht and "," not in m.group(1) and "." not in m.group(1):
+            if 1900 <= n <= 2600:
+                continue
+        checked += 1
+        ok = any(
+            (abs(n - k) <= 1.0) if k < 100 else (abs(n - k) <= 0.01 * k)
+            for k in known
+        )
+        if not ok:
+            unmatched.append(n)
+    return {"ok": not unmatched, "checked": checked, "unmatched": unmatched}
 
 
 # ─── Data gathering ─────────────────────────────────────────────────────────────
@@ -265,7 +329,8 @@ Top 5 หมวดรายจ่าย:
 - เปรียบเทียบกับเดือนก่อน (ถ้ามีข้อมูล)
 - ระบุหมวดค่าใช้จ่ายที่สูงที่สุด
 - ปิดท้ายด้วยข้อสังเกตหรือคำแนะนำ 1-2 ข้อที่เป็นประโยชน์
-- ไม่ต้องใส่หัวข้อหรือ bullet points — เขียนเป็น paragraph ต่อเนื่อง"""
+- ไม่ต้องใส่หัวข้อหรือ bullet points — เขียนเป็น paragraph ต่อเนื่อง
+- **สำคัญ: ใช้เฉพาะตัวเลขเงินที่ให้ไว้ด้านบนเท่านั้น ห้ามคำนวณ ปัดเศษ หรือสร้างตัวเลขใหม่เอง** (ตัวเลขทุกตัวต้องตรงกับข้อมูลจริง)"""
 
 
 # ─── Endpoint ───────────────────────────────────────────────────────────────────
@@ -312,6 +377,15 @@ def generate_narrative(
     prompt = _build_prompt(current_data, prev_data)
     narrative = _call_claude(prompt)
 
+    # F7 hallucination guard: flag any baht figure in the prose that matches no
+    # known-true value. Advisory — we log + surface, never rewrite the text.
+    verification = _verify_narrative(narrative, _known_values(current_data, prev_data))
+    if not verification["ok"]:
+        logger.warning(
+            "narrative for %s has %d unverified number(s): %s",
+            month, len(verification["unmatched"]), verification["unmatched"],
+        )
+
     # Format final LINE message
     net_sign = "+" if current_data["net"] >= 0 else ""
     header = (
@@ -335,6 +409,7 @@ def generate_narrative(
         "narrative": narrative,
         "full_message": full_message,
         "sent_to_line": send_line,
+        "verification": verification,
         "stats": {
             "total_income": current_data["total_income"],
             "total_expense": current_data["total_expense"],
