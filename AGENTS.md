@@ -240,6 +240,7 @@ frontend repo under `C:\Users\rapee\VEXONHQ\docs\`.
 - **Database**: Supabase Cloud Free, project `mara-ai-prod`, Tokyo region
 - **Snapshots**: keep 3 max. `$0.06/GB/month`. Total cap ~$5/month.
 - **Auto-heal pipeline**: L3 (Restart) + L3.5 (Show patch) shipped Sessions 29 + 31. See `CLAUDE.md` and `docs/01_PROJECT/ROADMAP.md`.
+- **Operations RUNBOOK (deploy / monitor / recover / handover)**: `C:\Users\rapee\VEXONHQ\docs\06_SUPPORT\RUNBOOK.md` — single source of truth for running the whole system (key-person-risk remediation, audit F3). Update it whenever infra/secret/process changes.
 
 ---
 
