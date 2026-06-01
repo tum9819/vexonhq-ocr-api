@@ -170,6 +170,10 @@ AUTHED_ROUTES = [
 
     # Option A + LINE Alert — AI exec endpoint (POST-only → GET returns 405 = route registered)
     ("GET", "/ai/exec"),
+
+    # AI monitoring (JWT-gated → 401 proves route exists). Telemetry (S51) + drift (S54).
+    ("GET", "/ai/stats"),
+    ("GET", "/ai/drift"),
 ]
 
 

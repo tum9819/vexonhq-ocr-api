@@ -155,3 +155,19 @@ def ai_calls(limit: int = Query(50, ge=1, le=500)):
         for (created_at, provider, task, model, ok, ptok, ctok, ttok, lat, status, error) in rows
     ]
     return {"count": len(calls), "calls": calls}
+
+
+@router.get("/drift")
+def ai_drift(post: bool = Query(False, description="true = real run (writes state + posts armed pings)")):
+    """AI quality/cost drift report (audit roadmap final item). Default is a
+    DRY RUN: computes per-task drift findings WITHOUT posting to Discord and
+    WITHOUT mutating ai_drift_state — safe to call any time to inspect what the
+    08:30 watcher would do. `?post=true` does one real run for end-to-end testing.
+    JWT-gated (the report references task/error detail). Returns warming_up while
+    the 28-day cold-start hasn't elapsed."""
+    from drift_monitor import run_drift_check
+    try:
+        return run_drift_check(dry_run=not post, post=post)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=503,
+                            content={"status": "drift_check_failed", "error": str(e)[:200]})

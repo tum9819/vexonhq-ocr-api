@@ -894,12 +894,37 @@ def _build_weekly_summary() -> str:
         conn.close()
 
 
+@_heartbeat("daily_ai_drift_check", expected_interval_hours=24)
+def _scheduled_ai_drift_check():
+    """APScheduler job: AI quality/cost drift watch (08:30 Bangkok, audit roadmap).
+    Reads ai_call_log, evaluates per-task drift, and — only when armed
+    (AI_DRIFT_ALERTS_ARMED=1) and past the 28-day cold-start — posts a high-signal
+    error-rate alert to Discord. Quality/cost drift, NOT outage detection.
+
+    The detection read re-raises on error so a silently-dead watchdog trips
+    /cron/health (AGENTS #28); the Discord post + state write are best-effort
+    inside run_drift_check, so a Discord outage never fails this job."""
+    log.info("Scheduled AI drift check — running")
+    from drift_monitor import run_drift_check
+    report = run_drift_check(dry_run=False, post=True)
+    posted = len(report.get("would_post", []))
+    log.info("AI drift check done — warming_up=%s armed=%s would_post=%d",
+             report.get("warming_up"), report.get("armed"), posted)
+
+
 @_heartbeat("weekly_summary", expected_interval_hours=168)
 def _scheduled_weekly_summary():
     """APScheduler job: send weekly summary to LINE every Monday 08:00 Bangkok."""
     log.info("Scheduled weekly summary — running")
     try:
         text = _build_weekly_summary()
+        # Fold one AI-drift line into the weekly digest (best-effort — never breaks
+        # the summary if drift_monitor / its table isn't available yet).
+        try:
+            from drift_monitor import run_drift_check
+            text = text + "\n" + run_drift_check(dry_run=True, post=False)["digest_line"]
+        except Exception:
+            log.warning("weekly summary: drift digest line unavailable (non-fatal)")
         _push_text(text)
         log.info("Weekly summary sent OK")
     except Exception as e:
@@ -942,11 +967,20 @@ _scheduler.add_job(
     id="daily_budget_alert",
     replace_existing=True,
 )
+_scheduler.add_job(
+    _scheduled_ai_drift_check,
+    trigger="cron",
+    hour=8,
+    minute=30,                 # after 06:00 digest, before 09:00 AP — no co-firing minute
+    id="daily_ai_drift_check",
+    replace_existing=True,
+)
 _scheduler.start()
 log.info("LINE digest scheduler started — fires daily at 06:00 Asia/Bangkok")
 log.info("AP due reminder scheduler started — fires daily at 09:00 Asia/Bangkok")
 log.info("Weekly summary scheduler started — fires every Monday 08:00 Asia/Bangkok")
 log.info("Budget alert scheduler started — fires daily at 20:00 Asia/Bangkok")
+log.info("AI drift check scheduler started — fires daily at 08:30 Asia/Bangkok")
 
 
 # ─────────────────────────────────────────────
