@@ -96,38 +96,87 @@ def run_claude_ocr(image_bytes: bytes, mime: str, prompt: str) -> dict:
     return _parse_json(raw)
 
 
-def compare_results(expected: dict, openai_actual: dict, claude_actual: dict) -> dict:
-    """Pure: score both model outputs against expected. No network. Testable."""
-    o = score_case(expected, openai_actual)
-    c = score_case(expected, claude_actual)
-    if o["overall"] > c["overall"]:
-        winner = "openai"
-    elif c["overall"] > o["overall"]:
-        winner = "claude"
-    else:
-        winner = "tie"
-    return {"openai": o, "claude": c, "winner": winner}
+def run_openai_structured_ocr(image_bytes: bytes, mime: str, prompt: str) -> dict:
+    """OpenAI path with a STRICT JSON Schema (Structured Outputs). Same model +
+    prompt as the free-form runner, but the output shape is structurally
+    guaranteed (see ocr_schema). Routed through llm.openai_chat_structured +
+    normalize_structured, logged under a distinct task. Lets `compare` measure
+    whether strict mode beats free-form on real invoices."""
+    import os
+    from llm import openai_chat_structured
+    from ocr_schema import invoice_json_schema, normalize_structured
+
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    data_url = f"data:{mime or 'image/jpeg'};base64,{b64}"
+    resp = openai_chat_structured(
+        "vision_ocr_compare_structured",
+        schema=invoice_json_schema(),
+        schema_name="invoice",
+        model=os.environ.get("OPENAI_VISION_MODEL", "gpt-4o"),
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ],
+        temperature=0.1,
+        max_tokens=4000,
+    )
+    return normalize_structured(_parse_json(resp.choices[0].message.content or "{}"))
+
+
+def compare_results(expected: dict, openai_actual: dict, claude_actual: dict,
+                    structured_actual: dict | None = None) -> dict:
+    """Pure: score each model output against expected. No network. Testable.
+    `structured_actual` (strict-schema OpenAI) is optional so the existing 2-way
+    callers keep working; when present the winner is chosen across all three."""
+    scores = {
+        "openai": score_case(expected, openai_actual),
+        "claude": score_case(expected, claude_actual),
+    }
+    if structured_actual is not None:
+        scores["structured"] = score_case(expected, structured_actual)
+
+    best = max(s["overall"] for s in scores.values())
+    leaders = [name for name, s in scores.items() if s["overall"] == best]
+    winner = leaders[0] if len(leaders) == 1 else "tie"
+
+    out = dict(scores)
+    out["winner"] = winner
+    return out
 
 
 def summarize(rows: list[dict]) -> dict:
-    """Pure: aggregate per-model mean overall + win counts across compared cases."""
+    """Pure: aggregate per-model mean overall + win counts across compared cases.
+    Adapts to whichever models the rows actually contain (2-way or 3-way)."""
     n = len(rows)
+    model_keys = ["openai", "claude", "structured"]
+    present = [m for m in model_keys if rows and m in rows[0]]
     if not n:
         return {"cases": 0, "openai_mean_overall": 0.0, "claude_mean_overall": 0.0, "wins": {}}
-    oa = round(sum(r["openai"]["overall"] for r in rows) / n, 4)
-    ca = round(sum(r["claude"]["overall"] for r in rows) / n, 4)
-    wins = {"openai": 0, "claude": 0, "tie": 0}
+
+    means = {m: round(sum(r[m]["overall"] for r in rows) / n, 4) for m in present}
+    wins: dict[str, int] = {m: 0 for m in present}
+    wins["tie"] = 0
     for r in rows:
-        wins[r["winner"]] += 1
-    return {
+        wins[r["winner"]] = wins.get(r["winner"], 0) + 1
+
+    best = max(means.values()) if means else 0.0
+    leaders = [m for m, v in means.items() if v == best]
+    out = {
         "cases": n,
-        "openai_mean_overall": oa,
-        "claude_mean_overall": ca,
         "wins": wins,
-        "recommendation": (
-            "openai" if oa > ca else "claude" if ca > oa else "tie"
-        ),
+        "recommendation": leaders[0] if len(leaders) == 1 else "tie",
     }
+    for m in present:
+        out[f"{m}_mean_overall"] = means[m]
+    # Back-compat keys (always present even in a 3-way run).
+    out.setdefault("openai_mean_overall", means.get("openai", 0.0))
+    out.setdefault("claude_mean_overall", means.get("claude", 0.0))
+    return out
 
 
 def _vision_prompt() -> str:
@@ -142,18 +191,26 @@ def _compare_one(image_path: pathlib.Path, expected_path: pathlib.Path, prompt: 
     mime = mimetypes.guess_type(str(image_path))[0] or "image/jpeg"
     openai_actual = run_openai_ocr(image_bytes, mime, prompt)
     claude_actual = run_claude_ocr(image_bytes, mime, prompt)
-    res = compare_results(expected, openai_actual, claude_actual)
+    structured_actual = run_openai_structured_ocr(image_bytes, mime, prompt)
+    res = compare_results(expected, openai_actual, claude_actual, structured_actual)
     res["image"] = image_path.name
     return res
 
 
 def _print_row(res: dict) -> None:
     o, c = res["openai"], res["claude"]
+    s = res.get("structured")
     print(f"\n  {res.get('image', '?')}")
-    print(f"    {'metric':<18}{'gpt-4o':>12}{'claude':>12}")
-    print(f"    {'field_accuracy':<18}{o['field_accuracy']:>12}{c['field_accuracy']:>12}")
-    print(f"    {'item_f1':<18}{o['items']['f1']:>12}{c['items']['f1']:>12}")
-    print(f"    {'overall':<18}{o['overall']:>12}{c['overall']:>12}")
+    if s:
+        print(f"    {'metric':<18}{'gpt-4o':>12}{'structured':>12}{'claude':>12}")
+        print(f"    {'field_accuracy':<18}{o['field_accuracy']:>12}{s['field_accuracy']:>12}{c['field_accuracy']:>12}")
+        print(f"    {'item_f1':<18}{o['items']['f1']:>12}{s['items']['f1']:>12}{c['items']['f1']:>12}")
+        print(f"    {'overall':<18}{o['overall']:>12}{s['overall']:>12}{c['overall']:>12}")
+    else:
+        print(f"    {'metric':<18}{'gpt-4o':>12}{'claude':>12}")
+        print(f"    {'field_accuracy':<18}{o['field_accuracy']:>12}{c['field_accuracy']:>12}")
+        print(f"    {'item_f1':<18}{o['items']['f1']:>12}{c['items']['f1']:>12}")
+        print(f"    {'overall':<18}{o['overall']:>12}{c['overall']:>12}")
     print(f"    winner: {res['winner']}")
 
 
@@ -178,14 +235,14 @@ def main(argv: list[str]) -> int:
         print("\n=== SUMMARY ===")
         print(json.dumps(summarize(rows), ensure_ascii=False, indent=2))
         print("\nToken + estimated-cost per model: see GET /ai/stats "
-              "(tasks vision_ocr_compare_openai / vision_ocr_compare_claude)")
+              "(tasks vision_ocr_compare_openai / _structured / _claude)")
         return 0
 
     if len(argv) == 2:
         res = _compare_one(pathlib.Path(argv[0]), pathlib.Path(argv[1]), prompt)
         _print_row(res)
         print("\nToken + estimated-cost per model: see GET /ai/stats "
-              "(tasks vision_ocr_compare_openai / vision_ocr_compare_claude)")
+              "(tasks vision_ocr_compare_openai / _structured / _claude)")
         return 0
 
     print(__doc__)

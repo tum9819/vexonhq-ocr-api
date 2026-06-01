@@ -323,6 +323,32 @@ def openai_chat(
     return resp
 
 
+def openai_chat_structured(
+    task: str,
+    *,
+    messages: list,
+    schema: dict,
+    schema_name: str = "result",
+    model: Optional[str] = None,
+    **kwargs: Any,
+):
+    """OpenAI Chat Completions with a STRICT JSON Schema (Structured Outputs).
+
+    Sets response_format={"type":"json_schema","json_schema":{...,"strict":True}}
+    so the model STRUCTURALLY guarantees the output shape (every field present,
+    typed, enums constrained) — killing the omit/wrong-type/invalid-enum class at
+    the source. Logs to ai_call_log like openai_chat; returns the RAW response
+    (caller reads .choices[0].message.content → already schema-valid JSON).
+
+    EXPERIMENTAL: no production route uses this yet; it exists for the OCR
+    comparison harness so a strict-mode promotion can be decided on real numbers."""
+    rf = {
+        "type": "json_schema",
+        "json_schema": {"name": schema_name, "schema": schema, "strict": True},
+    }
+    return openai_chat(task, messages=messages, model=model, response_format=rf, **kwargs)
+
+
 def call_anthropic_vision(
     task: str,
     *,
