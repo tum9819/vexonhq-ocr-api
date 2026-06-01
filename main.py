@@ -1947,7 +1947,17 @@ CRITICAL RULES — read carefully, these errors are common:
    Numbers in JSON must be JSON numbers, not strings.
    1,234.56 → 1234.56 (no comma, no quotes)
 
-10. OUTPUT
+10. CONFIDENCE + IMAGE QUALITY (audit F6)
+    Also return two extra top-level keys so a human reviewer knows what to double-check:
+      "field_confidence": an object mapping each of these fields to your confidence
+        0.0-1.0 that YOU read it correctly: vendor_name, invoice_no, merchant_tax_id,
+        bill_date, subtotal, vat, amount. Use < 0.6 when the text was blurry, cropped,
+        ambiguous, or you guessed; use ≥ 0.9 when it was crisp and unambiguous.
+      "image_quality": {"level": "good" | "fair" | "poor", "reason": "<short Thai/EN note>"}
+        — "poor" if blurry / skewed / dark / cut off so fields are hard to read.
+    These describe your READING CONFIDENCE; they must NOT change the extracted values above.
+
+11. OUTPUT
     Pure JSON only. NO markdown fences. NO explanation. NO preamble.
 """
 
@@ -2038,7 +2048,61 @@ def _validate_invoice(parsed: dict[str, Any]) -> list[dict[str, str]]:
         except (TypeError, ValueError):
             pass
 
+    warnings.extend(_confidence_warnings(parsed))
     return warnings
+
+
+# Fields the OCR reports a per-field confidence for (audit F6).
+_CONFIDENCE_FIELDS = [
+    "vendor_name", "invoice_no", "merchant_tax_id", "bill_date",
+    "subtotal", "vat", "amount",
+]
+_CONFIDENCE_LABEL_TH = {
+    "vendor_name": "ชื่อผู้ขาย", "invoice_no": "เลขที่ใบกำกับ",
+    "merchant_tax_id": "เลขผู้เสียภาษี", "bill_date": "วันที่",
+    "subtotal": "ยอดก่อน VAT", "vat": "VAT", "amount": "ยอดรวม",
+}
+_LOW_CONFIDENCE_THRESHOLD = 0.6
+
+
+def _confidence_warnings(parsed: dict[str, Any]) -> list[dict[str, str]]:
+    """Turn the OCR's self-reported field_confidence + image_quality into review
+    warnings (audit F6). Advisory: it flags what a human should double-check; it
+    never changes the extracted values. Tolerates missing/garbage AI output —
+    a model that omits or mangles these keys produces NO warnings, never an error."""
+    out: list[dict[str, str]] = []
+
+    fc = parsed.get("field_confidence")
+    if isinstance(fc, dict):
+        for field in _CONFIDENCE_FIELDS:
+            # Only flag a field the AI actually returned a value for.
+            if parsed.get(field) in (None, ""):
+                continue
+            raw = fc.get(field)
+            try:
+                conf = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if 0.0 <= conf < _LOW_CONFIDENCE_THRESHOLD:
+                label = _CONFIDENCE_LABEL_TH.get(field, field)
+                out.append({
+                    "severity": "warn",
+                    "code": "LOW_CONFIDENCE",
+                    "field": field,
+                    "message": f"AI ไม่มั่นใจ{label} ({conf * 100:.0f}%) — โปรดตรวจสอบ",
+                })
+
+    iq = parsed.get("image_quality")
+    if isinstance(iq, dict) and str(iq.get("level", "")).lower() == "poor":
+        reason = str(iq.get("reason") or "ภาพไม่ชัด")[:120]
+        out.append({
+            "severity": "warn",
+            "code": "LOW_IMAGE_QUALITY",
+            "field": "image",
+            "message": f"คุณภาพรูปต่ำ ({reason}) — ถ่ายใหม่ให้ชัดขึ้นจะอ่านแม่นกว่า",
+        })
+
+    return out
 
 
 # ============================================================

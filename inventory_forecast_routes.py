@@ -526,3 +526,129 @@ def ai_order_advice(
         "dow_ranked":        dow_ranked,      # sorted best→worst
         "advice":            advice,
     }
+
+
+# ─────────────────────────────────────────────────────────
+# F8 — Backtest the DOW order-advice against held-out actuals
+# ─────────────────────────────────────────────────────────
+
+def backtest_dow(train_daily: list[dict], test_daily: list[dict]) -> dict:
+    """Pure scorer (no DB): how well does the day-of-week sales pattern learned on
+    `train_daily` predict `test_daily`?
+
+    Each input row: {"date": str, "dow": int 0-6, "sales": float}.
+    - Train a per-DOW mean + grand mean; predict each test day = grand_mean ×
+      (dow_mean / grand_mean) = dow_mean(train). MAPE vs actual.
+    - best_day_hit: how many of train's top-2 DOW (by mean) are in test's top-2
+      actual DOW (by mean). 0-2.
+    Returns a report; handles empty/degenerate input without raising."""
+    def _dow_means(rows: list[dict]) -> dict[int, float]:
+        agg: dict[int, list[float]] = {}
+        for r in rows:
+            try:
+                d = int(r["dow"]); s = float(r["sales"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            agg.setdefault(d, []).append(s)
+        return {d: (sum(v) / len(v)) for d, v in agg.items() if v}
+
+    train_means = _dow_means(train_daily)
+    test_means = _dow_means(test_daily)
+
+    if not train_means or not test_daily:
+        return {
+            "train_days": len(train_daily), "test_days": len(test_daily),
+            "mape_pct": None, "accuracy_pct": None, "best_day_hit": None,
+            "verdict_th": "ข้อมูลไม่พอสำหรับ backtest (ต้องมีทั้งช่วง train และ test)",
+        }
+
+    grand_train = sum(train_means.values()) / len(train_means)
+
+    # MAPE on test days that have a usable actual (>0) and a train prediction.
+    abs_pcts: list[float] = []
+    for r in test_daily:
+        try:
+            d = int(r["dow"]); actual = float(r["sales"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if actual <= 0:
+            continue
+        pred = train_means.get(d, grand_train)
+        abs_pcts.append(abs(pred - actual) / actual)
+    mape = round(sum(abs_pcts) / len(abs_pcts) * 100, 1) if abs_pcts else None
+    accuracy = round(max(0.0, 100.0 - mape), 1) if mape is not None else None
+
+    # Best-day hit: train top-2 DOW vs test top-2 DOW (by mean).
+    train_top2 = {d for d, _ in sorted(train_means.items(), key=lambda kv: kv[1], reverse=True)[:2]}
+    test_top2 = {d for d, _ in sorted(test_means.items(), key=lambda kv: kv[1], reverse=True)[:2]}
+    best_day_hit = len(train_top2 & test_top2)
+
+    if mape is None:
+        verdict = "ทดสอบไม่ได้ (ยอดขายช่วง test เป็นศูนย์)"
+    elif mape <= 20 and best_day_hit >= 1:
+        verdict = f"แม่นยำดี — คลาดเฉลี่ย {mape:.0f}% และทายวันขายดีถูก {best_day_hit}/2 วัน เชื่อถือได้"
+    elif mape <= 35:
+        verdict = f"พอใช้ — คลาดเฉลี่ย {mape:.0f}% ใช้เป็นแนวทางได้ แต่อย่ายึดตายตัว"
+    else:
+        verdict = f"ยังไม่น่าเชื่อถือ — คลาดเฉลี่ย {mape:.0f}% รูปแบบ DOW ยังไม่นิ่ง อย่าสั่งของตามนี้ล้วน ๆ"
+
+    return {
+        "train_days": len(train_daily),
+        "test_days": len(test_daily),
+        "mape_pct": mape,
+        "accuracy_pct": accuracy,
+        "best_day_hit": best_day_hit,
+        "verdict_th": verdict,
+    }
+
+
+@router.get("/inventory/ai-order-advice/backtest")
+def ai_order_advice_backtest(
+    branch: str = Query(DEFAULT_BRANCH),
+    train_weeks: int = Query(8, ge=2, le=52),
+    test_weeks: int = Query(4, ge=1, le=26),
+):
+    """F8 — measure how trustworthy /inventory/ai-order-advice is: train the
+    day-of-week sales pattern on the older `train_weeks`, then score it against
+    the held-out newer `test_weeks` (MAPE + best-day hit). Read-only/advisory."""
+    today = date.today()
+    test_start = today - timedelta(weeks=test_weeks)
+    train_start = test_start - timedelta(weeks=train_weeks)
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT entry_date,
+                          EXTRACT(DOW FROM entry_date)::int AS dow,
+                          COALESCE(SUM(amount), 0)::float   AS sales
+                   FROM public.v_daybook
+                   WHERE direction = 'income'
+                     AND source IN ('pos_sale','rider_income_grab','rider_income_lineman')
+                     AND branch_code = %s
+                     AND entry_date >= %s AND entry_date < %s
+                   GROUP BY entry_date
+                   ORDER BY entry_date""",
+                (branch, train_start, today),
+            )
+            rows = _rows_to_dicts(cur)
+    finally:
+        conn.close()
+
+    train_daily = [
+        {"date": r["entry_date"].isoformat(), "dow": int(r["dow"]), "sales": float(r["sales"])}
+        for r in rows if r["entry_date"] < test_start
+    ]
+    test_daily = [
+        {"date": r["entry_date"].isoformat(), "dow": int(r["dow"]), "sales": float(r["sales"])}
+        for r in rows if r["entry_date"] >= test_start
+    ]
+
+    report = backtest_dow(train_daily, test_daily)
+    report.update({
+        "as_of": today.isoformat(),
+        "branch_code": branch,
+        "train_weeks": train_weeks,
+        "test_weeks": test_weeks,
+    })
+    return report

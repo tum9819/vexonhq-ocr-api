@@ -102,6 +102,7 @@ AUTHED_ROUTES = [
     ("GET", "/inventory/forecast"),
     ("GET", "/inventory/reorder"),
     ("GET", "/inventory/ai-order-advice"),  # Phase 32 victim — must not vanish
+    ("GET", "/inventory/ai-order-advice/backtest"),  # F8 backtest (Session 53)
     ("GET", "/inventory/current"),
     ("GET", "/inventory/snapshots"),
 
