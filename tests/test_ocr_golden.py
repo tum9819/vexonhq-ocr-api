@@ -17,6 +17,7 @@ import pathlib
 import pytest
 
 from tests.ocr_golden.scorer import score_case, aggregate, nums_match, normalize_text
+from tests.ocr_golden.compare import compare_results, summarize
 
 CASES_DIR = pathlib.Path(__file__).parent / "ocr_golden" / "cases"
 
@@ -83,3 +84,42 @@ def test_aggregate_runs():
     assert agg["cases"] == len(results)
     assert 0.0 <= agg["mean_overall"] <= 1.0
     assert set(agg["per_field"]) >= {"vendor_name", "amount", "vat"}
+
+
+# ── OCR model comparison harness (gpt-4o vs Claude) — pure-logic checks ──
+# The API-calling parts (run_openai_ocr / run_claude_ocr) are NOT tested here
+# (they need live keys); we test the scoring/aggregation that decides the winner.
+
+def test_compare_results_picks_better_model():
+    expected = {"vendor_name": "ก", "amount": 100.0, "items": []}
+    openai_actual = {"vendor_name": "ก", "amount": 100.0, "items": []}   # perfect
+    claude_actual = {"vendor_name": "ข", "amount": 999.0, "items": []}   # wrong
+    res = compare_results(expected, openai_actual, claude_actual)
+    assert res["winner"] == "openai"
+    assert res["openai"]["overall"] > res["claude"]["overall"]
+
+
+def test_compare_results_tie():
+    expected = {"vendor_name": "ก", "amount": 100.0, "items": []}
+    res = compare_results(expected, dict(expected), dict(expected))
+    assert res["winner"] == "tie"
+
+
+def test_summarize_counts_wins_and_recommends():
+    expected = {"vendor_name": "ก", "amount": 100.0, "items": []}
+    good, bad = {"vendor_name": "ก", "amount": 100.0, "items": []}, {"vendor_name": "ข", "amount": 1.0, "items": []}
+    rows = [
+        compare_results(expected, good, bad),   # openai wins
+        compare_results(expected, good, bad),   # openai wins
+        compare_results(expected, bad, good),   # claude wins
+    ]
+    s = summarize(rows)
+    assert s["cases"] == 3
+    assert s["wins"]["openai"] == 2 and s["wins"]["claude"] == 1
+    assert s["recommendation"] == "openai"
+    assert s["openai_mean_overall"] > s["claude_mean_overall"]
+
+
+def test_summarize_empty():
+    s = summarize([])
+    assert s["cases"] == 0

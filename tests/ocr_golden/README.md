@@ -44,6 +44,36 @@ It runs the real `main._run_gpt_vision` pipeline and prints field-level accuracy
    change to see whether accuracy moved. That number is the real Testing-phase
    metric the audit asked for.
 
+## Comparing OpenAI gpt-4o vs Anthropic Claude (model-switch evaluation)
+
+`compare.py` runs **both** models on the same image with the **same production
+prompt** and scores each — so an OpenAI→Claude OCR switch is decided on numbers.
+It does **NOT** touch production (which still uses OpenAI via `main._run_gpt_vision`).
+
+```powershell
+$env:OPENAI_API_KEY    = "sk-..."
+$env:ANTHROPIC_API_KEY = "sk-ant-..."
+$env:DATABASE_URL      = "postgresql://..."   # optional — only for telemetry
+# Optional: capability-matched test (default is Haiku, the cheapest)
+$env:ANTHROPIC_VISION_MODEL = "claude-sonnet-4-6"
+
+# one image
+python -m tests.ocr_golden.compare C:\path\outside\repo\inv1.jpg C:\path\outside\repo\inv1.expected.json
+# a whole folder (each <name>.jpg + sibling <name>.expected.json)
+python -m tests.ocr_golden.compare --dir C:\Users\rapee\ocr-golden-private
+```
+
+It prints per-image field_accuracy / item_f1 / overall for each model, a winner,
+and a SUMMARY with mean overall + win counts + a recommendation. Because both
+calls log to `ai_call_log` (tasks `vision_ocr_compare_openai` /
+`vision_ocr_compare_claude`), `GET /ai/stats` then shows the **token + estimated
+cost** side-by-side too — so you can weigh accuracy AND cost before switching.
+
+**How to read it:** if Claude's mean overall is clearly ≥ gpt-4o AND cost is ≤,
+a switch is worth it — change the production `_run_gpt_vision` to call
+`call_anthropic_vision`. If gpt-4o wins on accuracy (likely for dense Thai
+invoices), keep it. Don't switch on fewer than ~15–20 real invoices.
+
 ## Scoring rules
 - **Text fields** (`vendor_name`, `invoice_no`, `bill_date`, `merchant_tax_id`):
   exact match after lowercase + whitespace-collapse.

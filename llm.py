@@ -65,6 +65,11 @@ MODELS: dict[str, str] = {
     "menu_reco":       _HAIKU,
     "recipe_suggest":  _HAIKU,
     "recipe_draft":    _HAIKU,
+    # Anthropic — vision. EXPERIMENTAL: used only by the OCR comparison harness
+    # (tests/ocr_golden/compare.py), NOT wired to any production route. Default
+    # Haiku (cheapest); set ANTHROPIC_VISION_MODEL to a Sonnet for a
+    # capability-matched comparison against gpt-4o.
+    "vision_ocr_claude": os.environ.get("ANTHROPIC_VISION_MODEL", _HAIKU),
 }
 
 
@@ -316,3 +321,94 @@ def openai_chat(
         latency_ms=latency_ms, status=200,
     )
     return resp
+
+
+def call_anthropic_vision(
+    task: str,
+    *,
+    image_b64: str,
+    mime_type: str,
+    prompt: str,
+    system: Optional[str] = None,
+    max_tokens: int = 4000,
+    timeout: int = 60,
+    model: Optional[str] = None,
+) -> str:
+    """
+    Anthropic Messages API call WITH an image (vision). Returns the concatenated
+    assistant text. Logs to ai_call_log like the other primitives.
+
+    EXPERIMENTAL: there is no production route that calls this. It exists for the
+    OCR comparison harness (tests/ocr_golden/compare.py) so an OpenAI→Anthropic
+    OCR switch can be evaluated on real accuracy numbers. If a switch is ever
+    made, this is the function the production OCR path would adopt.
+    """
+    if not ANTHROPIC_API_KEY:
+        raise LLMError(500, "ANTHROPIC_API_KEY not configured")
+
+    model_used = model or model_for(task)
+    payload: dict = {
+        "model": model_used,
+        "max_tokens": max_tokens,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": mime_type or "image/jpeg",
+                            "data": image_b64,
+                        },
+                    },
+                ],
+            }
+        ],
+    }
+    if system is not None:
+        payload["system"] = system
+    body = json.dumps(payload).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=body,
+        headers={
+            "content-type": "application/json",
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": ANTHROPIC_VERSION,
+        },
+        method="POST",
+    )
+
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        usage = data.get("usage") or {}
+        inp, out = usage.get("input_tokens"), usage.get("output_tokens")
+        _log_ai_call(
+            "anthropic", task, model_used, True,
+            prompt_tokens=inp, completion_tokens=out,
+            total_tokens=((inp or 0) + (out or 0)) or None,
+            latency_ms=latency_ms, status=200,
+        )
+        blocks = data.get("content", [])
+        return "\n".join(
+            b.get("text", "") for b in blocks if b.get("type") == "text"
+        ).strip()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:400]
+        _log_ai_call("anthropic", task, model_used, False,
+                     latency_ms=int((time.monotonic() - t0) * 1000),
+                     status=e.code, error=detail)
+        raise LLMError(e.code, detail)
+    except LLMError:
+        raise
+    except Exception as e:  # noqa: BLE001 — transport/JSON errors → uniform LLMError
+        _log_ai_call("anthropic", task, model_used, False,
+                     latency_ms=int((time.monotonic() - t0) * 1000),
+                     status=502, error=str(e))
+        raise LLMError(502, str(e))
