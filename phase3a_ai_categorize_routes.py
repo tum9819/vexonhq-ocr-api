@@ -164,10 +164,11 @@ Examples:
 
 def _call_llm(prompt: str) -> dict:
     """Call OpenAI gpt-4o-mini. Returns dict with category_code, confidence, reason, tokens."""
-    from llm import get_openai
-    client = get_openai()
+    from llm import openai_chat
     try:
-        response = client.chat.completions.create(
+        # Routed through llm.openai_chat for ai_call_log telemetry. Model unchanged.
+        response = openai_chat(
+            "categorize",
             model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": "You are an accountant categorizing Thai restaurant invoices. Return strict JSON."},

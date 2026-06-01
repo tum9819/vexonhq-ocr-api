@@ -49,7 +49,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel
 
-from llm import get_openai  # OpenAI client factory (Step 2 consolidation — no circular dep)
+from llm import get_openai, openai_chat  # OpenAI factory + logged chat wrapper
 
 try:
     from main import (  # type: ignore
@@ -228,11 +228,12 @@ def _upload_slip_to_storage(
 
 def _run_slip_vision(image_bytes: bytes, mime_type: str) -> dict[str, Any]:
     """Send slip image to GPT-4o Vision. Returns parsed JSON dict."""
-    client = get_openai()
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:{mime_type or 'image/jpeg'};base64,{b64}"
 
-    resp = client.chat.completions.create(
+    # Routed through llm.openai_chat for ai_call_log telemetry. Model unchanged.
+    resp = openai_chat(
+        "slip_vision",
         model=OPENAI_VISION_MODEL,
         messages=[
             {

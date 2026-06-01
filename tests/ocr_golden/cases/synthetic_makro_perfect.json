@@ -1,0 +1,31 @@
+{
+  "name": "synthetic_makro_perfect",
+  "note": "SYNTHETIC — fictional vendor/amounts, NOT a real document. Models a clean read where the OCR got everything right.",
+  "expected": {
+    "vendor_name": "บริษัท สยามฟู้ดส์ จำกัด (ตัวอย่าง)",
+    "invoice_no": "INV-DEMO-0001",
+    "bill_date": "2026-05-10",
+    "merchant_tax_id": "0105500000000",
+    "subtotal": 1000.00,
+    "vat": 70.00,
+    "amount": 1070.00,
+    "items": [
+      {"product_name": "เนื้อหมูสามชั้น (ตัวอย่าง)", "qty": 5, "total": 600.00},
+      {"product_name": "ผักกาดขาว (ตัวอย่าง)", "qty": 10, "total": 400.00}
+    ]
+  },
+  "sample_actual": {
+    "vendor_name": "บริษัท สยามฟู้ดส์ จำกัด (ตัวอย่าง)",
+    "invoice_no": "INV-DEMO-0001",
+    "bill_date": "2026-05-10",
+    "merchant_tax_id": "0105500000000",
+    "subtotal": 1000.0,
+    "vat": 70.0,
+    "amount": 1070.0,
+    "items": [
+      {"product_name": "เนื้อหมูสามชั้น (ตัวอย่าง)", "qty": 5, "total": 600.0},
+      {"product_name": "ผักกาดขาว (ตัวอย่าง)", "qty": 10, "total": 400.0}
+    ]
+  },
+  "expected_score": {"field_accuracy": 1.0, "item_f1": 1.0, "overall": 1.0}
+}

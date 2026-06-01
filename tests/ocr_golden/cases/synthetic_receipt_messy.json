@@ -1,0 +1,31 @@
+{
+  "name": "synthetic_receipt_messy",
+  "note": "SYNTHETIC — fictional. Models numbers arriving as comma strings and a vendor with extra whitespace, to exercise the number/text normalizers. All fields should still score as correct.",
+  "expected": {
+    "vendor_name": "ร้านวัตถุดิบ เดโม",
+    "invoice_no": "RC-0099",
+    "bill_date": "2026-04-30",
+    "merchant_tax_id": "1234567890123",
+    "subtotal": 1234.56,
+    "vat": 86.42,
+    "amount": 1320.98,
+    "items": [
+      {"product_name": "พริกแห้ง (ตัวอย่าง)", "qty": 2, "total": 234.56},
+      {"product_name": "น้ำมันพืช (ตัวอย่าง)", "qty": 10, "total": 1000.00}
+    ]
+  },
+  "sample_actual": {
+    "vendor_name": "ร้านวัตถุดิบ  เดโม ",
+    "invoice_no": "RC-0099",
+    "bill_date": "2026-04-30",
+    "merchant_tax_id": "1234567890123",
+    "subtotal": "1,234.56",
+    "vat": "86.42",
+    "amount": "1,320.98 บาท",
+    "items": [
+      {"product_name": "พริกแห้ง (ตัวอย่าง)", "qty": 2, "total": "234.56"},
+      {"product_name": "น้ำมันพืช (ตัวอย่าง)", "qty": 10, "total": "1,000.00"}
+    ]
+  },
+  "expected_score": {"field_accuracy": 1.0, "item_f1": 1.0, "overall": 1.0}
+}

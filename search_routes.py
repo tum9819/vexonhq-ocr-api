@@ -74,9 +74,10 @@ SYSTEM_PROMPT = """คุณช่วยแปลง query ภาษาไทย
 
 def _gpt_parse(q: str) -> dict:
     try:
-        from llm import get_openai
-        client = get_openai()
-        resp = client.chat.completions.create(
+        from llm import openai_chat
+        # Routed through llm.openai_chat for ai_call_log telemetry. Model unchanged.
+        resp = openai_chat(
+            "search_openai",
             model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},

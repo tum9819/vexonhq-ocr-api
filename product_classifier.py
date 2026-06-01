@@ -153,14 +153,6 @@ def classify_items_batch(
             ))
         return result
 
-    # Bring our own client if the caller didn't pass one — easier to import
-    # from main.py without circular dependency.
-    if openai_client is None:
-        # Local import to keep this module standalone for unit tests that
-        # mock the client.
-        from llm import get_openai
-        openai_client = get_openai()
-
     # Mark empty inputs upfront so the model doesn't waste tokens on them.
     sanitized: list[str] = []
     placeholder_idx: set[int] = set()
@@ -181,7 +173,10 @@ def classify_items_batch(
     products = load_products(conn)
     system, user = _build_prompt(products, real_names)
 
-    resp = openai_client.chat.completions.create(
+    # An injected client (unit tests mock it) bypasses telemetry; production
+    # (no injected client) routes through llm.openai_chat so the call lands in
+    # ai_call_log. Model unchanged either way.
+    _create_kwargs = dict(
         model=CLASSIFIER_MODEL,
         response_format={"type": "json_object"},
         messages=[
@@ -190,6 +185,11 @@ def classify_items_batch(
         ],
         temperature=0.0,
     )
+    if openai_client is not None:
+        resp = openai_client.chat.completions.create(**_create_kwargs)
+    else:
+        from llm import openai_chat
+        resp = openai_chat("classify", **_create_kwargs)
 
     raw = resp.choices[0].message.content or "{}"
     try:

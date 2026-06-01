@@ -71,6 +71,7 @@ from rules_routes import router as rules_router
 from slip_routes import router as slip_router
 from loan_routes import router as loan_router
 from store_context_routes import router as store_context_router
+from ai_monitor_routes import router as ai_monitor_router
 from auth_routes import router as auth_router, verify_token
 from alerts_webhook_routes import router as alerts_router
 from discord_routes import router as discord_router
@@ -291,6 +292,7 @@ app.include_router(rules_router)
 app.include_router(slip_router)
 app.include_router(loan_router)
 app.include_router(store_context_router)
+app.include_router(ai_monitor_router)   # /ai/stats + /ai/calls (JWT-gated; audit Monitoring)
 # ============================================================
 # JWT Auth Middleware — protects all routes except public ones
 # NOTE: Must be added BEFORE CORSMiddleware so CORS is outermost.
@@ -1952,12 +1954,14 @@ CRITICAL RULES — read carefully, these errors are common:
 
 def _run_gpt_vision(image_bytes: bytes, mime_type: str, ocr_hint: str) -> dict[str, Any]:
     """Send image to GPT-4 Vision and return parsed JSON."""
-    client = get_openai()
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:{mime_type or 'image/jpeg'};base64,{b64}"
     prompt = VISION_PROMPT.format(ocr_hint=(ocr_hint or "(empty)")[:3000])
 
-    resp = client.chat.completions.create(
+    # Routed through llm.openai_chat so token usage/latency/errors land in
+    # ai_call_log (audit Monitoring remediation). Model unchanged.
+    resp = openai_chat(
+        "vision_ocr",
         model=OPENAI_VISION_MODEL,
         messages=[
             {

@@ -1,0 +1,36 @@
+{
+  "name": "synthetic_beer_partial",
+  "note": "SYNTHETIC — fictional. Models a typical imperfect read: vendor + total right, invoice_no misread, tax id missing, vat off by a lot, one of two items wrong.",
+  "expected": {
+    "vendor_name": "ตัวแทนจำหน่ายเครื่องดื่ม เดโม (ตัวอย่าง)",
+    "invoice_no": "BV-2026-0042",
+    "bill_date": "2026-05-12",
+    "merchant_tax_id": "0107500000001",
+    "subtotal": 2800.00,
+    "vat": 196.00,
+    "amount": 2996.00,
+    "items": [
+      {"product_name": "เบียร์ช้าง ลัง (ตัวอย่าง)", "qty": 4, "total": 1600.00},
+      {"product_name": "โซดา ลัง (ตัวอย่าง)", "qty": 6, "total": 1200.00}
+    ]
+  },
+  "sample_actual": {
+    "vendor_name": "ตัวแทนจำหน่ายเครื่องดื่ม เดโม (ตัวอย่าง)",
+    "invoice_no": "BV-2026-0042 ",
+    "bill_date": "2026-05-12",
+    "merchant_tax_id": null,
+    "subtotal": 2800.0,
+    "vat": 0.0,
+    "amount": 2996.0,
+    "items": [
+      {"product_name": "เบียร์ช้าง ลัง (ตัวอย่าง)", "qty": 4, "total": 1600.0},
+      {"product_name": "โซดา ลัง (ตัวอย่าง)", "qty": 6, "total": 999.0}
+    ]
+  },
+  "expected_score": {
+    "fields": {"vendor_name": true, "invoice_no": true, "bill_date": true, "merchant_tax_id": false, "subtotal": true, "vat": false, "amount": true},
+    "field_accuracy": 0.7143,
+    "item_matched": 1,
+    "item_f1": 0.5
+  }
+}

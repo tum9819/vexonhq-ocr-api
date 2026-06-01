@@ -21,9 +21,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import urllib.error
 import urllib.request
-from typing import Optional
+from typing import Any, Optional
 
 from openai import OpenAI
 
@@ -72,6 +73,43 @@ def model_for(task: str) -> str:
     return MODELS.get(task) or _HAIKU
 
 
+# ── Cost estimation (audit Monitoring remediation, 2026-06-01) ────────────────
+# USD per 1M tokens as (input, output). These are PUBLIC LIST PRICES as of
+# 2026-06-01 and are an ESTIMATE only — override the whole map with the
+# AI_PRICES_JSON env var (JSON: {"model": [in, out], ...}) if rates change.
+_DEFAULT_PRICES: dict[str, tuple[float, float]] = {
+    "gpt-4o":                     (2.50, 10.00),
+    "gpt-4o-mini":                (0.15, 0.60),
+    "claude-haiku-4-5-20251001":  (1.00, 5.00),
+    "claude-haiku-4-5":           (1.00, 5.00),
+}
+
+
+def _load_prices() -> dict[str, tuple[float, float]]:
+    raw = os.environ.get("AI_PRICES_JSON")
+    if not raw:
+        return dict(_DEFAULT_PRICES)
+    try:
+        data = json.loads(raw)
+        return {k: (float(v[0]), float(v[1])) for k, v in data.items()}
+    except Exception:  # noqa: BLE001 — bad override must not break cost calc
+        log.warning("AI_PRICES_JSON is invalid JSON; using default prices")
+        return dict(_DEFAULT_PRICES)
+
+
+PRICES = _load_prices()
+USD_THB = float(os.environ.get("USD_THB", "36.5"))
+
+
+def estimate_cost_thb(
+    model: str, prompt_tokens: Optional[int], completion_tokens: Optional[int]
+) -> float:
+    """Rough ฿ estimate for one call. Returns 0.0 for unknown models. ESTIMATE."""
+    inp, out = PRICES.get(model, (0.0, 0.0))
+    usd = (prompt_tokens or 0) / 1e6 * inp + (completion_tokens or 0) / 1e6 * out
+    return round(usd * USD_THB, 4)
+
+
 # ── OpenAI factory (moved here from main.py; main re-exports for back-compat) ──
 _openai_client: Optional[OpenAI] = None
 
@@ -84,6 +122,63 @@ def get_openai() -> OpenAI:
             raise RuntimeError("OPENAI_API_KEY must be set")
         _openai_client = OpenAI(api_key=OPENAI_API_KEY)
     return _openai_client
+
+
+# ── AI call telemetry (audit Monitoring remediation, 2026-06-01) ──────────────
+# Every OpenAI + Anthropic call writes one best-effort row to public.ai_call_log.
+# This is the ONE place that reverses the original "no cost-tracking" decision.
+# Logging is best-effort: it swallows ALL of its own errors so instrumentation
+# can never break an AI call or a user request (mirrors cron_heartbeat).
+
+
+def _log_conn():
+    """Open a Postgres connection for telemetry. Lazy import of main keeps
+    llm.py free of a module-load dependency on main (no circular import);
+    falls back to a direct psycopg2 connection in test/standalone contexts."""
+    try:
+        from main import get_db_conn  # type: ignore
+        return get_db_conn()
+    except Exception:
+        import psycopg2
+        return psycopg2.connect(os.environ["DATABASE_URL"])
+
+
+def _log_ai_call(
+    provider: str,
+    task: str,
+    model: str,
+    ok: bool,
+    *,
+    prompt_tokens: Optional[int] = None,
+    completion_tokens: Optional[int] = None,
+    total_tokens: Optional[int] = None,
+    latency_ms: Optional[int] = None,
+    status: Optional[int] = None,
+    error: Optional[str] = None,
+) -> None:
+    """Best-effort insert into public.ai_call_log. Never raises."""
+    try:
+        conn = _log_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO public.ai_call_log
+                        (provider, task, model, ok, prompt_tokens,
+                         completion_tokens, total_tokens, latency_ms, status, error)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        provider, task, model, ok, prompt_tokens,
+                        completion_tokens, total_tokens, latency_ms, status,
+                        (error or None) and str(error)[:500],
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 — telemetry must never break the AI call
+        log.warning("ai_call_log insert failed (provider=%s task=%s)", provider, task)
 
 
 # ── Anthropic transport ───────────────────────────────────────────────────────
@@ -126,8 +221,9 @@ def call_anthropic(
     if not ANTHROPIC_API_KEY:
         raise LLMError(500, "ANTHROPIC_API_KEY not configured")
 
+    model_used = model or model_for(task)
     payload: dict = {
-        "model": model or model_for(task),
+        "model": model_used,
         "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": user}],
     }
@@ -146,17 +242,77 @@ def call_anthropic(
         method="POST",
     )
 
+    t0 = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        usage = data.get("usage") or {}
+        inp, out = usage.get("input_tokens"), usage.get("output_tokens")
+        _log_ai_call(
+            "anthropic", task, model_used, True,
+            prompt_tokens=inp, completion_tokens=out,
+            total_tokens=((inp or 0) + (out or 0)) or None,
+            latency_ms=latency_ms, status=200,
+        )
         blocks = data.get("content", [])
         return "\n".join(
             b.get("text", "") for b in blocks if b.get("type") == "text"
         ).strip()
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:400]
+        _log_ai_call("anthropic", task, model_used, False,
+                     latency_ms=int((time.monotonic() - t0) * 1000),
+                     status=e.code, error=detail)
         raise LLMError(e.code, detail)
     except LLMError:
         raise
     except Exception as e:  # noqa: BLE001 — transport/JSON errors → uniform LLMError
+        _log_ai_call("anthropic", task, model_used, False,
+                     latency_ms=int((time.monotonic() - t0) * 1000),
+                     status=502, error=str(e))
         raise LLMError(502, str(e))
+
+
+def openai_chat(
+    task: str,
+    *,
+    messages: list,
+    model: Optional[str] = None,
+    **kwargs: Any,
+):
+    """
+    Central OpenAI Chat Completions caller — the single place every OpenAI call
+    flows through so usage/latency/errors land in public.ai_call_log.
+
+    ``task`` selects the model from :data:`MODELS` unless ``model`` overrides it
+    (call sites pass their existing model explicitly, so the model used never
+    changes — ``task`` is only the telemetry label). Extra kwargs
+    (``response_format``, ``temperature``, ``max_tokens``, ...) pass straight to
+    ``chat.completions.create``. Returns the RAW response object unchanged, so
+    callers keep reading ``resp.choices[0].message.content``. Logging is
+    best-effort; a logging failure never affects the returned response. On an
+    API error it logs ok=False and re-raises the original exception.
+    """
+    client = get_openai()
+    model_used = model or model_for(task)
+    t0 = time.monotonic()
+    try:
+        resp = client.chat.completions.create(
+            model=model_used, messages=messages, **kwargs
+        )
+    except Exception as e:  # noqa: BLE001 — log then re-raise unchanged
+        _log_ai_call("openai", task, model_used, False,
+                     latency_ms=int((time.monotonic() - t0) * 1000),
+                     status=getattr(e, "status_code", None), error=str(e))
+        raise
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    u = getattr(resp, "usage", None)
+    _log_ai_call(
+        "openai", task, model_used, True,
+        prompt_tokens=getattr(u, "prompt_tokens", None),
+        completion_tokens=getattr(u, "completion_tokens", None),
+        total_tokens=getattr(u, "total_tokens", None),
+        latency_ms=latency_ms, status=200,
+    )
+    return resp

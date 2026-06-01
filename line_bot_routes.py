@@ -290,13 +290,14 @@ def _classify_image_type(image_bytes: bytes) -> str:
     use case.
     """
     try:
-        from main import get_openai
+        from llm import openai_chat
         import base64 as _b64
 
-        client = get_openai()
         b64 = _b64.b64encode(image_bytes).decode("utf-8")
         data_url = f"data:image/jpeg;base64,{b64}"
-        resp = client.chat.completions.create(
+        # Routed through llm.openai_chat for ai_call_log telemetry. Model unchanged.
+        resp = openai_chat(
+            "line_image_classify",
             model="gpt-4o-mini",
             messages=[
                 {

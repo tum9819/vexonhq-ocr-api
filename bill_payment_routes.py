@@ -323,12 +323,13 @@ def bills_payment_line_alert():
 # ─────────────────────────────────────────────────────────
 
 def _call_gpt_vision_for_slip(image_bytes: bytes, mime: str) -> dict:
-    """Send slip image to GPT Vision and return extracted fields."""
-    import urllib.request, urllib.error, json as _json
+    """Send slip image to GPT Vision and return extracted fields.
 
-    openai_key = os.environ.get("OPENAI_API_KEY", "")
-    if not openai_key:
-        raise RuntimeError("OPENAI_API_KEY not set")
+    Routed through llm.openai_chat (was a raw urllib call — audit F10) so the
+    call is logged in ai_call_log and the OpenAI key/model are centralised.
+    Model unchanged (OPENAI_VISION_MODEL, default gpt-4o)."""
+    import json as _json
+    from llm import openai_chat
 
     b64 = base64.b64encode(image_bytes).decode()
     data_url = f"data:{mime};base64,{b64}"
@@ -344,10 +345,11 @@ def _call_gpt_vision_for_slip(image_bytes: bytes, mime: str) -> dict:
         "ถ้าไม่แน่ใจค่าไหนให้ใส่ null"
     )
 
-    body = {
-        "model": os.environ.get("OPENAI_VISION_MODEL", "gpt-4o"),
-        "max_tokens": 300,
-        "messages": [
+    resp = openai_chat(
+        "bill_slip_vision",
+        model=os.environ.get("OPENAI_VISION_MODEL", "gpt-4o"),
+        max_tokens=300,
+        messages=[
             {
                 "role": "user",
                 "content": [
@@ -356,24 +358,9 @@ def _call_gpt_vision_for_slip(image_bytes: bytes, mime: str) -> dict:
                 ],
             }
         ],
-    }
-
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=_json.dumps(body).encode(),
-        headers={
-            "Authorization": f"Bearer {openai_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = _json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"OpenAI API error: {e.code} {e.read()[:200]}")
 
-    raw_text = result["choices"][0]["message"]["content"].strip()
+    raw_text = (resp.choices[0].message.content or "").strip()
     # Strip markdown code fences if present
     if raw_text.startswith("```"):
         raw_text = raw_text.split("```")[1]
