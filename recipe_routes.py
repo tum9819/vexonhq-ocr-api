@@ -32,6 +32,8 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+import pricing  # pure selling-price calculator (round_price/compute_channel/compute_reverse)
+
 try:
     from main import get_db_conn  # type: ignore
 except ImportError:
@@ -45,6 +47,23 @@ ingredient_router = APIRouter(prefix="/ingredients", tags=["ingredients"])
 
 
 # ── Pydantic Models ──────────────────────────────────────────
+
+# Selling Price Calculator (RestoSheet gap #15) — map logical channel -> recipes column
+_CH_PRICE_COL = {"dine_in": "selling_price", "takeaway": "price_takeaway", "delivery": "price_delivery"}
+
+
+class ChannelPriceUpdate(BaseModel):
+    dine_in: Optional[float] = None
+    takeaway: Optional[float] = None
+    delivery: Optional[float] = None
+
+
+class PricingChannelRow(BaseModel):
+    channel: str
+    label: Optional[str] = None
+    packaging_cost: Optional[float] = None
+    commission_pct: Optional[float] = None
+
 
 class IngredientCreate(BaseModel):
     name: str
@@ -889,6 +908,135 @@ def delete_recipe(recipe_id: str):
                 raise HTTPException(404, "Recipe not found")
         conn.commit()
         return {"status": "deleted"}
+    finally:
+        conn.close()
+
+
+# ── Selling Price Calculator (RestoSheet gap #15) ────────────
+# Two-segment static path "/pricing/channels" does not collide with the
+# single-segment "/{recipe_id}" route, so declaration order is irrelevant.
+
+@router.get("/pricing/channels")
+def get_pricing_channels():
+    """Channel config: packaging cost + platform commission per channel."""
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT channel, label, packaging_cost, commission_pct, sort_order
+                FROM public.pricing_channels
+                ORDER BY sort_order
+            """)
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+            for r in rows:
+                r["packaging_cost"] = float(r["packaging_cost"] or 0)
+                r["commission_pct"] = float(r["commission_pct"] or 0)
+        return {"channels": rows}
+    finally:
+        conn.close()
+
+
+@router.put("/pricing/channels")
+def update_pricing_channels(body: List[PricingChannelRow]):
+    """Upsert-by-update channel config rows (label/packaging/commission)."""
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            for row in body:
+                fields = {k: v for k, v in row.dict().items()
+                          if k != "channel" and v is not None}
+                if not fields:
+                    continue
+                set_clause = ", ".join(f"{k} = %s" for k in fields)
+                cur.execute(
+                    f"UPDATE public.pricing_channels SET {set_clause}, updated_at = NOW() "
+                    f"WHERE channel = %s",
+                    list(fields.values()) + [row.channel],
+                )
+        conn.commit()
+        return {"status": "updated"}
+    finally:
+        conn.close()
+
+
+@router.get("/{recipe_id}/pricing")
+def get_recipe_pricing(recipe_id: str, target_pct: float, mode: str = "cost",
+                       rounding: str = "9"):
+    """Forward calc: target cost%/GP% -> suggested price + net GP after commission, per channel."""
+    if mode not in ("cost", "gp"):
+        raise HTTPException(400, "mode must be 'cost' or 'gp'")
+    if rounding not in ("9", "0", "5", "none"):
+        raise HTTPException(400, "rounding must be one of '9','0','5','none'")
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT name, selling_price, price_takeaway, price_delivery "
+                "FROM public.recipes WHERE id = %s",
+                (recipe_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "Recipe not found")
+            name, p_dine, p_take, p_del = row
+            current = {"dine_in": p_dine, "takeaway": p_take, "delivery": p_del}
+
+            cost_data = _calc_cost(cur, recipe_id)
+            food_cost = cost_data["total_cost"]
+
+            cur.execute("""
+                SELECT channel, label, packaging_cost, commission_pct
+                FROM public.pricing_channels
+                ORDER BY sort_order
+            """)
+            channels = []
+            for channel, label, packaging, commission in cur.fetchall():
+                try:
+                    calc = pricing.compute_channel(
+                        food_cost, packaging, commission, target_pct, mode, rounding)
+                except ValueError as e:
+                    raise HTTPException(400, str(e))
+                cur_price = current.get(channel)
+                channels.append({
+                    "channel": channel,
+                    "label": label,
+                    "packaging_cost": float(packaging or 0),
+                    "commission_pct": float(commission or 0),
+                    **calc,
+                    "current_price": float(cur_price) if cur_price is not None else None,
+                })
+        return {
+            "recipe_id": recipe_id,
+            "recipe_name": name,
+            "food_cost": food_cost,
+            "cost_incomplete": cost_data["cost_incomplete"],
+            "missing_price_count": cost_data["missing_price_count"],
+            "target": {"mode": mode, "pct": target_pct, "rounding": rounding},
+            "channels": channels,
+        }
+    finally:
+        conn.close()
+
+
+@router.put("/{recipe_id}/prices")
+def update_recipe_prices(recipe_id: str, body: ChannelPriceUpdate):
+    """Write per-channel prices back (dine_in->selling_price, takeaway/delivery cols)."""
+    updates = {_CH_PRICE_COL[k]: v for k, v in body.dict().items() if v is not None}
+    if not updates:
+        raise HTTPException(400, "No prices to update")
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            set_clause = ", ".join(f"{c} = %s" for c in updates)
+            cur.execute(
+                f"UPDATE public.recipes SET {set_clause}, updated_at = NOW() WHERE id = %s",
+                list(updates.values()) + [recipe_id],
+            )
+            if cur.rowcount == 0:
+                raise HTTPException(404, "Recipe not found")
+        conn.commit()
+        return {"status": "updated", "updated": list(updates.keys())}
     finally:
         conn.close()
 
