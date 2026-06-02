@@ -1,9 +1,41 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-06-02 (Session 52 — Supabase transaction pooler fix)
+**Last updated**: 2026-06-03 (A+ remediation round 1 — B+ → A-)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
+
+---
+
+## 🟢 2026-06-03 — A+ remediation round 1 shipped (grade B+ → A-)
+
+Context: independent full-system audit (2026-06-02, 6 parallel auditors + live read-only prod tests + Supabase advisors) returned 52 findings (2 Critical, 9 High, 19 Medium, 18 Low, 4 Info), overall grade **B+**. No active data leak found; all Session-47/49/50 fixes still hold; P&L/accounting core trustworthy. Report: `VEXONHQ_System_Audit_2026-06-02.html`. (Audit OPS-2 was a self-corrected false positive — the backup.py :5432→:6543 pooler rewrite is INTENTIONAL/correct; downgraded to Low.)
+
+This round was implemented + verified + pushed by Claude Code under a TUM-approved relaxation **scoped to the A+ plan only** (the firm "Antigravity writes all code" rule still applies to every other task). Smoke 70/70, deploy settled each time, independent adversarial re-review = 0 regressions, live-tested. Grade moved **B+ → A-**.
+
+### ✅ Backend items shipped to prod + verified this round
+- **SEC-1/AI-1 (Critical) — `/ai/exec` hardened.** `secrets.compare_digest` (constant-time key check) + removed `shell=True` (whitelisted cmds run as argv lists; docker-restart resolved in Python, no shell pipe) + timeout message 10s→30s. Kept on `PUBLIC_PATHS` so ai.marastation.com chat keeps working. Commit `6e98a57`. Verified live: bad-key → HTTP 401.
+- **OPS-1/DR (Critical) — backup + DR tooling.** Full pre-fix backup taken + verified (83 tables / 56,798 rows + 276 storage files / 268.7 MB; CSV row counts == manifest). DR tooling committed incl. off-host → Google Drive wrapper (`mara_backup_to_gdrive.ps1`, db daily / full weekly). Commit `d6d7832`. **Pending TUM:** add a Windows Task Scheduler entry to run it automatically.
+- **AI-2 (High) — anomaly detection.** Replaced mean/stddev z-score with robust median(p50)+percentile-spread; `MIN_SAMPLE_FOR_BASELINE` 3→8. Commit `bd36076`. Advisory-only (no financial-number impact).
+- **OPS-3 (High) — cron resilience.** `BackgroundScheduler` `job_defaults` `misfire_grace_time=3600` + `coalesce=True` (a missed run fires on recovery instead of being dropped). Commit `bd36076`. Verified: 9 cron jobs healthy.
+- **OCR-3 (High) — Vision API cost cap.** 25 MB upload cap + 40-page PDF cap (bounds GPT-4o credit-burn). Commit `bd36076`.
+- **AI-8 (Info) — P&L narrative warning.** Append an in-message warning to the LINE digest when a baht figure fails verification (was log-only). Commit `bd36076`.
+- **PNL-1 (Medium) — budget actuals match P&L.** `v_budget_status` repointed FROM `v_daybook` → `v_daybook_pnl` so budget "actual spend" matches the cash-basis P&L/exports. Applied as a Supabase DB migration (`apply_migration`). Verified: view returns valid rows. Reversible.
+- (Frontend, for cross-ref) FE-5 `/pos/compare` stale API fallback `'https://api.vexonhq.com'` → `''` and FE-1 `/budgets` EmptyState dead link `/settings` → `/categories` — VEXONHQ commit `1f727da`, lint/tsc/build green, zero-downtime deploy.
+
+### Rollback (one-command revert)
+Tags: `backup-pre-dr-tooling-2026-06-03`, `backup-pre-aiexec-2026-06-03`, `backup-pre-backendbatch2-2026-06-03` (vexonhq-ocr-api); `backup-pre-fe-2026-06-03` (VEXONHQ). Plus data backup `backups/mara-backup-20260602_171525`. Remediation report: `VEXONHQ_Remediation_Report_2026-06-03.html`.
+
+### 👉 NEXT priorities — DEFERRED BACKEND A+ items (to reach full A+)
+All specced in **`HANDOFF_AUDIT_FIXES.md`**. Deliberately NOT done unattended — each needs TUM's decision or risks breaking core flows that smoke can't verify.
+1. **SEC-1b — `/ai/exec` lockdown.** Remove from `PUBLIC_PATHS` + add JWT/IP (needs ai.marastation.com chat auth coordination).
+2. **OCR-1 — confirm-gating.** Touches the daily bill-confirm flow.
+3. **OCR-2 — cross-vendor invoice merge guard.** Changes financial-record matching.
+4. **SEC-2 — enable RLS on `web.*` schema.** Could cut off marastation-web's DB role → break the customer site.
+5. **SEC-3 — auth token → HttpOnly cookie.** Login risk.
+6. **OPS-12 — pin `requirements.txt` versions.** Wrong pin breaks the build.
+7. **OPS-4 — add `postgresql-client`/`pg_dump` to the image.**
+8. **DB drops** — 4 leftover backup tables + 3 duplicate `vendor_bills` indexes.
 
 ---
 
