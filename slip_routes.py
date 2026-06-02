@@ -92,6 +92,18 @@ def _sign_uploads_url(url):
         return url
 
 
+def _parse_storage_url(url: str) -> tuple[str, str]:
+    """Parse bucket and path from a Supabase storage public URL.
+    Returns (bucket, path) or raises ValueError if unparseable."""
+    if "/object/public/" not in url:
+        raise ValueError(f"URL is not a public storage URL: {url}")
+    after = url.split("/object/public/", 1)[1]
+    bucket, _, path = after.partition("/")
+    if not bucket or not path:
+        raise ValueError(f"Unparseable storage URL: {url}")
+    return bucket, path
+
+
 def _current_username(request: Request) -> Optional[str]:
     """Read JWT subject stamped by main.py middleware."""
     return getattr(request.state, "username", None)
@@ -838,144 +850,155 @@ async def slip_upload(file: UploadFile = File(...), request: Request = None):
     except Exception:
         log.exception("storage upload failed (continuing without raw_image_url)")
 
-    # ── 2) GPT-4o Vision OCR ──
     try:
-        parsed = await asyncio.to_thread(_run_slip_vision, contents, mime)
-    except Exception as e:
-        log.exception("slip vision failed")
-        raise HTTPException(500, f"slip vision OCR failed: {e}")
+        # ── 2) GPT-4o Vision OCR ──
+        try:
+            parsed = await asyncio.to_thread(_run_slip_vision, contents, mime)
+        except Exception as e:
+            log.exception("slip vision failed")
+            raise HTTPException(500, f"slip vision OCR failed: {e}")
 
-    # ── 3) Basic validation — every slip MUST have date + amount ──
-    transfer_date_raw = parsed.get("transfer_date")
-    amount_raw        = parsed.get("amount")
-    if not transfer_date_raw or amount_raw is None:
-        raise HTTPException(
-            422,
-            f"OCR could not extract transfer_date or amount from slip "
-            f"(got date={transfer_date_raw!r}, amount={amount_raw!r}). "
-            f"Try a clearer screenshot.",
-        )
-    try:
-        transfer_date_iso = datetime.strptime(transfer_date_raw[:10], "%Y-%m-%d").date()
-    except ValueError:
-        raise HTTPException(422, f"OCR returned invalid date {transfer_date_raw!r}")
-
-    try:
-        amount = float(amount_raw)
-    except (TypeError, ValueError):
-        raise HTTPException(422, f"OCR returned invalid amount {amount_raw!r}")
-
-    fee = parsed.get("fee")
-    try:
-        fee = float(fee) if fee is not None else 0.0
-    except (TypeError, ValueError):
-        fee = 0.0
-
-    transfer_time = parsed.get("transfer_time")
-    if transfer_time and len(transfer_time) == 5:  # HH:MM
-        transfer_time = transfer_time + ":00"
-
-    # ── 4) Classify memo → canonical SKU ──
-    conn = get_db_conn()
-    try:
-        # ── 4a) Duplicate check before insert. If TUM sent the same screenshot
-        #    twice (web + LINE, accidental re-send, etc.) we want to return
-        #    the existing slip rather than create a second row that fights
-        #    over the same statement.
-        existing_id = _find_duplicate_slip(
-            conn,
-            transfer_date_iso,
-            amount,
-            parsed.get("ref_no"),
-            parsed.get("recipient_name"),
-        )
-        if existing_id:
-            log.info("slip upload duplicate detected — returning existing id=%s", existing_id)
-            # F11 (anti-tamper): a bank ref_no is globally unique per transaction, so if
-            # this duplicate was caught by a matching ref_no but the UPLOADED amount differs
-            # from the stored one, the slip image may have been edited. Surface a loud warning
-            # instead of silently de-duping (the original stored slip is kept either way).
-            tamper = None
-            new_ref = (parsed.get("ref_no") or "").strip()
-            if new_ref:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT amount, ref_no FROM public.slips WHERE id = %s", (existing_id,))
-                    erow = cur.fetchone()
-                if erow:
-                    tamper = _slip_tamper_signal(erow[0], erow[1], new_ref, amount)
-                    if tamper:
-                        log.warning("slip TAMPER signal: ref_no=%s stored=%.2f uploaded=%.2f",
-                                    new_ref, tamper["existing_amount"], tamper["uploaded_amount"])
-            message = "สลิปนี้มีในระบบแล้ว — ไม่ได้บันทึกซ้ำ"
-            if tamper:
-                message = (
-                    f"*** เตือน: เลขอ้างอิงเดียวกัน (ref {new_ref}) แต่ยอดไม่ตรง — "
-                    f"ในระบบ {tamper['existing_amount']:,.2f} แต่ที่อัปมา {amount:,.2f} บาท "
-                    f"อาจเป็นสลิปที่ถูกแก้ตัวเลข กรุณาตรวจสอบก่อนใช้"
-                )
-            return {
-                "success":        True,
-                "slip_id":        existing_id,
-                "parsed":         parsed,
-                "preview_url":    _sign_uploads_url(image_url),
-                "duplicate":      True,
-                "tamper_warning": bool(tamper),
-                "tamper":         tamper,
-                "message":        message,
-                "match":          {"status": "duplicate", "existing_slip_id": existing_id},
-            }
-
-        sku, conf = _classify_memo(conn, parsed.get("memo"))
-
-        # ── 5) Insert into slips ──
-        new_id = str(uuid.uuid4())
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO public.slips
-                    (id, transfer_date, transfer_time, amount, fee,
-                     sender_name, sender_account, sender_bank,
-                     recipient_name, recipient_account, recipient_bank,
-                     memo, ref_no, raw_image_url, ocr_json,
-                     canonical_sku, canonical_confidence,
-                     source, created_by, updated_by)
-                VALUES
-                    (%s, %s, %s, %s, %s,
-                     %s, %s, %s,
-                     %s, %s, %s,
-                     %s, %s, %s, %s::jsonb,
-                     %s, %s,
-                     %s, %s, %s)
-                """,
-                (
-                    new_id,
-                    transfer_date_iso,
-                    transfer_time,
-                    amount,
-                    fee,
-                    parsed.get("sender_name"),
-                    parsed.get("sender_account"),
-                    parsed.get("sender_bank"),
-                    parsed.get("recipient_name"),
-                    parsed.get("recipient_account"),
-                    parsed.get("recipient_bank"),
-                    parsed.get("memo"),
-                    parsed.get("ref_no"),
-                    image_url,
-                    json.dumps(parsed, ensure_ascii=False),
-                    sku,
-                    conf if conf > 0 else None,
-                    "web",
-                    actor,
-                    actor,
-                ),
+        # ── 3) Basic validation — every slip MUST have date + amount ──
+        transfer_date_raw = parsed.get("transfer_date")
+        amount_raw        = parsed.get("amount")
+        if not transfer_date_raw or amount_raw is None:
+            raise HTTPException(
+                422,
+                f"OCR could not extract transfer_date or amount from slip "
+                f"(got date={transfer_date_raw!r}, amount={amount_raw!r}). "
+                f"Try a clearer screenshot.",
             )
-        conn.commit()
+        try:
+            transfer_date_iso = datetime.strptime(transfer_date_raw[:10], "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(422, f"OCR returned invalid date {transfer_date_raw!r}")
+
+        try:
+            amount = float(amount_raw)
+        except (TypeError, ValueError):
+            raise HTTPException(422, f"OCR returned invalid amount {amount_raw!r}")
+
+        fee = parsed.get("fee")
+        try:
+            fee = float(fee) if fee is not None else 0.0
+        except (TypeError, ValueError):
+            fee = 0.0
+
+        transfer_time = parsed.get("transfer_time")
+        if transfer_time and len(transfer_time) == 5:  # HH:MM
+            transfer_time = transfer_time + ":00"
+
+        # ── 4) Classify memo → canonical SKU ──
+        conn = get_db_conn()
+        try:
+            # ── 4a) Duplicate check before insert. If TUM sent the same screenshot
+            #    twice (web + LINE, accidental re-send, etc.) we want to return
+            #    the existing slip rather than create a second row that fights
+            #    over the same statement.
+            existing_id = _find_duplicate_slip(
+                conn,
+                transfer_date_iso,
+                amount,
+                parsed.get("ref_no"),
+                parsed.get("recipient_name"),
+            )
+            if existing_id:
+                log.info("slip upload duplicate detected — returning existing id=%s", existing_id)
+                # F11 (anti-tamper): a bank ref_no is globally unique per transaction, so if
+                # this duplicate was caught by a matching ref_no but the UPLOADED amount differs
+                # from the stored one, the slip image may have been edited. Surface a loud warning
+                # instead of silently de-duping (the original stored slip is kept either way).
+                tamper = None
+                new_ref = (parsed.get("ref_no") or "").strip()
+                if new_ref:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT amount, ref_no FROM public.slips WHERE id = %s", (existing_id,))
+                        erow = cur.fetchone()
+                    if erow:
+                        tamper = _slip_tamper_signal(erow[0], erow[1], new_ref, amount)
+                        if tamper:
+                            log.warning("slip TAMPER signal: ref_no=%s stored=%.2f uploaded=%.2f",
+                                        new_ref, tamper["existing_amount"], tamper["uploaded_amount"])
+                message = "สลิปนี้มีในระบบแล้ว — ไม่ได้บันทึกซ้ำ"
+                if tamper:
+                    message = (
+                        f"*** เตือน: เลขอ้างอิงเดียวกัน (ref {new_ref}) แต่ยอดไม่ตรง — "
+                        f"ในระบบ {tamper['existing_amount']:,.2f} แต่ที่อัปมา {amount:,.2f} บาท "
+                        f"อาจเป็นสลิปที่ถูกแก้ตัวเลข กรุณาตรวจสอบก่อนใช้"
+                    )
+                return {
+                    "success":        True,
+                    "slip_id":        existing_id,
+                    "parsed":         parsed,
+                    "preview_url":    _sign_uploads_url(image_url),
+                    "duplicate":      True,
+                    "tamper_warning": bool(tamper),
+                    "tamper":         tamper,
+                    "message":        message,
+                    "match":          {"status": "duplicate", "existing_slip_id": existing_id},
+                }
+
+            sku, conf = _classify_memo(conn, parsed.get("memo"))
+
+            # ── 5) Insert into slips ──
+            new_id = str(uuid.uuid4())
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO public.slips
+                        (id, transfer_date, transfer_time, amount, fee,
+                         sender_name, sender_account, sender_bank,
+                         recipient_name, recipient_account, recipient_bank,
+                         memo, ref_no, raw_image_url, ocr_json,
+                         canonical_sku, canonical_confidence,
+                         source, created_by, updated_by)
+                    VALUES
+                        (%s, %s, %s, %s, %s,
+                         %s, %s, %s,
+                         %s, %s, %s,
+                         %s, %s, %s, %s::jsonb,
+                         %s, %s,
+                         %s, %s, %s)
+                    """,
+                    (
+                        new_id,
+                        transfer_date_iso,
+                        transfer_time,
+                        amount,
+                        fee,
+                        parsed.get("sender_name"),
+                        parsed.get("sender_account"),
+                        parsed.get("sender_bank"),
+                        parsed.get("recipient_name"),
+                        parsed.get("recipient_account"),
+                        parsed.get("recipient_bank"),
+                        parsed.get("memo"),
+                        parsed.get("ref_no"),
+                        image_url,
+                        json.dumps(parsed, ensure_ascii=False),
+                        sku,
+                        conf if conf > 0 else None,
+                        "web",
+                        actor,
+                        actor,
+                    ),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
     except Exception:
-        conn.rollback()
+        if image_url:
+            try:
+                bucket, path = _parse_storage_url(image_url)
+                sb = get_supabase()
+                sb.storage.from_(bucket).remove([path])
+                log.info("Cleaned up orphaned slip storage file: bucket=%s, path=%s", bucket, path)
+            except Exception as cleanup_err:
+                log.warning("Failed to clean up orphaned slip storage file %s: %s", image_url, cleanup_err)
         raise
-    finally:
-        conn.close()
 
     # ── 6) Run 3-way matcher ──
     try:
@@ -1305,10 +1328,26 @@ def delete_slip(slip_id: str, request: Request, _admin: dict = Depends(_require_
     actor = _current_username(request)
     conn = get_db_conn()
     try:
+        raw_image_url = None
+        with conn.cursor() as cur:
+            cur.execute("SELECT raw_image_url FROM public.slips WHERE id = %s", (slip_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "slip not found")
+            raw_image_url = row[0]
+
+        # Cleanup storage file if present
+        if raw_image_url:
+            try:
+                bucket, path = _parse_storage_url(raw_image_url)
+                sb = get_supabase()
+                sb.storage.from_(bucket).remove([path])
+                log.info("Deleted slip storage object: bucket=%s, path=%s", bucket, path)
+            except Exception as e:
+                log.warning("Failed to delete slip storage object for slip_id %s (proceeding with row delete): %s", slip_id, e)
+
         with conn.cursor() as cur:
             cur.execute("DELETE FROM public.slips WHERE id = %s", (slip_id,))
-            if cur.rowcount == 0:
-                raise HTTPException(404, "slip not found")
         conn.commit()
     except HTTPException:
         raise

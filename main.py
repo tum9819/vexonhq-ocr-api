@@ -746,8 +746,9 @@ def _process_single_image(
 
     # 4) Upload to Supabase Storage
     file_url = None
+    storage_path = None
     try:
-        file_url, _ = _upload_to_storage(image_bytes, file_name, mime_type)
+        file_url, storage_path = _upload_to_storage(image_bytes, file_name, mime_type)
     except Exception:
         log.exception("storage upload failed (continuing without file_url)")
 
@@ -762,6 +763,13 @@ def _process_single_image(
         )
     except Exception as e:
         log.exception("db save failed")
+        if storage_path:
+            try:
+                sb = get_supabase()
+                sb.storage.from_(SUPABASE_STORAGE_BUCKET).remove([storage_path])
+                log.info("Cleaned up orphaned invoice storage file: bucket=%s, path=%s", SUPABASE_STORAGE_BUCKET, storage_path)
+            except Exception as cleanup_err:
+                log.warning("Failed to clean up orphaned invoice storage file %s: %s", storage_path, cleanup_err)
         raise HTTPException(500, f"db save failed: {e}")
 
     # 6) Revalidate against the merged state so warnings stay accurate
