@@ -56,7 +56,7 @@ WHERE table_schema='public' AND table_name='<table>' ORDER BY ordinal_position;
 3. **Test หลายรอบ**: `ast.parse` per file → `pytest` if tests exist → `.\verify.ps1` → local `uvicorn` endpoint probe with `Invoke-WebRequest`
 4. **Confirm**: all green before claiming ready
 5. **ขออนุมัติ TUM**: show the diff + commit message (HEREDOC) + Coolify env-var instructions if needed, and ask for approval
-6. **Claude push (หลัง Confirm)**: Claude runs `git push` → Coolify auto-deploys ~20-30s → Claude verifies + reports
+6. **Claude push (หลัง Confirm)**: Claude runs `git push` → Coolify auto-deploys ~20-30s → Claude **verifies the rebuild finished cleanly EVERY TIME** before reporting: `/health` 200 + `/health/deep` healthy **and** the shared-VPS CPU is back to normal (`cpu_pct` from `/health/deep`). The 3 apps share the 4GB VPS, so any push rebuilds and spikes CPU — re-check until it settles, don't report "done" while a build is still running. *(Clean-rebuild check added 2026-06-02 per TUM.)*
 
 ---
 

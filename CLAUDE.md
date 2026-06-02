@@ -191,7 +191,7 @@ curl http://localhost:8000/health
 2. `git diff` — review what changed (must be small + focused)
 3. Hand the diff + commit message to TUM in PowerShell-paste form (TUM commits + pushes)
 4. Coolify watches `tum9819/vexonhq-ocr-api` on `main` and auto-deploys via Webhook (Nixpacks, ~20-30s)
-5. After deploy: `curl https://api.marastation.com/health` should return 200
+5. After deploy: verify the rebuild finished cleanly EVERY push — `curl https://api.marastation.com/health` → 200 AND `/health/deep` healthy with `cpu_pct` back to normal (the shared 4GB VPS spikes during rebuild; re-check until it settles before reporting done). *(Added 2026-06-02 per TUM.)*
 
 If auto-deploy doesn't trigger, manual: Coolify dashboard → `vexonhq-ocr-api` → Deploy button.
 
