@@ -397,6 +397,10 @@ def generate_narrative(
         f"{'─' * 28}\n\n"
     )
     full_message = header + narrative
+    # AI-8: if any baht figure in the prose failed verification, warn the reader
+    # in-message (not just in the logs) so an LLM-invented number is never shown unflagged.
+    if not verification["ok"]:
+        full_message += "\n\n⚠️ ตัวเลขบางตัวในสรุปอาจไม่ตรงข้อมูลจริง โปรดยึดตัวเลขสรุปด้านบนเป็นหลัก"
 
     # Send to LINE
     if send_line:

@@ -666,6 +666,9 @@ async def invoice_upload(file: UploadFile = File(...)):
     contents = await file.read()
     if not contents:
         raise HTTPException(400, "empty file")
+    # OCR-3: cap upload size to bound GPT-4o vision credit-burn from oversized files.
+    if len(contents) > 25 * 1024 * 1024:
+        raise HTTPException(413, "file too large (max 25 MB)")
 
     # Heavy work (PDF render + GPT Vision OCR + Supabase save) is CPU/IO-blocking and
     # would freeze the async event loop for the entire upload — health checks then time
@@ -692,6 +695,10 @@ def _process_upload(contents: bytes, filename: str, content_type: str) -> dict[s
 
         if not page_images:
             raise HTTPException(400, "pdf has no readable pages")
+        # OCR-3: cap pages — each page = one GPT-4o vision call; an accidental
+        # huge PDF would otherwise fan out unbounded paid calls.
+        if len(page_images) > 40:
+            raise HTTPException(413, f"PDF has too many pages ({len(page_images)}, max 40)")
 
         log.info("processing PDF '%s' with %d page(s)", filename, len(page_images))
 

@@ -46,7 +46,7 @@ except ImportError:
 logger = logging.getLogger("phase3a_anomaly")
 router = APIRouter(tags=["phase3a-anomaly"])
 
-MIN_SAMPLE_FOR_BASELINE = 3
+MIN_SAMPLE_FOR_BASELINE = 8   # raised from 3: stddev/spread is unreliable below ~8 samples (audit AI-2)
 ZSCORE_LOW = 1.5
 ZSCORE_MEDIUM = 2.0
 ZSCORE_HIGH = 3.0
@@ -84,14 +84,25 @@ def _parse_uuid(value: Any, field_name: str = "id") -> UUID:
         raise HTTPException(400, f"Invalid UUID for {field_name}: {value!r}")
 
 
-def _classify_severity(zscore: float, bill_amount: float, p99: Optional[float]) -> Optional[str]:
-    """Returns severity label or None if not anomalous."""
-    abs_z = abs(zscore)
-    if abs_z >= ZSCORE_HIGH:
+def _robust_zscore(amount: float, stddev: float, p50: float, p95: float) -> float:
+    """Median-anchored z-score using a percentile-derived spread (audit AI-2).
+    Expense amounts are right-skewed, so mean/stddev z-scores both miss real
+    outliers and cry wolf. Anchor on the median (p50) and estimate the spread
+    from the median->p95 gap (p95 ~= 1.645 sigma for a normal tail); fall back to
+    stddev only if the percentile spread is unavailable."""
+    spread = (p95 - p50) / 1.645 if (p95 and p95 > p50) else stddev
+    if not spread:
+        return 0.0
+    return (amount - p50) / spread
+
+
+def _classify_severity(robust_z: float, bill_amount: float,
+                       p95: Optional[float], p99: Optional[float]) -> Optional[str]:
+    """Severity from the robust z-score plus hard percentile gates. None if normal."""
+    abs_z = abs(robust_z)
+    if (p99 is not None and bill_amount > float(p99)) or abs_z >= ZSCORE_HIGH:
         return "high"
-    if p99 is not None and bill_amount > float(p99):
-        return "high"
-    if abs_z >= ZSCORE_MEDIUM:
+    if (p95 is not None and bill_amount > float(p95)) or abs_z >= ZSCORE_MEDIUM:
         return "medium"
     if abs_z >= ZSCORE_LOW:
         return "low"
@@ -165,7 +176,7 @@ def _scan_one_bill(cur, bill: dict, baselines: dict[str, dict]) -> Optional[dict
         }
 
     b = baselines.get(cat)
-    if not b or b["stddev"] == 0:
+    if not b:
         return None
 
     amount = float(bill["amount"])
@@ -173,10 +184,10 @@ def _scan_one_bill(cur, bill: dict, baselines: dict[str, dict]) -> Optional[dict
         return None
 
     mean, stddev, p50, p95, p99 = b["mean"], b["stddev"], b["p50"], b["p95"], b["p99"]
-    zscore = (amount - mean) / stddev if stddev else 0.0
+    zscore = _robust_zscore(amount, stddev, p50, p95)
 
-    anomaly_type = "amount_high" if amount > mean else "amount_low"
-    severity = _classify_severity(zscore, amount, p99)
+    anomaly_type = "amount_high" if amount >= p50 else "amount_low"
+    severity = _classify_severity(zscore, amount, p95, p99)
     if severity is None:
         return None
 

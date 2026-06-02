@@ -933,7 +933,12 @@ def _scheduled_weekly_summary():
 
 
 # Start scheduler when module loads (FastAPI startup)
-_scheduler = BackgroundScheduler(timezone="Asia/Bangkok")
+_scheduler = BackgroundScheduler(
+    timezone="Asia/Bangkok",
+    # OPS-3: a missed run (e.g. container restart during the job's minute) still
+    # fires once on recovery within the grace window, instead of being silently dropped.
+    job_defaults={"misfire_grace_time": 3600, "coalesce": True},
+)
 _scheduler.add_job(
     _scheduled_daily_digest,
     trigger="cron",
