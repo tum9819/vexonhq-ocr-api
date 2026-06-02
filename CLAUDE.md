@@ -19,8 +19,8 @@ Language: respond in Thai mixed with English, technical when needed. Keep things
    - *Commit*: produce a small focused commit message and hand the diff to TUM to push
 2. **Ask questions first** — when requirements are ambiguous (edge cases, UX, technical tradeoffs), ask before writing the spec. Don't guess.
 3. **Fix root cause. Never suppress errors. Never skip tests.** When something fails, explain *why* before fixing.
-4. **TUM pushes to GitHub.** Claude can stage files, edit, run tests, run pytest, run black/ruff, and commit locally — but **stop before `git push`** and hand the diff to TUM with the exact PowerShell commands.
-5. **Backup tag + local CI before every handoff.** Before sending TUM a `git push` command, ALWAYS:
+4. **Push flow (updated 2026-06-02): Claude pushes after TUM confirms.** Claude stages files, edits, runs tests/pytest/black/ruff, and commits locally, then shows TUM the diff + commit message and asks approval. After TUM confirms, **Claude runs `git push` itself**, then verifies + reports. Never push without an explicit Confirm for that push. *(Was: "TUM pushes to GitHub; stop before git push".)*
+5. **Backup tag + local CI before every handoff.** Before pushing to `main` (after TUM's Confirm), ALWAYS:
    (a) Tag `origin/main` as a rollback target: `git fetch origin && git tag backup-pre-<descriptor>-YYYY-MM-DD origin/main && git push origin <tag>` — gives TUM one-command revert (`git reset --hard <tag>`) if the push regresses.
    (b) Run the full local check suite: `python -c "import ast; ast.parse(open(file, encoding='utf-8').read())"` on every touched .py file, plus `pytest tests/` if tests exist, plus a live endpoint probe (`Invoke-WebRequest` against staging or local uvicorn) when the change touches a route.
    (c) State plainly in the handoff what was verified — e.g. "Backup tagged as `backup-pre-X-YYYY-MM-DD`, ast.parse + endpoint probe passed, ready to push." Never silently skip a step.
@@ -307,7 +307,7 @@ The frontend repo also has all docs under `Documents\Claude\Projects\MaraStation
 ## Session protocol (when wrapping a coding session)
 
 End-of-session checklist (also in `docs/END_OF_SESSION_CHECKLIST.md`):
-1. PowerShell `git status` clean → `git push origin main` (TUM does this)
+1. PowerShell `git status` clean → after TUM Confirm, Claude runs `git push origin main`
 2. Verify both Coolify apps Running
 3. DigitalOcean Droplet snapshot (manual, name like `vexonhq-<phase>-YYYY-MM-DD`)
 4. Update `CHANGELOG.md`, `DAILY_LOG_*.md`, `TOMORROW.md`, `ROADMAP.md` as needed

@@ -49,14 +49,14 @@ WHERE table_schema='public' AND table_name='<table>' ORDER BY ordinal_position;
 
 ## The 6-step workflow (mandatory)
 
-**Backup → แก้ไข → Test หลายรอบ → Confirm → แจ้ง TUM → TUM up GitHub**
+**Backup → แก้ไข → Test หลายรอบ → Confirm → ขออนุมัติ → Claude push → Verify + Report**
 
 1. **Backup**: prepare `git tag backup-pre-<X>-YYYY-MM-DD origin/main` command
 2. **Edit**: minimal-diff; new files first, then edit existing
 3. **Test หลายรอบ**: `ast.parse` per file → `pytest` if tests exist → `.\verify.ps1` → local `uvicorn` endpoint probe with `Invoke-WebRequest`
 4. **Confirm**: all green before claiming ready
-5. **แจ้ง TUM**: single PowerShell-paste block with `git add/commit/push` (HEREDOC) + Coolify env-var instructions if needed
-6. **TUM up GitHub**: TUM pastes → Coolify auto-deploys ~20-30s
+5. **ขออนุมัติ TUM**: show the diff + commit message (HEREDOC) + Coolify env-var instructions if needed, and ask for approval
+6. **Claude push (หลัง Confirm)**: Claude runs `git push` → Coolify auto-deploys ~20-30s → Claude verifies + reports
 
 ---
 
@@ -71,7 +71,7 @@ Run this **before** drafting the step-5 paste block — it is part of the task d
 
 2. **Update `AGENTS.md`** (this file) **only when an agent-relevant change occurred** — new rule, new pitfall, new infra detail. Append a bullet to the relevant existing section; date the addition in the commit message body.
 
-3. **Push to GitHub** — TUM pushes from his own PowerShell. Claude prepares the paste block (no `Co-Authored-By:` trailer). **Claude never pushes** unless TUM explicitly grants permission for that turn.
+3. **Push to GitHub** — Claude composes the commit (no `Co-Authored-By:` trailer), shows TUM the diff + message, and asks approval. **After TUM confirms, Claude runs `git push` itself**, then verifies + reports. Do NOT push without an explicit Confirm for that push. *(Updated 2026-06-02: was "TUM pushes from his own PowerShell; Claude never pushes".)*
 
 **Why this exists:** The next Claude session loads `AGENTS.md` + `CLAUDE.md` + auto-memory first; skipping doc updates makes the new session start with stale context.
 
@@ -97,7 +97,7 @@ Run this **before** drafting the step-5 paste block — it is part of the task d
 - Modifying `_ADMIN_USERNAMES` logic or `_get_role()` in `auth_routes.py` — affects all user access
 
 ### 🚫 Never do
-- `git push` — TUM pushes from his own PowerShell, always
+- `git push` **without TUM's Confirm** — Claude may push only after showing the diff + commit and getting TUM's approval for that push (updated 2026-06-02; previously "TUM pushes always")
 - `except: pass` or `except Exception: pass` — log + re-raise or `log.exception()`
 - Hallucinated SQL columns: NEVER `net_price`, `b.status`, `b.branch`, `staff`, `r.menu_name`, `ri.quantity` — see `CLAUDE.md` cheat sheet for verified columns
 - `git reset --hard`, `git checkout HEAD -- .` reflexively
