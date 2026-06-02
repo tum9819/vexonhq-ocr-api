@@ -1,9 +1,35 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-05-31 (Session 50 — loan tracking เงินยืม Phase 1)
+**Last updated**: 2026-06-02 (Session 52 — Supabase transaction pooler fix)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
+
+---
+
+## 🟢 Session 52 (2026-06-02) — Supabase transaction pooler fix (:6543 + autocommit + retry)
+
+### ✅ Applied/Fixed in code this session (awaiting TUM push + Coolify deploy)
+- Fixed the database connection in `scripts/backup.py` to route through port `6543` (Transaction Pooler) instead of `5432` to avoid pool saturation.
+- Added `autocommit=True` to the psycopg2 connection options immediately upon initialization to satisfy PgBouncer transaction mode for COPY streams.
+- Implemented a resilient connection retry helper `connect_with_retry(url)` supporting up to 3 attempts on `psycopg2.OperationalError` with a 5-second sleep in between.
+- Verified the fix end-to-end with a live dry-run (`python scripts/backup.py --skip-storage`), successfully backing up all 83 base tables (56,793 rows) cleanly.
+
+---
+
+## 🟢 Session 51 (2026-06-02) — Added --skip-storage / --db-only flag to backup tool
+
+### ✅ Applied/Fixed in code this session (awaiting TUM push + Coolify deploy)
+- Added command-line argument `--skip-storage` (and its alias `--db-only`) to `scripts/backup.py` using Python's `argparse`.
+- Modified environment variable validation to conditionally check S3 storage configuration (`SUPABASE_URL`, `SUPABASE_S3_ACCESS_KEY_ID`, `SUPABASE_S3_SECRET_ACCESS_KEY`) only when `--skip-storage` is NOT set.
+- Bypassed the `perform_storage_backup` step when `--skip-storage` is set, returning `num_files = 0` and `total_bytes = 0` for logs/summary prints.
+- Updated `manifest.json` generation inside `perform_db_backup` to accept `skip_storage` argument and record `"storage_skipped": true` and `"storage_files": 0` when set.
+- Added automatic update of `manifest.json` at the end of the full backup to include real S3 stats (`"storage_skipped": false`, `"storage_files": num_files`, `"storage_bytes": total_bytes`).
+- Verified code syntax check using `ast.parse` and repository compile-check via `.\verify.ps1`. Both passed cleanly.
+
+### 👉 NEXT for TUM / Daily Cron
+- Configure the daily cron backup to pass `--skip-storage` (or `--db-only`) to perform lightweight database-only backups.
+- Keep the weekly backup running in full mode (without `--skip-storage`) to continue backing up all Supabase storage buckets.
 
 ---
 
