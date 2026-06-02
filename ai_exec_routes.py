@@ -27,6 +27,8 @@ docker rm, pipes, redirects.
 
 import logging
 import os
+import secrets
+import shlex
 import subprocess
 import time
 from collections import defaultdict
@@ -91,7 +93,7 @@ def exec_command(body: ExecRequest, request: Request) -> ExecResponse:
     # 1. API key auth
     api_key = request.headers.get("X-AI-Exec-Key", "")
     expected = os.environ.get("AI_EXEC_SECRET", "")
-    if not expected or api_key != expected:
+    if not expected or not secrets.compare_digest(api_key, expected):
         raise HTTPException(status_code=401, detail="Invalid or missing X-AI-Exec-Key")
 
     # 2. Rate limit (per client IP)
@@ -104,23 +106,37 @@ def exec_command(body: ExecRequest, request: Request) -> ExecResponse:
         log.warning("[AI-EXEC] REJECTED cmd=%r ip=%s", cmd, client_ip)
         raise HTTPException(status_code=403, detail=f"Command not in whitelist: {cmd!r}")
 
-    # 4. Translate friendly restart names → actual Coolify container UUID
-    # Coolify names containers "<app-uuid>-<build-id>"; use --filter name= to
-    # match by UUID prefix, which stays stable across deploys.
-    if cmd in COOLIFY_RESTART_MAP:
-        uuid = COOLIFY_RESTART_MAP[cmd]
-        cmd = f"docker ps -q --filter name={uuid} | xargs -r docker restart"
-
-    # 5. Execute
+    # 4 + 5. Execute WITHOUT a shell (no shell invocation -> no shell-injection surface).
+    # Whitelisted commands are split into an argv list. The docker-restart case is
+    # resolved in Python (find container ids by name filter, then restart) instead
+    # of a shell pipe, so even a future whitelist mistake cannot reach a shell.
     ts = datetime.utcnow().isoformat(timespec="seconds")
     try:
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        if cmd in COOLIFY_RESTART_MAP:
+            uuid = COOLIFY_RESTART_MAP[cmd]
+            ps = subprocess.run(
+                ["docker", "ps", "-q", "--filter", f"name={uuid}"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            ids = ps.stdout.split()
+            if not ids:
+                log.warning("[AI-EXEC] %s no container matched name=%s ip=%s", ts, uuid, client_ip)
+                return ExecResponse(stdout="", stderr=f"no running container matches {uuid}", exit_code=1)
+            result = subprocess.run(
+                ["docker", "restart", *ids],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        else:
+            result = subprocess.run(
+                shlex.split(cmd),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
         log.info("[AI-EXEC] %s cmd=%r exit=%d ip=%s", ts, cmd, result.returncode, client_ip)
         return ExecResponse(
             stdout=result.stdout,
@@ -129,4 +145,4 @@ def exec_command(body: ExecRequest, request: Request) -> ExecResponse:
         )
     except subprocess.TimeoutExpired:
         log.error("[AI-EXEC] %s TIMEOUT cmd=%r ip=%s", ts, cmd, client_ip)
-        raise HTTPException(status_code=504, detail="Command timed out after 10s")
+        raise HTTPException(status_code=504, detail="Command timed out after 30s")
