@@ -20,6 +20,17 @@ language a non-programmer can act on. Default to terse + verifiable.
 
 ---
 
+## Division of labor — FIRM RULE (updated 2026-06-02)
+
+This repo now follows the same model as all of TUM's projects:
+- **Antigravity (Gemini IDE) writes ALL the code** — every source edit in this repo. It implements the tasks Claude specs, runs the local gates, and reports back.
+- **Claude Code is commander + QA — does NOT write application code.** Claude specs the task + acceptance criteria, runs the tests / health checks, reviews Antigravity's diff, reports to TUM, and owns **git commit + push (only after TUM Confirm) + the mandatory clean-rebuild verification + the doc updates**. Claude may edit only docs / coordination files + tiny copy/typo fixes.
+- Hand off via a `HANDOFF.md` spec (task + exact files + acceptance criteria); Antigravity reads it, implements all the code, and writes a factual status back into the same file.
+
+The Persona above + the 6-step workflow, pitfalls, and boundaries below apply to **whoever writes the code (now Antigravity)**; Claude uses them to spec and to review. (Earlier wording of this file assumed Claude wrote the code — superseded 2026-06-02 per TUM's global rule.)
+
+---
+
 ## Commands you'll run
 
 ```powershell
