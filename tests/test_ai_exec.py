@@ -4,6 +4,7 @@ Also tests health_monitor.py parsers via mocked subprocess output.
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 import types
 import unittest
@@ -92,6 +93,26 @@ class TestRateLimiter(unittest.TestCase):
             self.mod._check_rate_limit("10.0.0.1")
         # Different IP should still be allowed
         self.mod._check_rate_limit("10.0.0.2")  # should not raise
+
+
+class TestIPAllowList(unittest.TestCase):
+    """SEC-1b: optional AI_EXEC_ALLOWED_IPS source-IP allow-list."""
+    def setUp(self):
+        self.mod = _load_exec_module()
+
+    def test_no_env_allows_any_ip(self):
+        os.environ.pop("AI_EXEC_ALLOWED_IPS", None)
+        self.mod._check_ip_allowed("9.9.9.9")  # unset -> no restriction, must not raise
+
+    def test_allowed_ip_passes(self):
+        with patch.dict(os.environ, {"AI_EXEC_ALLOWED_IPS": "1.2.3.4, 5.6.7.8"}):
+            self.mod._check_ip_allowed("5.6.7.8")  # must not raise
+
+    def test_disallowed_ip_blocked_403(self):
+        with patch.dict(os.environ, {"AI_EXEC_ALLOWED_IPS": "1.2.3.4"}):
+            with self.assertRaises(_FakeHTTPException) as ctx:
+                self.mod._check_ip_allowed("9.9.9.9")
+            self.assertEqual(ctx.exception.status_code, 403)
 
 
 class TestExecValidation(unittest.TestCase):

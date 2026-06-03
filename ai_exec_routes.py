@@ -74,6 +74,17 @@ def _check_rate_limit(ip: str) -> None:
     _rate_buckets[ip].append(now)
 
 
+def _check_ip_allowed(ip: str) -> None:
+    """SEC-1b: optional IP allow-list. If AI_EXEC_ALLOWED_IPS is set (comma-
+    separated) ONLY those source IPs may call /ai/exec; unset -> no IP restriction
+    (key auth still required). Defense-in-depth so the owner can lock the endpoint
+    to the marastation-ai egress IP with just an env var — no code change."""
+    allowed = [a.strip() for a in os.environ.get("AI_EXEC_ALLOWED_IPS", "").split(",") if a.strip()]
+    if allowed and ip not in allowed:
+        log.warning("[AI-EXEC] REJECTED ip=%s not in AI_EXEC_ALLOWED_IPS", ip)
+        raise HTTPException(status_code=403, detail="Source IP not allowed")
+
+
 # ── Request / Response models ──────────────────────────────────────────
 
 class ExecRequest(BaseModel):
@@ -90,6 +101,11 @@ class ExecResponse(BaseModel):
 
 @router.post("/exec", response_model=ExecResponse)
 def exec_command(body: ExecRequest, request: Request) -> ExecResponse:
+    client_ip = request.client.host if request.client else "unknown"
+
+    # 0. SEC-1b: optional IP allow-list (defense-in-depth on top of the key auth)
+    _check_ip_allowed(client_ip)
+
     # 1. API key auth
     api_key = request.headers.get("X-AI-Exec-Key", "")
     expected = os.environ.get("AI_EXEC_SECRET", "")
@@ -97,7 +113,6 @@ def exec_command(body: ExecRequest, request: Request) -> ExecResponse:
         raise HTTPException(status_code=401, detail="Invalid or missing X-AI-Exec-Key")
 
     # 2. Rate limit (per client IP)
-    client_ip = request.client.host if request.client else "unknown"
     _check_rate_limit(client_ip)
 
     # 3. Whitelist check
