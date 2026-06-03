@@ -253,6 +253,7 @@ def scan_anomalies(limit: int = Query(500, ge=1, le=2000)):
                    FROM public.vendor_bills
                    WHERE review_status = 'confirmed'
                      AND amount IS NOT NULL AND amount > 0
+                     AND id NOT IN (SELECT bill_id FROM public.bill_anomalies)
                    ORDER BY created_at DESC
                    LIMIT %s""",
                 (limit,),

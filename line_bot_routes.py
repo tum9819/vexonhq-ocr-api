@@ -1710,6 +1710,73 @@ except Exception as e:
     log.error("Failed to register nightly_slip_reconcile job: %s", e)
 
 
+# Phase 3B (Session 56): Scheduled AI cashflow categorization — daily 02:00 BKK
+@_heartbeat("ai_cashflow_categorize", expected_interval_hours=24)
+def _scheduled_ai_cashflow_categorize():
+    """APScheduler job: AI cashflow categorize batch daily at 02:00 Bangkok time."""
+    log.info("Scheduled AI cashflow categorization running")
+    try:
+        from phase3a_ai_categorize_routes import categorize_cashflow_batch
+        res = categorize_cashflow_batch(limit=50, allow_llm=True)
+        log.info(
+            "AI cashflow categorization completed: processed=%s, by_tier=%s, cost_usd=%s, errors=%s",
+            res.get("processed"),
+            res.get("by_tier"),
+            res.get("total_cost_usd"),
+            len(res.get("errors", [])),
+        )
+    except Exception as e:
+        log.error("Scheduled AI cashflow categorization FAILED: %s", e)
+        raise  # let @_heartbeat record the failure
+
+
+try:
+    _scheduler.add_job(
+        _scheduled_ai_cashflow_categorize,
+        trigger="cron",
+        hour=2,
+        minute=0,
+        id="ai_cashflow_categorize",
+        replace_existing=True,
+    )
+    log.info("AI cashflow categorize scheduler started — fires daily 02:00 Asia/Bangkok")
+except Exception as e:
+    log.error("Failed to register ai_cashflow_categorize job: %s", e)
+
+
+# Phase 3A-2 (Session 56): Scheduled AI bill anomaly scan — daily 03:00 BKK
+@_heartbeat("ai_anomaly_scan", expected_interval_hours=24)
+def _scheduled_ai_anomaly_scan():
+    """APScheduler job: AI bill anomaly scan daily at 03:00 Bangkok time."""
+    log.info("Scheduled AI anomaly scan running")
+    try:
+        from phase3a_anomaly_routes import scan_anomalies
+        res = scan_anomalies(limit=500)
+        log.info(
+            "AI anomaly scan completed: scanned=%s, alerts_created=%s, by_severity=%s",
+            res.get("scanned"),
+            res.get("alerts_created"),
+            res.get("by_severity"),
+        )
+    except Exception as e:
+        log.error("Scheduled AI anomaly scan FAILED: %s", e)
+        raise  # let @_heartbeat record the failure
+
+
+try:
+    _scheduler.add_job(
+        _scheduled_ai_anomaly_scan,
+        trigger="cron",
+        hour=3,
+        minute=0,
+        id="ai_anomaly_scan",
+        replace_existing=True,
+    )
+    log.info("AI anomaly scan scheduler started — fires daily 03:00 Asia/Bangkok")
+except Exception as e:
+    log.error("Failed to register ai_anomaly_scan job: %s", e)
+
+
 # Option A + LINE Alert (2026-05-27): VPS health monitor every 15 min.
 # Checks disk, RAM, containers, API health — fires LINE alert on issue.
 try:
