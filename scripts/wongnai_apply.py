@@ -40,6 +40,29 @@ def serialize_db_val(val):
         return str(val)
     return val
 
+
+def enable_rls_on_table(cur, table_name: str) -> None:
+    """
+    Enforce Row Level Security (RLS) on a table in the public schema immediately after creation.
+    This ensures that the 'anon' role gets nothing by default, while 'service_role' and bypassrls
+    roles remain unaffected and can access the table normally.
+    
+    CRITICAL RULE: Every public table created dynamically or via tooling must have RLS enabled.
+    """
+    # Normalize to public schema if not specified
+    if "." not in table_name:
+        full_table_name = f"public.{table_name}"
+    else:
+        full_table_name = table_name
+
+    # Only apply to public schema tables
+    if full_table_name.startswith("public."):
+        clean_name = full_table_name.replace("public.", "")
+        # Quote table name to handle case sensitivity and special characters safely
+        sql = f'ALTER TABLE public."{clean_name}" ENABLE ROW LEVEL SECURITY;'
+        print(f"[RLS GUARD] Enabling Row Level Security on {full_table_name}")
+        cur.execute(sql)
+
 def clean_thai_name(name):
     """
     Cleans name by:

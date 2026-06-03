@@ -7,6 +7,46 @@ import argparse
 import subprocess
 import json
 import traceback
+import urllib.request
+import urllib.error
+
+def send_discord_alert(message: str):
+    webhook_url = os.environ.get("DISCORD_OPS_WEBHOOK_URL")
+    if not webhook_url:
+        # Try loading env first if not populated
+        if os.path.exists(".env"):
+            try:
+                with open(".env", "r", encoding="utf-8-sig") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, val = line.split("=", 1)
+                            if k.strip() == "DISCORD_OPS_WEBHOOK_URL":
+                                webhook_url = val.strip().strip("'\"")
+                                break
+            except Exception:
+                pass
+    if not webhook_url:
+        print("WARNING: DISCORD_OPS_WEBHOOK_URL not set, cannot send Discord alert.", file=sys.stderr)
+        return
+    
+    payload = {"content": message[:1900]}
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        webhook_url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "VEXONHQ-OpsBot (vexonhq.com, 1.0)",
+        },
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if not (200 <= resp.status < 300):
+                print(f"WARNING: Discord returned status {resp.status}", file=sys.stderr)
+    except Exception as err:
+        print(f"WARNING: Failed to send Discord alert: {err}", file=sys.stderr)
 
 # Try importing the required third-party libraries early to fail fast
 try:
@@ -14,7 +54,9 @@ try:
     import boto3
     from botocore.exceptions import BotoCoreError, ClientError
 except ImportError as e:
-    print(f"CRITICAL: Required dependencies not found. Please install psycopg2 and boto3. Error: {e}", file=sys.stderr)
+    msg = f"❌ **DR Backup Alert (ImportError)**\nRequired dependencies not found. Please install psycopg2 and boto3.\nError: {e}"
+    print(f"CRITICAL: {msg}", file=sys.stderr)
+    send_discord_alert(msg)
     sys.exit(1)
 
 
@@ -33,6 +75,50 @@ def load_env(env_path=".env"):
                 val = val.strip().strip("'\"")
                 if key and key not in os.environ:
                     os.environ[key] = val
+
+
+def record_backup_heartbeat(database_url: str, ok: bool, error_message: str | None = None):
+    try:
+        conn = psycopg2.connect(database_url)
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            if ok:
+                cur.execute(
+                    """
+                    INSERT INTO public.job_heartbeat
+                        (job_id, last_run_at, last_success_at, run_count,
+                         expected_interval_hours)
+                    VALUES ('dr_backup', NOW(), NOW(), 1, 24)
+                    ON CONFLICT (job_id) DO UPDATE
+                    SET last_run_at              = NOW(),
+                        last_success_at          = NOW(),
+                        run_count                = job_heartbeat.run_count + 1,
+                        expected_interval_hours  = 24,
+                        updated_at               = NOW()
+                    """
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO public.job_heartbeat
+                        (job_id, last_run_at, last_error_at,
+                         last_error_message, run_count, error_count,
+                         expected_interval_hours)
+                    VALUES ('dr_backup', NOW(), NOW(), %s, 1, 1, 24)
+                    ON CONFLICT (job_id) DO UPDATE
+                    SET last_run_at              = NOW(),
+                        last_error_at            = NOW(),
+                        last_error_message       = EXCLUDED.last_error_message,
+                        run_count                = job_heartbeat.run_count + 1,
+                        error_count              = job_heartbeat.error_count + 1,
+                        expected_interval_hours  = 24,
+                        updated_at               = NOW()
+                    """,
+                    ((error_message or "")[:500],)
+                )
+        conn.close()
+    except Exception as e:
+        print(f"WARNING: failed to record heartbeat for dr_backup: {e}", file=sys.stderr)
 
 
 def obfuscate_db_url(url: str) -> str:
@@ -341,10 +427,11 @@ def main():
             missing_vars.append("SUPABASE_S3_SECRET_ACCESS_KEY")
         
     if missing_vars:
-        print(f"CRITICAL: Missing environment variables: {', '.join(missing_vars)}", file=sys.stderr)
-        print("Please check your .env file or environment configuration.", file=sys.stderr)
+        msg = f"❌ **DR Backup Alert (ConfigError)**\nMissing environment variables: {', '.join(missing_vars)}\nPlease check your .env file or environment configuration."
+        print(msg, file=sys.stderr)
+        send_discord_alert(msg)
         sys.exit(1)
-        
+
     # Generate unique output timestamp folder
     timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
     backup_folder_name = f"mara-backup-{timestamp}"
@@ -400,12 +487,24 @@ def main():
         print(f"Total Storage Bytes:   {total_bytes} bytes ({total_bytes / (1024 * 1024):.2f} MB)")
         print(f"Absolute Output Path:  {output_path}")
         print("=" * 60)
+
+        # Record success heartbeat
+        record_backup_heartbeat(database_url, ok=True)
         
     except Exception as e:
         print("\n" + "=" * 60, file=sys.stderr)
         print("BACKUP FAILED!", file=sys.stderr)
         print("=" * 60, file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
+        
+        # Record failure heartbeat
+        if database_url:
+            record_backup_heartbeat(database_url, ok=False, error_message=str(e))
+            
+        # Send Discord alert
+        err_msg = f"❌ **DR Backup Alert (RuntimeError)**\nBackup script failed with error:\n`{e}`"
+        send_discord_alert(err_msg)
+        
         # Clean up output directory on failure to preserve idempotence and cleanliness if folder is empty or partial
         # Actually, let's keep the error directory or clean it up if it has partially written data?
         # Standard DR practice: keep the directory for debugging or clean it to avoid corrupted/incomplete backups.

@@ -56,9 +56,32 @@ try {
     $sizeMB = [math]::Round((Get-Item $zip).Length / 1MB, 1)
     "OK  $ts  mode=$Mode  ->  $zip  ($sizeMB MB)" | Out-File -FilePath $log -Append -Encoding utf8
     Write-Output "OK mode=$Mode -> $zip ($sizeMB MB)"
+
+    $webhook = $env:DISCORD_OPS_WEBHOOK_URL
+    if ($webhook) {
+        $msg = "✅ **DR Backup Success**`nMode: $Mode`nFile: $zip ($sizeMB MB)`nAge: 0 minutes"
+        $body = @{ content = $msg } | ConvertTo-Json
+        try {
+            Invoke-RestMethod -Uri $webhook -Method Post -ContentType "application/json; charset=utf-8" -Body $body -UserAgent "VEXONHQ-OpsBot (vexonhq.com, 1.0)" | Out-Null
+        } catch {
+            Write-Warning "Failed to send Discord notification: $_"
+        }
+    }
 }
 catch {
-    "FAILED  $ts  mode=$Mode  :  $_" | Out-File -FilePath $log -Append -Encoding utf8
-    Write-Output "FAILED mode=$Mode : $_"
+    $errStr = $_.ToString()
+    "FAILED  $ts  mode=$Mode  :  $errStr" | Out-File -FilePath $log -Append -Encoding utf8
+    Write-Output "FAILED mode=$Mode : $errStr"
+
+    $webhook = $env:DISCORD_OPS_WEBHOOK_URL
+    if ($webhook) {
+        $msg = "❌ **DR Backup Failed (Wrapper)**`nMode: $Mode`nError: $errStr"
+        $body = @{ content = $msg } | ConvertTo-Json
+        try {
+            Invoke-RestMethod -Uri $webhook -Method Post -ContentType "application/json; charset=utf-8" -Body $body -UserAgent "VEXONHQ-OpsBot (vexonhq.com, 1.0)" | Out-Null
+        } catch {
+            Write-Warning "Failed to send Discord notification: $_"
+        }
+    }
     exit 1
 }
