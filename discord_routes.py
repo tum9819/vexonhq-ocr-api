@@ -245,6 +245,14 @@ async def discord_interaction(
     ):
         raise HTTPException(401, "Invalid request signature")
 
+    # SEC-4: reject replays. Discord signs (timestamp + body); a captured valid
+    # payload could otherwise be replayed indefinitely. Require it to be recent.
+    try:
+        if abs(time.time() - int(timestamp)) > 300:
+            raise HTTPException(401, "Stale request (timestamp outside 5-minute window)")
+    except (ValueError, TypeError):
+        raise HTTPException(401, "Invalid request timestamp")
+
     try:
         payload = json.loads(raw_body.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):

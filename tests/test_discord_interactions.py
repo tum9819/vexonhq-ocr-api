@@ -28,6 +28,7 @@ from __future__ import annotations
 import importlib
 import json
 import sys
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -83,8 +84,11 @@ def app_with_router(monkeypatch, keypair):
     return app
 
 
-def _sign_body(sk: SigningKey, body: bytes, timestamp: str = "0") -> dict:
-    """Return signed headers for a Discord-style POST body."""
+def _sign_body(sk: SigningKey, body: bytes, timestamp: str | None = None) -> dict:
+    """Return signed headers for a Discord-style POST body.
+    Defaults to the current timestamp so the SEC-4 replay-freshness check (<=5min) passes."""
+    if timestamp is None:
+        timestamp = str(int(time.time()))
     message = timestamp.encode("utf-8") + body
     sig = sk.sign(message).signature.hex()
     return {

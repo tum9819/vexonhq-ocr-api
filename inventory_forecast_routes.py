@@ -176,6 +176,12 @@ def inventory_forecast(
 
         urgency = _urgency(days_since, avg_interval)
 
+        # AI-5: with <2 orders in the window the interval/next-date are guesses, not
+        # data — surface "insufficient_data" instead of a fabricated cadence.
+        insufficient = order_count < 2
+        if insufficient:
+            urgency = "unknown"
+
         forecasts.append({
             "vendor_name":       r["vendor_name"],
             "category_name":     r["category_name"],
@@ -188,15 +194,16 @@ def inventory_forecast(
             "avg_interval_days": round(avg_interval, 0),
             "min_interval_days": min_interval,
             "max_interval_days": max_interval,
-            "next_order_est":    next_order_est.isoformat(),
-            "days_until_order":  days_until,
+            "next_order_est":    None if insufficient else next_order_est.isoformat(),
+            "days_until_order":  None if insufficient else days_until,
             "urgency":           urgency,
             "urgency_label":     _urgency_label(urgency),
+            "insufficient_data": insufficient,
         })
 
     # Sort: overdue first → urgent → soon → ok
     urgency_order = {"overdue": 0, "urgent": 1, "soon": 2, "ok": 3, "unknown": 4}
-    forecasts.sort(key=lambda x: (urgency_order.get(x["urgency"], 4), x["days_until_order"]))
+    forecasts.sort(key=lambda x: (urgency_order.get(x["urgency"], 4), x["days_until_order"] if x["days_until_order"] is not None else 99999))
 
     overdue_count = sum(1 for f in forecasts if f["urgency"] == "overdue")
     urgent_count  = sum(1 for f in forecasts if f["urgency"] == "urgent")

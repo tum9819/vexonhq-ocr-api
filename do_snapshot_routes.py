@@ -31,7 +31,7 @@ Env vars (gracefully no-op if missing):
   DO_API_TOKEN            DigitalOcean Personal Access Token (read+write).
                           Create at cloud.digitalocean.com/account/api/tokens.
                           Scopes needed: droplet:read, droplet:create,
-                          image:read, image:delete.
+                          image:create, image:read, image:delete.
   DO_DROPLET_NAME         default "vexonhq-core" — name of the droplet
                           we snapshot (must match exactly).
   DO_SNAPSHOT_PREFIX      default "vexonhq-auto-" — auto-rotated
@@ -67,7 +67,10 @@ DO_API_TOKEN = os.environ.get("DO_API_TOKEN", "")
 DO_DROPLET_NAME = os.environ.get("DO_DROPLET_NAME", "vexonhq-core")
 DO_SNAPSHOT_PREFIX = os.environ.get("DO_SNAPSHOT_PREFIX", "vexonhq-auto-")
 try:
-    DO_SNAPSHOT_MAX_KEEP = max(1, int(os.environ.get("DO_SNAPSHOT_MAX_KEEP", "1")))
+    # OPS-8: default 2 (one failed create never leaves zero snapshots). NOTE: a DO
+    # droplet snapshot backs up the APP SERVER, NOT the Supabase DB (that lives in
+    # Supabase) -> the DB is covered only by scripts/backup.py, not this.
+    DO_SNAPSHOT_MAX_KEEP = max(1, int(os.environ.get("DO_SNAPSHOT_MAX_KEEP", "2")))
 except ValueError:
     DO_SNAPSHOT_MAX_KEEP = 1
 

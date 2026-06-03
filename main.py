@@ -520,13 +520,16 @@ def health_deep(background_tasks: BackgroundTasks):
     # 4) VPS resource usage (psutil — zero I/O, ~1ms)
     try:
         ram = psutil.virtual_memory()
+        disk = psutil.disk_usage("/")  # OPS-6: surface disk so an external monitor catches a full disk before outage
         checks["resources"] = {
             "ram_pct": round(ram.percent, 1),
             "cpu_pct": round(psutil.cpu_percent(interval=0.1), 1),
             "ram_warn": ram.percent >= 70,
+            "disk_pct": round(disk.percent, 1),
+            "disk_warn": disk.percent >= 80,
         }
     except Exception:
-        checks["resources"] = {"ram_pct": None, "cpu_pct": None, "ram_warn": False}
+        checks["resources"] = {"ram_pct": None, "cpu_pct": None, "ram_warn": False, "disk_pct": None, "disk_warn": False}
 
     # 5) APScheduler liveness (confirms cron jobs are still registered)
     try:
