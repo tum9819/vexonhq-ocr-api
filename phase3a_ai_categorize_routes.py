@@ -577,10 +577,10 @@ def _build_cashflow_prompt(description: str, categories: list[dict]) -> str:
 {cat_lines}
 
 ตัวอย่าง:
-- น้ำแข็ง, ผัก, หมู, ไก่, มะนาว, เอ็น, ไส้กรอก → raw_food
-- ผ้าขี้ริ้ว, กระเช็บ, ถัง, กล่อง → supplies
-- นักร้อง, ดนตรี → entertainment
-- คืนเงิน → customer_refund
+- น้ำแข็ง, ผัก, หมู, ไก่, มะนาว, เอ็น, ไส้กรอก → food_raw
+- ผ้าขี้ริ้ว, ถัง, กล่อง, น้ำยาล้างจาน → cleaning
+- นักร้อง, ดนตรี → musician_fee
+- คืนเงิน, โอนผิด → transfer_error
 
 ตอบ JSON เท่านั้น (ไม่มีข้อความอื่น):
 {{"category_code": "<code>", "confidence": <0.0-1.0>, "reason": "<เหตุผลสั้น>"}}"""

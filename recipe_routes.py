@@ -840,7 +840,10 @@ def list_recipes():
                 cost_data = _calc_cost(cur, str(rec["id"]))
                 cost = cost_data["total_cost"]
                 sell = float(rec["selling_price"] or 0)
-                gp_pct = round((sell - cost) / sell * 100, 1) if sell > 0 else None
+                if len(cost_data["breakdown"]) == 0:
+                    gp_pct = None
+                else:
+                    gp_pct = round((sell - cost) / sell * 100, 1) if sell > 0 else None
                 result.append({
                     **rec,
                     "id": str(rec["id"]),
@@ -1060,7 +1063,10 @@ def get_recipe(recipe_id: str):
             cost_data = _calc_cost(cur, recipe_id)
             cost = cost_data["total_cost"]
             sell = float(rec["selling_price"] or 0)
-            gp_pct = round((sell - cost) / sell * 100, 1) if sell > 0 else None
+            if len(cost_data["breakdown"]) == 0:
+                gp_pct = None
+            else:
+                gp_pct = round((sell - cost) / sell * 100, 1) if sell > 0 else None
 
         return {
             **rec,

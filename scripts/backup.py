@@ -398,10 +398,90 @@ def perform_storage_backup(supabase_url: str, access_key: str, secret_key: str, 
     return total_files, total_bytes
 
 
+def prune_backups(base_dir: str, db_limit: int, full_limit: int, disable_prune: bool = False):
+    """
+    Prune old backups from base_dir:
+    - Keep latest db_limit of db-only backups (storage_skipped=True)
+    - Keep latest full_limit of full backups (storage_skipped=False)
+    - Only delete folders matching 'mara-backup-*' that contain backups
+    """
+    if disable_prune:
+        print("[Prune] Pruning is disabled.")
+        return
+        
+    if not os.path.exists(base_dir):
+        print(f"[Prune] Base directory '{base_dir}' does not exist. Skipping pruning.")
+        return
+
+    print(f"[Prune] Scanning '{base_dir}' for backups (retention: db-only={db_limit}, full={full_limit})...")
+    
+    backups = []
+    try:
+        names = os.listdir(base_dir)
+    except Exception as e:
+        print(f"[Prune] Error listing base directory: {e}", file=sys.stderr)
+        return
+        
+    for name in names:
+        path = os.path.join(base_dir, name)
+        if os.path.isdir(path) and name.startswith("mara-backup-"):
+            manifest_path = os.path.join(path, "manifest.json")
+            is_db_only = True
+            if os.path.exists(manifest_path):
+                try:
+                    with open(manifest_path, "r", encoding="utf-8") as f:
+                        manifest = json.load(f)
+                    is_db_only = manifest.get("storage_skipped", True)
+                except Exception as e:
+                    print(f"[Prune] Warning: Failed to parse manifest in {name}: {e}")
+                    is_db_only = not os.path.exists(os.path.join(path, "storage"))
+            else:
+                is_db_only = not os.path.exists(os.path.join(path, "storage"))
+                
+            backups.append({
+                "name": name,
+                "path": path,
+                "is_db_only": is_db_only
+            })
+            
+    # Sort descending by folder name (e.g. mara-backup-20260603_120000) so newest are first
+    backups.sort(key=lambda x: x["name"], reverse=True)
+    
+    db_backups = [b for b in backups if b["is_db_only"]]
+    full_backups = [b for b in backups if not b["is_db_only"]]
+    
+    print(f"[Prune] Found {len(db_backups)} db-only and {len(full_backups)} full backups.")
+    
+    # Prune db-only
+    if len(db_backups) > db_limit:
+        to_delete = db_backups[db_limit:]
+        print(f"[Prune] Deleting {len(to_delete)} older db-only backups:")
+        for b in to_delete:
+            print(f"  - Deleting db-only backup: {b['name']} ({b['path']})")
+            try:
+                shutil.rmtree(b["path"])
+            except Exception as e:
+                print(f"[Prune] Error deleting {b['path']}: {e}", file=sys.stderr)
+                
+    # Prune full
+    if len(full_backups) > full_limit:
+        to_delete = full_backups[full_limit:]
+        print(f"[Prune] Deleting {len(to_delete)} older full backups:")
+        for b in to_delete:
+            print(f"  - Deleting full backup: {b['name']} ({b['path']})")
+            try:
+                shutil.rmtree(b["path"])
+            except Exception as e:
+                print(f"[Prune] Error deleting {b['path']}: {e}", file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(description="VEXONHQ Disaster Recovery Backup Tool")
     parser.add_argument("--out", default="./backups", help="Base directory where timestamped backups will be written")
     parser.add_argument("--skip-storage", "--db-only", action="store_true", help="Skip Supabase storage download step and back up only the database")
+    parser.add_argument("--no-prune", action="store_true", help="Disable retention pruning of old backups")
+    parser.add_argument("--retention-db", type=int, default=14, help="Number of db-only backups to keep")
+    parser.add_argument("--retention-full", type=int, default=4, help="Number of full backups to keep")
     args = parser.parse_args()
     
     # Load env variables from .env file
@@ -490,6 +570,14 @@ def main():
 
         # Record success heartbeat
         record_backup_heartbeat(database_url, ok=True)
+        
+        # Step 4: Prune old backups (if not disabled)
+        prune_backups(
+            base_dir=args.out,
+            db_limit=args.retention_db,
+            full_limit=args.retention_full,
+            disable_prune=args.no_prune
+        )
         
     except Exception as e:
         print("\n" + "=" * 60, file=sys.stderr)

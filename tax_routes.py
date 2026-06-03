@@ -147,7 +147,8 @@ def wht_summary(
             "description":    row["description"],
             "amount_paid":    amount,   # amount actually debited from bank
             "wht_amount":     wht,
-            "net_before_wht": round(amount / (1 - rule["wht_pct"] / 100), 2),  # gross estimate
+            "net_before_wht": amount,   # gross = amount (since PNL-3 confirmed amount is gross)
+            "net_paid":       net_paid, # net_paid = amount - wht
         })
 
         # Accumulate category totals
