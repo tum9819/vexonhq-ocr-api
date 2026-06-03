@@ -635,6 +635,9 @@ class InvoiceUpdate(BaseModel):
 
 class ConfirmRequest(BaseModel):
     reviewed_by: Optional[str] = None
+    # OCR-1: when True, bypass the error-severity confirm gate (user chose to
+    # confirm despite validation errors like a missing total).
+    force: bool = False
 
 
 class RejectRequest(BaseModel):
@@ -1521,6 +1524,29 @@ def invoice_confirm(
     body: Optional[ConfirmRequest] = None,
 ):
     _validate_uuid_param("invoice_id", invoice_id)
+    # OCR-1: refuse to confirm a bill that still carries an error-severity
+    # validation warning (e.g. MISSING_TOTAL) unless the caller explicitly
+    # forces it. _revalidate_bill reflects the CURRENT merged state. Fail-open
+    # on infra error so a DB/network blip can't block a legitimate confirm
+    # (consistent with the upload path treating revalidate failure as non-fatal).
+    # OCR-1: skip the gate (and its warnings re-write) entirely when forcing.
+    _force_confirm = bool(body.force) if body else False
+    if not _force_confirm:
+        try:
+            _fresh_warnings = _revalidate_bill(invoice_id)
+        except Exception:
+            log.exception("OCR-1: revalidate before confirm failed for %s", invoice_id)
+            _fresh_warnings = []
+        _blocking = [w for w in _fresh_warnings if str(w.get("severity")) == "error"]
+        if _blocking:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "CONFIRM_BLOCKED",
+                    "message": "บิลนี้มีข้อผิดพลาดที่ต้องแก้ก่อนยืนยัน (เช่น ไม่มียอดรวม) — แก้ให้ครบ หรือกดยืนยันทั้งที่มีคำเตือนเพื่อข้าม",
+                    "warnings": _blocking,
+                },
+            )
     # Prefer JWT-derived username (trustworthy) over client-supplied
     # `reviewed_by` (legacy + tamperable). Falls back to client value
     # only when middleware didn't populate state.username (shouldn't
@@ -2172,6 +2198,66 @@ def _sign_uploads_url(url: Optional[str], expires_in: int = 86400) -> Optional[s
 # ============================================================
 # Helpers — DB writes (with multi-page merge)
 # ============================================================
+def _is_weak_invoice_no(invoice_no: Optional[str]) -> bool:
+    """OCR-2: True for invoice numbers too generic to safely match across
+    vendors (e.g. "1", "001", "12345") — these collide between unrelated
+    vendors, so the invoice_no-only dedup fallback must skip them.
+    """
+    s = (invoice_no or "").strip()
+    digits = s.replace("-", "").replace("/", "").replace(" ", "")
+    return len(s) < 4 or (digits.isdigit() and len(digits) < 6)
+
+
+def _to_float(x: Any) -> Optional[float]:
+    """Best-effort numeric coercion; tolerates None, Decimal, and "1,070"."""
+    try:
+        return float(str(x).replace(",", "")) if x is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _should_merge_on_invoice_no(
+    cand: dict[str, Any], vendor_name: Optional[str], parsed: dict[str, Any], invoice_no: str
+) -> bool:
+    """OCR-2: the invoice_no-only dedup fallback serves multi-page invoices
+    whose vendor_name OCR-drifts between pages (header fields like amount/date
+    often appear on only ONE page). It must NOT fuse DIFFERENT vendors that
+    merely share an invoice number. Decide whether `cand` (already matched on
+    invoice_no) is the SAME physical bill:
+      • same normalized vendor             -> merge (definitive)
+      • amounts present & within tolerance  -> merge (strong corroboration)
+      • WEAK invoice_no ("1"/"001"/short numeric) with neither of the above
+        -> do NOT merge (collision-prone; safer to create a separate bill that
+        can be merged in review) — note a same-date coincidence is NOT enough
+      • STRONG invoice_no -> trust the exact match UNLESS actively contradicted
+        (vendors both present & different AND an amount/date also contradicts).
+    A field missing on either side is treated as non-conflicting (the multi-page
+    case), never as a reason to split.
+    """
+    cv = (_norm_text(cand.get("vendor_name")) or "").lower()
+    nv = (_norm_text(vendor_name) or "").lower()
+    if cv and nv and cv == nv:
+        return True
+    # Amount corroboration: both present, non-zero, within a tight band — so a
+    # coincidental near-amount on large unrelated bills can't fuse them, and a
+    # literal 0 (which also trips MISSING_TOTAL) never counts as a match.
+    a, b = _to_float(parsed.get("amount")), _to_float(cand.get("amount"))
+    amt_known = a is not None and b is not None and a != 0 and b != 0
+    if amt_known and abs(a - b) <= min(100.0, max(1.0, 0.01 * max(abs(a), abs(b)))):
+        return True
+    if _is_weak_invoice_no(invoice_no):
+        return False
+    # Strong invoice_no: trust the exact match unless ACTIVELY contradicted by
+    # amounts that are both present and differ beyond tolerance. A drifting or
+    # missing date/vendor is the multi-page OCR-drift case (header fields land on
+    # only one page), NOT a reason to split — treating a drifted date as a hard
+    # contradiction would re-split legitimate multi-page invoices.
+    vendors_differ = bool(cv and nv and cv != nv)
+    if vendors_differ and amt_known:
+        return False
+    return True
+
+
 def _save_invoice(
     parsed: dict[str, Any],
     ocr_text: str,
@@ -2218,6 +2304,11 @@ def _save_invoice(
     # vendor_name slightly differently between pages — invoice_no is the
     # most reliable across pages because it's a unique number on every page).
     if not existing and invoice_no:
+        # OCR-2: the invoice_no-only fallback serves multi-page invoices whose
+        # vendor_name OCR-drifts between pages. Look up the candidate, then let
+        # _should_merge_on_invoice_no decide — so a weak/colliding number ("1")
+        # only merges with corroboration, while a genuine multi-page invoice
+        # (header fields missing on some pages) is NOT split.
         try:
             res = (
                 sb.table("vendor_bills")
@@ -2228,8 +2319,15 @@ def _save_invoice(
                 .execute()
             )
             if res.data:
-                existing = res.data[0]
-                log.info("dedup matched by invoice_no fallback (vendor_name differed)")
+                cand = res.data[0]
+                if _should_merge_on_invoice_no(cand, vendor_name, parsed, invoice_no):
+                    existing = cand
+                    log.info("dedup matched by invoice_no fallback")
+                else:
+                    log.info(
+                        "OCR-2: invoice_no %r fallback REJECTED — looks like a "
+                        "different bill (no vendor/amount corroboration)", invoice_no,
+                    )
         except Exception as e:
             log.warning("dedup lookup (invoice_no fallback) failed: %s", e)
 
