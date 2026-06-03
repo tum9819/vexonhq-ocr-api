@@ -519,6 +519,16 @@ def _build_pnd3(month: str) -> openpyxl.Workbook:
                 (first, last, wht_cats),
             )
             pnd_rows = _rows_to_dicts(cur)
+
+            # PNL-4: best-effort prefill of payee tax-id by EXACT (normalized) name
+            # match against counterparties. Exact-match ONLY — a wrong tax-id on a
+            # สรรพากร filing is worse than a blank, so never fuzzy-match.
+            cur.execute(
+                """SELECT lower(btrim(name)) AS k, tax_id
+                   FROM public.counterparties
+                   WHERE tax_id IS NOT NULL AND btrim(tax_id) <> '' AND is_active"""
+            )
+            cp_taxid = {k: t for k, t in cur.fetchall() if k}
     finally:
         conn.close()
 
@@ -541,7 +551,8 @@ def _build_pnd3(month: str) -> openpyxl.Workbook:
         _data_cell(ws, row, 1, i, align=CENTER, fill=fill)
         _data_cell(ws, row, 2, date_str, align=CENTER, fill=fill)
         _data_cell(ws, row, 3, r["name"], fill=fill)
-        _data_cell(ws, row, 4, "", align=CENTER, fill=fill)  # เลขประจำตัว (กรอกเอง)
+        tid = cp_taxid.get((r["name"] or "").strip().lower(), "")  # PNL-4: exact name match, else blank
+        _data_cell(ws, row, 4, tid, align=CENTER, fill=fill)
         _data_cell(ws, row, 5, f'{rule["label"]} - {rule["section"]}', fill=fill)
         _data_cell(ws, row, 6, f"{pct:g}%", align=CENTER, fill=fill)
         _data_cell(ws, row, 7, amount, align=RIGHT, num_format='#,##0.00', fill=fill)
@@ -568,7 +579,7 @@ def _build_pnd3(month: str) -> openpyxl.Workbook:
 
     # Note
     row += 2
-    note = ws.cell(row=row, column=1, value="หมายเหตุ: กรุณากรอกเลขประจำตัวผู้เสียภาษีของผู้รับเงินแต่ละรายก่อนยื่น สรรพากร")
+    note = ws.cell(row=row, column=1, value="หมายเหตุ: เลขประจำตัวผู้เสียภาษีที่เติมให้อัตโนมัติมาจากการจับคู่ชื่อแบบตรงตัวเท่านั้น — โปรดตรวจสอบทุกแถวและกรอกช่องที่ว่างก่อนยื่นสรรพากร")
     note.font = Font(name="TH Sarabun New", size=10, italic=True, color="CC0000")
     ws.merge_cells(f"A{row}:H{row}")
 

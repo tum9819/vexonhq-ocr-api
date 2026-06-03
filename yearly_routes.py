@@ -347,6 +347,16 @@ def export_pnd3_annual(
                 (year, wht_cats),
             )
             rows = _rows_to_dicts(cur)
+
+            # PNL-4: best-effort prefill of payee tax-id by EXACT (normalized) name
+            # match against counterparties (exact-match ONLY — never fuzzy; a wrong
+            # tax-id on a สรรพากร filing is worse than a blank).
+            cur.execute(
+                """SELECT lower(btrim(name)) AS k, tax_id
+                   FROM public.counterparties
+                   WHERE tax_id IS NOT NULL AND btrim(tax_id) <> '' AND is_active"""
+            )
+            cp_taxid = {k: t for k, t in cur.fetchall() if k}
     finally:
         conn.close()
 
@@ -405,7 +415,8 @@ def export_pnd3_annual(
         _c(2, TH_MONTHS[m], CENTER)
         _c(3, date_str, CENTER)
         _c(4, r["name"])
-        _c(5, "", CENTER)          # เลขผู้เสียภาษี — กรอกเอง
+        tid = cp_taxid.get((r["name"] or "").strip().lower(), "")  # PNL-4: exact name match, else blank
+        _c(5, tid, CENTER)
         _c(6, f'{rule["label"]} - {rule["section"]}')
         _c(7, amount, RIGHT, FONT_B, '#,##0.00')
         _c(8, tax,    RIGHT, FONT_B, '#,##0.00')
@@ -431,7 +442,7 @@ def export_pnd3_annual(
     note_row = row_n + 2
     ws.merge_cells(f"A{note_row}:H{note_row}")
     n = ws.cell(row=note_row, column=1,
-                value="หมายเหตุ: กรุณากรอกเลขประจำตัวผู้เสียภาษีของผู้รับเงินแต่ละรายก่อนยื่น สรรพากร")
+                value="หมายเหตุ: เลขประจำตัวผู้เสียภาษีที่เติมให้อัตโนมัติมาจากการจับคู่ชื่อแบบตรงตัวเท่านั้น — โปรดตรวจสอบทุกแถวและกรอกช่องที่ว่างก่อนยื่นสรรพากร")
     n.font = Font(name="TH Sarabun New", size=10, italic=True, color="CC0000")
 
     for col_i, w in enumerate([7, 8, 14, 28, 18, 24, 16, 14], 1):
