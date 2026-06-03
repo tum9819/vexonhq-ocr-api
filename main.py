@@ -2014,7 +2014,7 @@ CRITICAL RULES — read carefully, these errors are common:
         0.0-1.0 that YOU read it correctly: vendor_name, invoice_no, merchant_tax_id,
         bill_date, subtotal, vat, amount. Use < 0.6 when the text was blurry, cropped,
         ambiguous, or you guessed; use ≥ 0.9 when it was crisp and unambiguous.
-      "image_quality": {"level": "good" | "fair" | "poor", "reason": "<short Thai/EN note>"}
+      "image_quality": {{"level": "good" | "fair" | "poor", "reason": "<short Thai/EN note>"}}
         — "poor" if blurry / skewed / dark / cut off so fields are hard to read.
     These describe your READING CONFIDENCE; they must NOT change the extracted values above.
 
