@@ -75,6 +75,17 @@ def test_missing_job_alerts(monkeypatch):
     assert posts and "new_job" in posts[0] and "NEVER" in posts[0]
 
 
+def test_self_watchdog_not_alerted_as_missing(monkeypatch):
+    """The watchdog must NOT alert that it itself has never run (it writes its own
+    heartbeat only after finishing, so it always looks 'missing' on first run)."""
+    ch._last_stale_alert_at.clear()
+    monkeypatch.setattr(ch, "_compute_job_states", lambda: _states(missing=["cron_stale_watchdog"]))
+    posts = _capture(monkeypatch)
+    r = ch.check_and_alert_stale_jobs(now=1_700_000_000.0)
+    assert r["alerted"] == []
+    assert posts == []
+
+
 def test_read_failure_is_safe(monkeypatch):
     def _boom():
         raise RuntimeError("db down")

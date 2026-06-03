@@ -260,6 +260,10 @@ def cron_health():
 # job_id(s) to Discord, rate-limited per job_id so it can't spam.
 _STALE_ALERT_SECONDS = 6 * 3600          # re-alert a given job_id at most every 6h
 _last_stale_alert_at: dict[str, float] = {}
+# The watchdog writes its OWN heartbeat only AFTER it finishes, so on its first
+# run it sees itself as "missing". Never alert about itself for the missing case
+# (a self-reference, not a real dead job). Stale-detection still applies to it.
+_SELF_JOB_ID = "cron_stale_watchdog"
 
 
 def check_and_alert_stale_jobs(now: float | None = None) -> dict:
@@ -289,6 +293,8 @@ def check_and_alert_stale_jobs(now: float | None = None) -> dict:
             f"(expected every {j.get('expected_interval_hours')}h)"
         )
     for jid in missing:
+        if jid == _SELF_JOB_ID:
+            continue  # first-run self-reference, not a real dead job
         key = f"missing::{jid}"
         if _now - _last_stale_alert_at.get(key, 0) < _STALE_ALERT_SECONDS:
             continue
