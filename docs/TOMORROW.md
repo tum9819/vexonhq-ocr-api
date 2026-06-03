@@ -1,9 +1,54 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-06-03 (A+ remediation round 3 — ~A → A/A+)
+**Last updated**: 2026-06-03 (A+ remediation round 4 — ops fixes, grade A/A+)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
+
+---
+
+## 🟢 2026-06-03 round 4 (ops fixes) — grade A/A+ (real prod DB outage root-caused + fixed)
+
+Context: continues round 1 + 2 + 3 (same day, evening). Driven partly by **live Discord alerts** (`auto_diagnose`). Headline: a **REAL production DB outage** was root-caused + fixed — the backend had lost DB connectivity the previous night (23:24) when the Supabase **session-mode pooler** (`:5432`, 15-client cap) saturated → Discord `postgres_failed` "max clients reached in session mode". Every change gated + verified; **48 new offline tests this round, full suite 211 passed / 23 skipped**. Grade holds **A/A+**.
+
+> **Re-grade note:** **OPS-13** was previously mis-graded "resolved" — it was the **real one**. Trajectory this finding: resolved → active → fixed (see self-corrections below).
+
+### ✅ Backend items shipped to prod + verified this round (5)
+- **OPS-13 (HIGH — the real one) — session-pooler saturation → real DB outage** (`main.py`, commit `238313a`). Root cause: the app connected via the Supabase **SESSION-mode pooler** (`:5432`, 15-client cap) which **saturated** → Discord `postgres_failed` alert "max clients reached in session mode" (prev night 23:24) = backend lost DB connectivity. Fix: (a) **verified the code uses NO session features** (no named cursors / `SET` / `LISTEN`-`NOTIFY` / prepared statements) so it is **transaction-mode-safe**; (b) added **connect-retry** to `main.get_db_conn` (retry 3× w/ backoff, on the saturation class only); (c) TUM switched Coolify `DATABASE_URL` → `pooler.supabase.com:6543` (**TRANSACTION** mode). **VERIFIED on `:6543`:** reads (`/menu/public` 30KB), **WRITES** (cron heartbeat `run_count` 259→260, 0 new errors), app healthy. **NOTE:** the ~590ms postgres latency is the app↔pooler **TLS handshake** (fresh connection per request, no in-process pool) — **SEPARATE** from pooler mode; reducing it needs an in-process pool (**deferred**, not worth it now).
+- **SEC-1b — `/ai/exec` optional IP allow-list** (`main.py`, commit `ae5992e`). `/ai/exec` (already hardened round 1: `X-AI-Exec-Key` constant-time + strict whitelist + rate limit) now has an **optional IP allow-list** — `_check_ip_allowed()` rejects **403** unless the caller IP is in `AI_EXEC_ALLOWED_IPS` (**unset = no restriction, back-compatible**). Caller is the separate marastation-ai app; **full lockdown = TUM sets the env var.**
+- **PNL-4 — WHT tax-id prefill by exact-name match** (`export_routes.py` + `yearly_routes.py`, commit `72343a3`). PND.3 (ภ.ง.ด.3) WHT exports now **prefill the payee tax-id** by **EXACT normalized-name match** against counterparties (a clean JOIN is infeasible — WHT rows carry only a free-text name). **Exact-match ONLY (never fuzzy** — a wrong tax-id on a government filing is worse than blank); unmatched rows stay **blank** + the strengthened red manual-check note remains.
+- **AI-6 — cashflow AI categorization audit log** (commit `556a119`, migration `2026_06_03_ai6_cashflow_categorization_log`). Cashflow AI categorization decisions are now **audit-logged**. Extended `ai_categorization_log` (`bill_id` already nullable) with `cashflow_entry_id` + `source` columns; instrumented `_categorize_cashflow_one` to log **BOTH** rule + LLM tiers in the **same transaction (atomic)**, with a lowered-confidence fallback reason on invalid LLM codes.
+- **OPS-11 self-alert fix** (`cron`/watchdog, commit `7db1562`). The stale-job watchdog was alerting that **IT ITSELF** had "never run" (it writes its own heartbeat only after finishing, so on first run it looked missing). **Skip `_SELF_JOB_ID`** in the missing-job alert (stale-detection still applies).
+
+### Duplicate-operation-id cleanup + a DEFENSE catch
+- **dup operationId** (commit `238313a`). Set `include_in_schema=False` on the 4 GET+HEAD ops endpoints (`health`, `health/deep`, `cron/health`, `menu/public`) — FastAPI emitted the same `operationId` for GET+HEAD.
+- ⚠️ **DEFENSE — do NOT blindly apply Haiku auto-diagnose patches.** The `auto_diagnose` "Patch suggestion (Claude Haiku)" was **WRONG** — it told us to **delete `menu_public_router`** as a "duplicate", but it is `include_router`-ed exactly **once**; applying it would have **broken `/menu`**. Verify before applying any auto-diagnose patch.
+
+### New tests this round
+`tests/test_ai_exec` (IP allow-list), `tests/test_cron_stale_alert` (self-skip), `tests/test_db_conn_retry` (saturation retry). Suite: **211 passed / 23 skipped** (48 new offline tests this session).
+
+### Self-corrections (surfaced openly, not hidden)
+- **OPS-2** High → Low: the `backup.py` host port rewrite (`:5432`→`:6543`) is **intentional**.
+- **`sales_import_raw`** is **NOT** a backup table — **kept** (live forecast source).
+- **OPS-13** resolved → active → **fixed** (the real prod outage; see above).
+
+### Rollback (one-command revert)
+Rollback tags (2026-06-03): `backup-pre-ai6`, `backup-pre-sec1b`, `backup-pre-pnl4`, `backup-pre-ops11fix`, `backup-pre-ops13retry`. Commits: `238313a` (OPS-13 retry + dup-op-id), `ae5992e` (SEC-1b), `72343a3` (PNL-4), `556a119` (AI-6 + migration `2026_06_03_ai6_cashflow_categorization_log`), `7db1562` (OPS-11 self-alert fix).
+
+### 👉 STILL OPEN (not blocking the A/A+ grade)
+**🔴 TUM data / action:**
+1. **OPS-12 — pin `requirements.txt`.** Paste the container's `pip freeze` to pin deps.
+2. **PNL-3 — WHT gross vs net.** Needs a real invoice / the accountant.
+3. **Set `AI_EXEC_ALLOWED_IPS` in Coolify** — completes **SEC-1b** (full `/ai/exec` lockdown).
+
+**🟢 Antigravity (HANDOFFs written in the VEXONHQ repo):**
+4. **FE-3 — POS declutter** (cut map approved by TUM).
+5. **SEC-3 — httpOnly cookie via same-origin proxy** (cross-repo).
+6. **FE-2 — route manifest** (after FE-3).
+
+**Optional later:** reduce the ~590ms DB latency via an in-process connection pool.
+
+> **Supabase ops watch:** ticket **SU-387973** — orphaned storage; grace extension to **04 Jun 2026**. Watchdogs armed.
 
 ---
 
