@@ -218,7 +218,7 @@ def _compute_job_states() -> tuple[list[dict], list[str], bool]:
     return jobs, missing_jobs, any_stale
 
 
-@router.api_route("/health", methods=["GET", "HEAD"])
+@router.api_route("/health", methods=["GET", "HEAD"], include_in_schema=False)
 def cron_health():
     """Return per-job heartbeat state. Flags jobs whose last_run_at is more than
     2× expected_interval_hours ago as 'stale'.

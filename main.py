@@ -132,15 +132,32 @@ class SlowQueryWatchingCursor(psycopg2.extensions.cursor):
 
 
 def get_db_conn():
-    """Open a fresh psycopg v3 connection to Supabase Postgres.
+    """Open a fresh psycopg2 connection to Supabase Postgres.
 
     Returns a connection whose default cursor factory logs warnings
     for slow queries (≥3s) and errors for critical ones (≥10s).
+
+    OPS-13: brief retry on transient pooler saturation ("max clients reached in
+    session mode") so a momentary connection spike doesn't immediately fail the
+    request. Only the saturation class is retried; auth/DNS errors fail fast. The
+    real fix is the transaction-mode pooler (DATABASE_URL :6543); this is the
+    in-process safety net (mirrors scripts/backup.py connect_with_retry).
     """
-    return psycopg2.connect(
-        os.environ["DATABASE_URL"],
-        cursor_factory=SlowQueryWatchingCursor,
-    )
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            return psycopg2.connect(
+                os.environ["DATABASE_URL"],
+                cursor_factory=SlowQueryWatchingCursor,
+            )
+        except psycopg2.OperationalError as e:
+            last_err = e
+            msg = str(e).lower()
+            if "max clients" in msg or "too many clients" in msg or "max_client_conn" in msg:
+                time.sleep(0.4 * (attempt + 1))
+                continue
+            raise
+    raise last_err  # type: ignore[misc]
 
 # ============================================================
 # Config
@@ -435,7 +452,7 @@ def root():
     }
 
 
-@app.api_route("/health", methods=["GET", "HEAD"])
+@app.api_route("/health", methods=["GET", "HEAD"], include_in_schema=False)
 def health():
     return {
         "status": "healthy",
@@ -446,7 +463,7 @@ def health():
     }
 
 
-@app.api_route("/health/deep", methods=["GET", "HEAD"])
+@app.api_route("/health/deep", methods=["GET", "HEAD"], include_in_schema=False)
 def health_deep(background_tasks: BackgroundTasks):
     """
     Deep health check — actually verifies dependencies (P0.1, Session 24).

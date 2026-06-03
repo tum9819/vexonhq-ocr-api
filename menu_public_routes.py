@@ -61,7 +61,7 @@ logger = logging.getLogger("menu_public")
 router = APIRouter(prefix="/menu", tags=["menu-public"])
 
 
-@router.api_route("/public", methods=["GET", "HEAD"])
+@router.api_route("/public", methods=["GET", "HEAD"], include_in_schema=False)
 def get_public_menu():
     """
     Return the customer-facing menu for the public website.
