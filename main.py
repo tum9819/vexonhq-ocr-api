@@ -2233,6 +2233,61 @@ def _to_float(x: Any) -> Optional[float]:
         return None
 
 
+def _normalize_vendor_name(name: Optional[str]) -> str:
+    """
+    Normalize vendor name for deduplication comparison ONLY.
+    Does not modify the stored name in the database.
+    Normalizes: lowercase, sara-am, stripping tone marks / thanthakhat /
+    mai-taikhoo, common prefixes and suffixes, and collapsing whitespaces/punctuation.
+    """
+    if not name:
+        return ""
+    import re
+    s = name.lower()
+    # Normalize sara-am (U+0E4D + U+0E32 -> U+0E33)
+    s = s.replace("\u0e4d\u0e32", "\u0e33")
+    # Remove Thai tone marks and thanthakhat/mai-taikhoo/nikhahit
+    # ่ (0e48), ้ (0e49), ๊ (0e4a), ๋ (0e4b), ์ (0e4c), ็ (0e47), ํ (0e4d)
+    for c in ["\u0e48", "\u0e49", "\u0e4a", "\u0e4b", "\u0e4c", "\u0e47", "\u0e4d"]:
+        s = s.replace(c, "")
+    # Strip Thai prefixes
+    prefixes = [
+        r"^บริษัท\s*",
+        r"^บจก\.\s*",
+        r"^บจก\s+",
+        r"^หจก\.\s*",
+        r"^หจก\s+",
+    ]
+    for p in prefixes:
+        s = re.sub(p, "", s)
+    # Strip suffixes
+    suffixes = [
+        r"\s*จำกัด\s*\(มหาชน\)$",
+        r"\s*จำกัด\(มหาชน\)$",
+        r"\s*\(มหาชน\)$",
+        r"\s*\(จำกัด\)$",
+        r"\s*จำกัด$",
+        r"\s*มหาชน$",
+        r"\s*co\.,\s*ltd\.$",
+        r"\s*co\.,\s*ltd$",
+        r"\s*co\.\s*ltd\.$",
+        r"\s*co\.\s*ltd$",
+        r"\s*co\s*ltd$",
+        r"\s*ltd\.$",
+        r"\s*ltd$",
+        r"\s*corp\.$",
+        r"\s*corp$",
+        r"\s*inc\.$",
+        r"\s*inc$",
+    ]
+    for sf in suffixes:
+        s = re.sub(sf, "", s)
+    # Remove punctuation
+    s = re.sub(r"[.,\-()\/\\\[\]\'\"“”]", "", s)
+    # Collapse whitespaces
+    return " ".join(s.split())
+
+
 def _should_merge_on_invoice_no(
     cand: dict[str, Any], vendor_name: Optional[str], parsed: dict[str, Any], invoice_no: str
 ) -> bool:
@@ -2251,9 +2306,9 @@ def _should_merge_on_invoice_no(
     A field missing on either side is treated as non-conflicting (the multi-page
     case), never as a reason to split.
     """
-    cv = (_norm_text(cand.get("vendor_name")) or "").lower()
-    nv = (_norm_text(vendor_name) or "").lower()
-    if cv and nv and cv == nv:
+    cv_norm = _normalize_vendor_name(cand.get("vendor_name"))
+    nv_norm = _normalize_vendor_name(vendor_name)
+    if cv_norm and nv_norm and cv_norm == nv_norm:
         return True
     # Amount corroboration: both present, non-zero, within a tight band — so a
     # coincidental near-amount on large unrelated bills can't fuse them, and a
@@ -2269,7 +2324,7 @@ def _should_merge_on_invoice_no(
     # missing date/vendor is the multi-page OCR-drift case (header fields land on
     # only one page), NOT a reason to split — treating a drifted date as a hard
     # contradiction would re-split legitimate multi-page invoices.
-    vendors_differ = bool(cv and nv and cv != nv)
+    vendors_differ = bool(cv_norm and nv_norm and cv_norm != nv_norm)
     if vendors_differ and amt_known:
         return False
     return True
@@ -2321,7 +2376,7 @@ def _save_invoice(
                 sb.table("vendor_bills")
                 .select("*")
                 .eq("dedup_key", dedup_key)
-                .in_("review_status", ["pending", "needs_attention"])
+                .in_("review_status", ["pending", "needs_attention", "confirmed"])
                 .limit(1)
                 .execute()
             )
@@ -2344,7 +2399,7 @@ def _save_invoice(
                 sb.table("vendor_bills")
                 .select("*")
                 .eq("invoice_no", invoice_no)
-                .in_("review_status", ["pending", "needs_attention"])
+                .in_("review_status", ["pending", "needs_attention", "confirmed"])
                 .limit(1)
                 .execute()
             )
@@ -2360,6 +2415,75 @@ def _save_invoice(
                     )
         except Exception as e:
             log.warning("dedup lookup (invoice_no fallback) failed: %s", e)
+
+    # Page idempotency check
+    is_duplicate_page = False
+    existing_page_no = None
+
+    if existing:
+        try:
+            # 1. Fetch attachments to see if this filename is already present
+            att_res = (
+                sb.table("attachments")
+                .select("page_no, file_name")
+                .eq("parent_type", "vendor_bill")
+                .eq("parent_id", existing["id"])
+                .execute()
+            )
+            matching_att = None
+            for att in att_res.data:
+                if att["file_name"] == file_name:
+                    matching_att = att
+                    break
+            
+            if matching_att:
+                # Filename matches. Verify if content also matches.
+                # Fetch existing items for this invoice
+                items_res = (
+                    sb.table("invoice_items")
+                    .select("product_name, quantity, unit_price, amount, source_page")
+                    .eq("vendor_bill_id", existing["id"])
+                    .execute()
+                )
+                
+                # Group existing items by source_page
+                existing_pages = {}
+                for item in items_res.data:
+                    sp = item.get("source_page")
+                    if sp not in existing_pages:
+                        existing_pages[sp] = []
+                    existing_pages[sp].append({
+                        "product_name": _norm_text(item.get("product_name")),
+                        "quantity": _to_float(item.get("quantity")),
+                        "unit_price": _to_float(item.get("unit_price")),
+                        "amount": _to_float(item.get("amount")),
+                    })
+                
+                # Build incoming page items list
+                incoming_items = []
+                for it in (parsed.get("items") or []):
+                    name = it.get("product_name")
+                    if name:
+                        incoming_items.append({
+                            "product_name": _norm_text(name),
+                            "quantity": _to_float(it.get("quantity")),
+                            "unit_price": _to_float(it.get("unit_price")),
+                            "amount": _to_float(it.get("amount")),
+                        })
+                
+                # Compare incoming items to the items of the matching page_no
+                target_page = matching_att["page_no"]
+                target_page_items = existing_pages.get(target_page, [])
+                
+                if target_page_items == incoming_items:
+                    is_duplicate_page = True
+                    existing_page_no = target_page
+                    log.info("Duplicate page detected (filename & content match) for invoice_id=%s, page_no=%s. Skipping insert.", existing["id"], existing_page_no)
+        except Exception as e:
+            log.warning("failed to run page idempotency check: %s", e)
+
+    if is_duplicate_page:
+        return existing["id"], existing.get("batch_id") or str(uuid.uuid4()), existing_page_no, True
 
     # Whitelist payment_type to the DB check constraint chk_vb_payment_type
     # (NULL or credit_card/transfer/cash/cheque/other). The OCR prompt asks for one
