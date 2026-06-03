@@ -1,9 +1,32 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-06-03 (PNL-3 ภ.ง.ด.3 WHT gross-vs-net RESOLVED — verdict GROSS, NO code change)
+**Last updated**: 2026-06-03 (SEC-3 DONE on frontend repos — backend auth_routes.py unchanged; GP% costs entered for 25 Wongnai recipes; Supabase FREE ~270 MB confirmed; all systems 200)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
+
+---
+
+## 🟢 2026-06-03 — SEC-3 DONE, GP% costs entered, Supabase FREE, all systems healthy
+
+**SEC-3 (HttpOnly cookie via same-origin proxy) — COMPLETE.** Phase 2+3 shipped on the frontend repos (VEXONHQ + marastation-web). Backend `auth_routes.py` and the Bearer token flow are **unchanged** — the backend was already correct; no ocr-api code change was needed or made.
+
+**GP% / costs — DONE.** Cost data entered for 25 new Wongnai recipes via Supabase SQL (`recipe_ingredients` table).
+
+**Supabase — downgraded back to Free.** Support confirmed actual usage ~270 MB; the SU-387973 storage-quota concern is resolved. No quota overage risk.
+
+**All systems healthy:** `api.marastation.com` 200 ✅ · VEXONHQ app 200 ✅ · `marastation.com` 200 ✅
+
+### 👉 OPEN items (updated as of end-of-day 2026-06-03)
+**🔴 TUM data / action:**
+1. **OPS-12 — pin `requirements.txt`.** Paste the container's `pip freeze` to pin deps.
+2. **Set `AI_EXEC_ALLOWED_IPS` in Coolify** — completes **SEC-1b** (full `/ai/exec` lockdown).
+
+**🟢 Antigravity (HANDOFFs written in the VEXONHQ repo):**
+3. **FE-3 — POS declutter** (KEEP/CUT map approved by TUM).
+4. **FE-2 — route manifest** (after FE-3).
+
+**Optional later:** reduce the ~590ms DB latency via an in-process connection pool.
 
 ---
 
@@ -64,12 +87,12 @@ Rollback tags (2026-06-03): `backup-pre-ai6`, `backup-pre-sec1b`, `backup-pre-pn
 
 **🟢 Antigravity (HANDOFFs written in the VEXONHQ repo):**
 4. **FE-3 — POS declutter** (cut map approved by TUM).
-5. **SEC-3 — httpOnly cookie via same-origin proxy** (cross-repo).
+5. ~~**SEC-3 — httpOnly cookie via same-origin proxy** (cross-repo).~~ ✅ **DONE 2026-06-03** (frontend repos only; backend auth_routes.py unchanged).
 6. **FE-2 — route manifest** (after FE-3).
 
 **Optional later:** reduce the ~590ms DB latency via an in-process connection pool.
 
-> **Supabase ops watch:** ticket **SU-387973** — orphaned storage; grace extension to **04 Jun 2026**. Watchdogs armed.
+> ~~**Supabase ops watch:** ticket **SU-387973** — orphaned storage; grace extension to **04 Jun 2026**. Watchdogs armed.~~ ✅ **RESOLVED 2026-06-03** — Supabase downgraded back to Free; support confirmed actual usage ~270 MB.
 
 ---
 
@@ -104,7 +127,7 @@ Rollback tags (2026-06-03): `backup-pre-ocr12`, `backup-pre-batchB`, `backup-pre
 8. **OPS-12 — pin `requirements.txt`.** Paste the container's `pip freeze` to pin deps, or skip.
 9. **PNL-3 — WHT gross vs net.** Tax ambiguity — needs a real invoice / the accountant.
 
-> **Supabase ops watch:** ticket **SU-387973** — orphaned storage objects (12.7 GB billed vs ~268 MB physical); grace extension to **04 Jun 2026**. Local + remote watchdogs armed for a 402.
+> ~~**Supabase ops watch:** ticket **SU-387973** — orphaned storage objects (12.7 GB billed vs ~268 MB physical); grace extension to **04 Jun 2026**. Local + remote watchdogs armed for a 402.~~ ✅ **RESOLVED 2026-06-03** — Supabase downgraded back to Free; actual usage ~270 MB confirmed.
 
 ---
 
@@ -150,7 +173,7 @@ Tags (2026-06-03): backend `backup-pre-g1batch1`, `backup-pre-g1batch2` (plus ea
 10. **OPS-4** (add `postgresql-client`/`pg_dump` to the image) and **OPS-10**.
 11. (Frontend, cross-ref) **FE-3** page declutter / show-plan-first, **FE-2** route manifest; **FE-6** (`safeFetch` on `/budget` + `/pos/compare`) deferred.
 
-> **Supabase ops watch:** ticket **SU-387973** — storage quota shows 12.7 GB billed vs 268 MB physical (orphaned objects at the raw storage node, invisible to the Storage API); grace extension to **04 Jun 2026**. Local + remote watchdogs armed for a 402.
+> ~~**Supabase ops watch:** ticket **SU-387973** — storage quota shows 12.7 GB billed vs 268 MB physical (orphaned objects at the raw storage node, invisible to the Storage API); grace extension to **04 Jun 2026**. Local + remote watchdogs armed for a 402.~~ ✅ **RESOLVED 2026-06-03** — Supabase downgraded back to Free; actual usage ~270 MB confirmed.
 
 ---
 
