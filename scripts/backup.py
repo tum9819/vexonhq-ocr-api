@@ -85,6 +85,16 @@ def perform_db_backup(database_url: str, output_dir: str, skip_storage: bool = F
     if ":5432" in backup_url:
         backup_url = backup_url.replace(":5432", ":6543")
 
+    # OPS-4: pg_dump CANNOT run against the :6543 transaction pooler — PgBouncer
+    # transaction mode gives each statement its own server session, which breaks
+    # pg_dump's single multi-statement dump session. Use a direct/session url
+    # (:5432) for the dump + its stats query; keep backup_url (:6543) for the
+    # COPY fallback, which intentionally rides the transaction pooler to dodge the
+    # session-pooler client cap (see OPS-2 — that rewrite is deliberate).
+    dump_url = database_url
+    if ":6543" in dump_url:
+        dump_url = dump_url.replace(":6543", ":5432")
+
     pg_dump_path = shutil.which("pg_dump")
     
     if pg_dump_path:
@@ -93,7 +103,7 @@ def perform_db_backup(database_url: str, output_dir: str, skip_storage: bool = F
         # Ensure output directory exists
         os.makedirs(output_dir, exist_ok=True)
         
-        cmd = [pg_dump_path, "-Fc", "-d", backup_url, "-f", db_dump_file]
+        cmd = [pg_dump_path, "-Fc", "-d", dump_url, "-f", db_dump_file]
         print(f"[DB] Executing pg_dump into {db_dump_file}...")
         try:
             # Run without showing credentials in output or using shell=True to avoid injection
@@ -108,7 +118,7 @@ def perform_db_backup(database_url: str, output_dir: str, skip_storage: bool = F
             # We connect via psycopg2 briefly to count tables and rows
             print("[DB] pg_dump completed successfully. Gathering stats for manifest...")
             tables_stats = []
-            conn = connect_with_retry(backup_url)
+            conn = connect_with_retry(dump_url)
             cur = conn.cursor()
             cur.execute("""
                 SELECT table_schema, table_name 

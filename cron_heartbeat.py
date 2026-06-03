@@ -35,6 +35,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import time
 from typing import Callable, TypeVar
 
 import psycopg2
@@ -151,27 +152,15 @@ def heartbeat(job_id: str, expected_interval_hours: int = 24) -> Callable[[F], F
 # /cron/health endpoint
 # ─────────────────────────────────────────────
 
-@router.api_route("/health", methods=["GET", "HEAD"])
-def cron_health():
-    """Return per-job heartbeat state. Flags jobs whose last_run_at
-    is more than 2× expected_interval_hours ago as 'stale'.
+def _compute_job_states() -> tuple[list[dict], list[str], bool]:
+    """Read public.job_heartbeat and compute per-job stale state + the set of
+    registered-but-never-written (missing) jobs.
 
-    Returns 200 (healthy) or 503 (any stale) so Uptime Robot can poll
-    this directly and alert without parsing the body. HEAD method is
-    accepted because Uptime Robot free plan only supports HEAD requests;
-    Starlette strips the body but preserves the status code, which is
-    all the monitor needs.
+    Returns (jobs, missing_jobs, any_stale). Raises on DB error. Shared by
+    /cron/health (passive) and the active stale-job watchdog so both judge
+    staleness identically.
     """
-    from fastapi.responses import JSONResponse
-
-    try:
-        conn = _get_conn()
-    except Exception as e:
-        return JSONResponse(
-            status_code=503,
-            content={"status": "db_unreachable", "error": str(e)[:200]},
-        )
-
+    conn = _get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -221,22 +210,102 @@ def cron_health():
             "stale": is_stale,
         })
 
-    # Jobs DECORATED with @heartbeat but never having written a row are invisible to
-    # the table read above — surface them so a dead-on-arrival job can't hide
-    # (audit CEO-REL-01). Kept at HTTP 200 (status "degraded") when that is the ONLY
-    # issue, so a freshly-deployed job awaiting its first scheduled run doesn't trip a
-    # false Uptime Robot DOWN; stale jobs still return 503.
+    # Jobs DECORATED with @heartbeat but never having written a row are invisible
+    # to the table read above — surface them so a dead-on-arrival job can't hide
+    # (audit CEO-REL-01).
     present_ids = {j["job_id"] for j in jobs}
     missing_jobs = sorted(_REGISTERED_JOBS - present_ids)
+    return jobs, missing_jobs, any_stale
+
+
+@router.api_route("/health", methods=["GET", "HEAD"])
+def cron_health():
+    """Return per-job heartbeat state. Flags jobs whose last_run_at is more than
+    2× expected_interval_hours ago as 'stale'.
+
+    Returns 200 (healthy) or 503 (any stale) so Uptime Robot can poll this
+    directly and alert without parsing the body. A registered job that has never
+    written a row reports status "degraded" at HTTP 200 (so a freshly-deployed
+    job awaiting its first run doesn't trip a false DOWN); stale jobs still 503.
+    HEAD is accepted (Uptime Robot free plan only supports HEAD).
+    """
+    from fastapi.responses import JSONResponse
+
+    try:
+        jobs, missing_jobs, any_stale = _compute_job_states()
+    except Exception as e:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "db_unreachable", "error": str(e)[:200]},
+        )
+
     if any_stale:
         status = "stale"
     elif missing_jobs:
         status = "degraded"
     else:
         status = "healthy"
-    body = {
-        "status": status,
-        "jobs": jobs,
-        "missing_jobs": missing_jobs,
-    }
-    return JSONResponse(status_code=503 if any_stale else 200, content=body)
+    return JSONResponse(
+        status_code=503 if any_stale else 200,
+        content={"status": status, "jobs": jobs, "missing_jobs": missing_jobs},
+    )
+
+
+# ─────────────────────────────────────────────
+# OPS-11 — active stale-job watchdog
+# ─────────────────────────────────────────────
+# /cron/health is PASSIVE: Uptime Robot learns *that* something is stale (503)
+# but not WHICH job (its free plan strips the body). This watchdog runs on a
+# schedule, reads the same heartbeat state, and pushes the SPECIFIC stale/missing
+# job_id(s) to Discord, rate-limited per job_id so it can't spam.
+_STALE_ALERT_SECONDS = 6 * 3600          # re-alert a given job_id at most every 6h
+_last_stale_alert_at: dict[str, float] = {}
+
+
+def check_and_alert_stale_jobs(now: float | None = None) -> dict:
+    """Active watchdog: read heartbeat state and post the SPECIFIC stale/missing
+    job_id(s) to Discord (rate-limited per job_id). Best-effort — never raises
+    (it runs inside APScheduler). `now` is injectable for testing."""
+    try:
+        jobs, missing, _any_stale = _compute_job_states()
+    except Exception:
+        log.exception("check_and_alert_stale_jobs: heartbeat read failed")
+        return {"checked": False}
+
+    stale = [j for j in jobs if j.get("stale")]
+    _now = time.time() if now is None else now
+    lines: list[str] = []
+    alerted: list[str] = []
+
+    for j in stale:
+        jid = j["job_id"]
+        if _now - _last_stale_alert_at.get(jid, 0) < _STALE_ALERT_SECONDS:
+            continue
+        _last_stale_alert_at[jid] = _now
+        alerted.append(jid)
+        mins = j.get("minutes_since_last_run", 0)
+        lines.append(
+            f"- `{jid}` STALE — last run {mins // 60}h{mins % 60}m ago "
+            f"(expected every {j.get('expected_interval_hours')}h)"
+        )
+    for jid in missing:
+        key = f"missing::{jid}"
+        if _now - _last_stale_alert_at.get(key, 0) < _STALE_ALERT_SECONDS:
+            continue
+        _last_stale_alert_at[key] = _now
+        alerted.append(jid)
+        lines.append(f"- `{jid}` has NEVER run (no heartbeat row since deploy)")
+
+    if not lines:
+        return {"checked": True, "stale": [j["job_id"] for j in stale],
+                "missing": missing, "alerted": []}
+    try:
+        from auto_diagnose import _post_to_discord
+        _post_to_discord(
+            "🕒 **Cron stale-job alert** — a scheduled job stopped firing:\n"
+            + "\n".join(lines)
+        )
+    except Exception:
+        log.exception("check_and_alert_stale_jobs: discord post failed")
+    return {"checked": True, "stale": [j["job_id"] for j in stale],
+            "missing": missing, "alerted": alerted}

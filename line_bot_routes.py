@@ -1730,6 +1730,25 @@ except Exception as e:
     log.error("Failed to register vps_health_monitor job: %s", e)
 
 
+# OPS-11 (2026-06-03): active cron stale-job watchdog. Every 30 min it reads
+# job_heartbeat and pushes the SPECIFIC stale/missing job_id to Discord — the
+# passive /cron/health only tells Uptime Robot *that* something is stale, not
+# WHICH. Wrapped in @_heartbeat so the watchdog itself is monitored.
+try:
+    from cron_heartbeat import check_and_alert_stale_jobs as _stale_check
+    _hb_stale_check = _heartbeat("cron_stale_watchdog", expected_interval_hours=1)(_stale_check)
+    _scheduler.add_job(
+        _hb_stale_check,
+        trigger="interval",
+        minutes=30,
+        id="cron_stale_watchdog",
+        replace_existing=True,
+    )
+    log.info("Cron stale-job watchdog started — checks every 30 min")
+except Exception as e:
+    log.error("Failed to register cron_stale_watchdog job: %s", e)
+
+
 def _verify_signature(body: bytes, signature: str) -> bool:
     secret = os.environ.get("LINE_CHANNEL_SECRET", "")
     if not secret or not signature:
