@@ -1,9 +1,55 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-06-03 (A+ remediation round 1 — B+ → A-)
+**Last updated**: 2026-06-03 (A+ remediation round 2 — A- → ~A)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
+
+---
+
+## 🟢 2026-06-03 — A+ remediation round 2 shipped (grade A- → ~A)
+
+Context: continues round 1 (same day). Grade trajectory **B+ (audit) → A- (round 1, 9 fixes) → ~A (round 2, this session)**. Backup taken FIRST: Supabase logical backup `mara-backup-20260603_005144` (83 tables / 56,842 rows / 276 storage files), verified. Every change gated (backend compileall + pytest 165 passed / 23 skipped + live smoke via pre-push hook; web lint 0-err + tsc + npm build) and verified live.
+
+### ✅ Backend + DB items shipped to prod + verified this round (10)
+- **SEC-4 — Discord anti-replay** (`discord_routes.py`). After the Ed25519 verify, added an interaction-timestamp freshness check (reject if `|now-ts| > 300s`). Commit `56b345b`.
+- **OPS-6 — disk telemetry** (`main.py`). `/health/deep` now reports `disk_pct` + `disk_warn` (≥80%). Verified live `disk_pct=29.2`. Commit `56b345b`.
+- **OPS-8 — snapshot keep-floor** (`do_snapshot_routes.py`). `DO_SNAPSHOT_MAX_KEEP` default 1→2 (a failed create never leaves zero); doc scope `image:create`; note "DO snapshot backs up the APP SERVER, not the Supabase DB". Commit `56b345b`.
+- **AI-5 — forecast honesty** (`inventory_forecast_routes.py`). When `order_count < 2` → `insufficient_data=true`, urgency `"unknown"`, `next_order_est`/`days_until_order` = None (no guessing); None-safe sort. Commit `56b345b`.
+- **dup-index drop** (DB migration `g1_drop_duplicate_vendor_bills_indexes`). Dropped `idx_vb_due_date`/`idx_vb_status`/`idx_vb_vendor` (duplicates of canonical `idx_vendor_bills_*`). Verified gone.
+- **PNL-2 — budget actuals = dashboard** (`phase2_routes.py`). `/budgets/status` per-category `spent` now from `v_daybook_pnl` (was vendor_bills-only) → matches dashboard `top_categories`/`food_cost`; includes cash/manual + bank-statement expenses, excludes equity. Commit `1d1328e`.
+- **OPS-9 — verify-before-delete** (`do_snapshot_routes.py`). `rotate_auto_snapshots` now verifies the DO create action was accepted (status `in-progress`/`completed`) BEFORE deleting any old snapshot — a failed create skips deletion so backup count never drops. Commit `1d1328e`.
+- **table-drops** (DB migration `g2_drop_3_dead_backup_tables`). Dropped `sales_backup`, `bank_statement_entries_bak_20260530`, `pos_sales_items_dedup_bak_20260531`. **KEPT `sales_import_raw`** — it feeds `v_sales_unified → v_sales_clean → v_sales_forecast_base → v_sales_next7` (audit misclassified it as a backup).
+- **SEC-2 — RLS on `web.*`** (DB migration `g2_sec2_enable_rls_web_schema`). Enabled RLS on all 20 `web.*` tables (defense-in-depth). Verified marastation.com still SSRs data identically (homepage 212017B unchanged, `/menu` `/events` unchanged) → proves marastation-web connects via a BYPASSRLS role. Reversible (DISABLE).
+- **test fix** (`tests/test_discord_interactions.py`). `_sign_body` now defaults to the current timestamp (SEC-4 made the old static `"0"` stale). pytest: **165 passed, 23 skipped**.
+- (Frontend, for cross-ref) **FE-4** admin-only role-gate on `/ai-review` (`app/ai-review/page.tsx`) mirroring `/ai-stats`. VEXONHQ commit `db5b6b4`, deploy settled, app 307.
+
+### Audit findings corrected this round (do NOT re-flag)
+- **OPS-2** downgraded High → Low: `backup.py` rewriting host port 5432→6543 is **INTENTIONAL** (avoids the Supabase pooler "max clients reached"). Keep the rewrite.
+- **`sales_import_raw` is NOT a dead backup table** — it is a live source for the sales-forecast view chain. Not dropped.
+
+### Rollback (one-command revert)
+Tags (2026-06-03): backend `backup-pre-g1batch1`, `backup-pre-g1batch2` (plus earlier `backup-pre-aiexec`/`backendbatch2`/`dr-tooling`/`docs`); web `backup-pre-fe4`, `backup-pre-fe`, `backup-pre-docs`. Plus the round-2 data backup `mara-backup-20260603_005144`. Commits: backend `56b345b` (SEC-4/OPS-6/OPS-8/AI-5), `1d1328e` (PNL-2/OPS-9); web `db5b6b4` (FE-4). DB migrations applied via Supabase MCP.
+
+### 👉 STILL OPEN — path to full A+
+**🔴 BLOCKED on TUM input (do NOT proceed without his decision):**
+1. **SEC-1b — `/ai/exec` residual Critical lockdown.** Needs the ai.marastation.com chat-app auth mechanism (JWT? fixed IP?) before it can come off `PUBLIC_PATHS`.
+2. **OPS-12 — pin `requirements.txt` versions.** Needs the container's `pip freeze` — no SSH/exec key available to Claude.
+3. **PNL-3 — WHT gross-vs-net.** Tax ambiguity, both unsure; needs a real invoice / the accountant. **DO NOT guess.**
+
+**🟡 INVOLVED — Claude can do on TUM's go:**
+4. **OPS-11 — cron stale-job alert.**
+5. **AI-6 — cashflow AI decision log.**
+6. **OPS-13 — DB connection pool.** Riskiest of this group — do carefully.
+7. **PNL-4 — tax-id prefill.**
+
+**🟢 GROUP 3 — larger / batchable:**
+8. **OCR-1 / OCR-2** (+ unit tests).
+9. **SEC-3 — auth token → HttpOnly cookie.**
+10. **OPS-4** (add `postgresql-client`/`pg_dump` to the image) and **OPS-10**.
+11. (Frontend, cross-ref) **FE-3** page declutter / show-plan-first, **FE-2** route manifest; **FE-6** (`safeFetch` on `/budget` + `/pos/compare`) deferred.
+
+> **Supabase ops watch:** ticket **SU-387973** — storage quota shows 12.7 GB billed vs 268 MB physical (orphaned objects at the raw storage node, invisible to the Storage API); grace extension to **04 Jun 2026**. Local + remote watchdogs armed for a 402.
 
 ---
 
@@ -26,16 +72,16 @@ This round was implemented + verified + pushed by Claude Code under a TUM-approv
 ### Rollback (one-command revert)
 Tags: `backup-pre-dr-tooling-2026-06-03`, `backup-pre-aiexec-2026-06-03`, `backup-pre-backendbatch2-2026-06-03` (vexonhq-ocr-api); `backup-pre-fe-2026-06-03` (VEXONHQ). Plus data backup `backups/mara-backup-20260602_171525`. Remediation report: `VEXONHQ_Remediation_Report_2026-06-03.html`.
 
-### 👉 NEXT priorities — DEFERRED BACKEND A+ items (to reach full A+)
-All specced in **`HANDOFF_AUDIT_FIXES.md`**. Deliberately NOT done unattended — each needs TUM's decision or risks breaking core flows that smoke can't verify.
-1. **SEC-1b — `/ai/exec` lockdown.** Remove from `PUBLIC_PATHS` + add JWT/IP (needs ai.marastation.com chat auth coordination).
-2. **OCR-1 — confirm-gating.** Touches the daily bill-confirm flow.
-3. **OCR-2 — cross-vendor invoice merge guard.** Changes financial-record matching.
-4. **SEC-2 — enable RLS on `web.*` schema.** Could cut off marastation-web's DB role → break the customer site.
-5. **SEC-3 — auth token → HttpOnly cookie.** Login risk.
-6. **OPS-12 — pin `requirements.txt` versions.** Wrong pin breaks the build.
-7. **OPS-4 — add `postgresql-client`/`pg_dump` to the image.**
-8. **DB drops** — 4 leftover backup tables + 3 duplicate `vendor_bills` indexes.
+### 👉 NEXT priorities — DEFERRED BACKEND A+ items (historical — superseded by round 2 above)
+All specced in **`HANDOFF_AUDIT_FIXES.md`**. Status as of round 2 (current STILL-OPEN list lives in the round-2 section above):
+1. **SEC-1b — `/ai/exec` lockdown.** STILL OPEN, BLOCKED on TUM (chat-app auth mechanism).
+2. **OCR-1 — confirm-gating.** STILL OPEN (Group 3, + unit tests).
+3. **OCR-2 — cross-vendor invoice merge guard.** STILL OPEN (Group 3, + unit tests).
+4. **SEC-2 — enable RLS on `web.*` schema.** ✅ DONE round 2 (`g2_sec2_enable_rls_web_schema`, 20 tables; marastation.com verified unaffected).
+5. **SEC-3 — auth token → HttpOnly cookie.** STILL OPEN (Group 3).
+6. **OPS-12 — pin `requirements.txt` versions.** STILL OPEN, BLOCKED on TUM (needs container `pip freeze`).
+7. **OPS-4 — add `postgresql-client`/`pg_dump` to the image.** STILL OPEN (Group 3).
+8. **DB drops** — ✅ DONE round 2: 3 dead backup tables dropped (`g2_drop_3_dead_backup_tables`; `sales_import_raw` KEPT — live forecast source) + 3 duplicate `vendor_bills` indexes dropped (`g1_drop_duplicate_vendor_bills_indexes`).
 
 ---
 
