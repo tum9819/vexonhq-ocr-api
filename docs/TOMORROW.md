@@ -1,9 +1,44 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-06-03 (A+ remediation round 2 — A- → ~A)
+**Last updated**: 2026-06-03 (A+ remediation round 3 — ~A → A/A+)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
+
+---
+
+## 🟢 2026-06-03 — A+ remediation round 3 shipped (grade ~A → A/A+)
+
+Context: continues round 1 + round 2 (same day). Grade trajectory **B+ (audit) → A- (round 1) → ~A (round 2) → A/A+ (round 3, this session)**. The remaining High/Med engineering items are now fixed; only owner-decision/info items are left. Approach: analyzed all remaining items in parallel, implemented the safe ones, and adversarially verified the money-path changes over **2 rounds** — which caught + fixed a real multi-page-split regression in OCR-2 before it shipped. Every change gated + verified; **39 new offline tests, full suite 204 passed**.
+
+> **Re-grade note:** the analysis re-graded **OCR-1 + OCR-2 as HIGH** (money correctness), not Low. Several audit "easy fixes" were infeasible as written (**PNL-4** has no clean counterparty join key; **OPS-13** may just be an env-var port — do NOT do a 42-file pool refactor for a Low finding).
+
+### ✅ Backend + web items shipped to prod + verified this round (6)
+- **OCR-1 (HIGH) — confirm-gating** (`main.py`, commit `722d9fe`). `POST /invoice/{id}/confirm` now refuses a bill carrying an **error-severity** validation warning (e.g. `MISSING_TOTAL`) with **HTTP 422 `CONFIRM_BLOCKED`** unless `ConfirmRequest.force=True`. **Fails OPEN** on infra error; skips the gate + warnings-rewrite when forcing.
+- **OCR-2 (HIGH) — cross-vendor invoice merge guard** (`main.py`, commit `722d9fe`). The `invoice_no`-only dedup fallback could fuse **DIFFERENT vendors** sharing an invoice number ("1"/"001"). New `_should_merge_on_invoice_no()`: same vendor **OR** tight non-zero amount match → merge; weak number with neither → split; strong number → trust the match UNLESS amounts both present and differ. ⚠️ A missing/drifted vendor **OR** date is the **multi-page OCR case, never a split signal** (this nuance was caught by adversarial review — the regression it would have caused was fixed before shipping).
+- **OPS-11 — cron stale-job watchdog** (`cron_heartbeat.py` + `line_bot_routes.py`, commit `0faf40b`). Extracted `_compute_job_states()` (behavior-preserving — `/cron/health` response unchanged) + `check_and_alert_stale_jobs()` posts the **specific** stale/missing `job_id` to Discord, rate-limited 6h/job; registered as a 30-min APScheduler job wrapped in `@_heartbeat`. Verified live: `/cron/health` shape preserved.
+- **OPS-4 (HIGH) — `pg_dump` against pooler** (`scripts/backup.py`, commit `0faf40b`). `pg_dump` cannot run against the `:6543` transaction pooler; it now uses a **direct/session url (`:5432`)** for the dump + stats, while the COPY fallback keeps the `:6543` rewrite (deliberate, **OPS-2**). Enables a real `pg_restore`-able dump once `pg_dump` is on the host PATH.
+- **OPS-10 (MED) — money-path unit tests** (`tests/` + `main.py`, commit `94bf46a`). 18 offline money-path unit tests (`test_invoice_validation`, `test_merge_totals`, `test_slip_reconcile`) + a behavior-preserving `_compute_backfill()` extraction (the never-overwrite-a-present-total rule) so merge backfill is testable. `verify.ps1` gained a `[1b]` offline-test step.
+- **FE-6 (MED) — `/pos/compare` error state** (web `app/pos/compare/page.tsx`, commit `c6a3680`). The page swallowed backend 500/401 and showed the empty "ไม่มีข้อมูล" state (looked like no data, not an outage). Migrated to `safeFetch` (throws on non-2xx) + explicit error state + rose error banner.
+
+### Rollback (one-command revert)
+Rollback tags (2026-06-03): `backup-pre-ocr12`, `backup-pre-batchB`, `backup-pre-fe6`, `backup-pre-ops10`. Commits: backend `722d9fe` (OCR-1/OCR-2), `0faf40b` (OPS-11/OPS-4), `94bf46a` (OPS-10); web `c6a3680` (FE-6).
+
+### 👉 STILL OPEN — all need owner decision / info (no engineering items left)
+**🔵 DECIDE (Claude can implement once TUM picks the approach):**
+1. **AI-6 — cashflow AI decision log.** Decide: extend `ai_categorization_log` vs a separate table; and whether to gate low-confidence entries to review.
+2. **OPS-13 — DB connection pool / prod port.** Confirm prod `DATABASE_URL` port `:5432` vs `:6543` — **likely env-only**; do NOT do the 42-file pool refactor for a Low finding.
+3. **PNL-4 — tax-id prefill.** Clean counterparty join is **infeasible** — choose: best-effort exact-name prefill vs schema + UI vs keep-blank + note.
+4. **SEC-3 — auth token → HttpOnly cookie.** Cross-repo: needs a same-origin proxy in **BOTH** VEXONHQ + marastation-web before flipping the shared SSO cookie. **Ship CSP first.**
+5. **FE-3 — POS declutter (25 → ~18 pages).** Approve the KEEP/CUT map first — **deletes are irreversible.**
+6. **FE-2 — route-manifest single-source.** Do **AFTER** FE-3.
+
+**🔴 INFO NEEDED (BLOCKED on TUM — do NOT guess):**
+7. **SEC-1b — `/ai/exec` lockdown.** How does ai.marastation.com call `/ai/exec` — JWT? fixed IP? (needed before it comes off `PUBLIC_PATHS`).
+8. **OPS-12 — pin `requirements.txt`.** Paste the container's `pip freeze` to pin deps, or skip.
+9. **PNL-3 — WHT gross vs net.** Tax ambiguity — needs a real invoice / the accountant.
+
+> **Supabase ops watch:** ticket **SU-387973** — orphaned storage objects (12.7 GB billed vs ~268 MB physical); grace extension to **04 Jun 2026**. Local + remote watchdogs armed for a 402.
 
 ---
 
