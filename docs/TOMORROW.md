@@ -1,9 +1,30 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-06-03 (A+ remediation round 4 — ops fixes, grade A/A+)
+**Last updated**: 2026-06-03 (PNL-3 ภ.ง.ด.3 WHT gross-vs-net RESOLVED — verdict GROSS, NO code change)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
+
+---
+
+## 🟢 2026-06-03 — PNL-3 (ภ.ง.ด.3 WHT: gross vs net) RESOLVED — verdict GROSS, NO code change
+
+Closes the **PNL-3** item that had been BLOCKED-on-TUM/accountant across rounds 2-4. **No commit, no push, no migration** — this is a **REVERT** (net-zero code change) plus the live-data evidence that settled the ambiguity. A clean **cross-agent adversarial-review catch**: the firm "Antigravity writes / Claude reviews" rule caught a **wrong tax formula on a government filing before it shipped.**
+
+### What happened
+- **Antigravity (headless `agy`) had changed the WHT formula to GROSS-UP the stored amount** — `gross = net / (1 − rate)`, `WHT = net × rate / (1 − rate)` — across `export_routes.py`, `tax_routes.py`, `yearly_routes.py`, **assuming the stored amount was NET-of-withholding, WITHOUT checking the real data.**
+
+### Claude's review (the catch) — live data settled it
+- Queried the LIVE `public.v_daybook_pnl`: `musician_fee` = **120 rows, 115/120 are round-to-100 face values** (฿600 ×88, ฿700 ×19, ฿2,100, ฿2,800); `rent` = ฿8,000. **ALL round = GROSS.**
+- If they were net-of-3%/5%, the grossed-up values would be **non-round** (e.g. 618.56, 721.65, 8,421) — it is **impossible for 115/120 to be round by coincidence.**
+
+### Verdict + action
+- **Amounts are GROSS** → the **ORIGINAL formula (`tax = amount × rate`) is correct.**
+- Claude **REVERTED all 3 files** to original. **PNL-3 is CLOSED — no code change shipped.** `HANDOFF.md` already updated with this verdict.
+- **No git push for this repo** (revert only = net-zero code change).
+
+### Minor deferred follow-up (low priority)
+- `tax_routes.py` field `net_before_wht` is a **pre-existing display-only estimate with confusing naming**; it is **NOT on the official ภ.ง.ด.3 export.** Clean up the name later — not urgent, not money-affecting.
 
 ---
 
@@ -38,7 +59,7 @@ Rollback tags (2026-06-03): `backup-pre-ai6`, `backup-pre-sec1b`, `backup-pre-pn
 ### 👉 STILL OPEN (not blocking the A/A+ grade)
 **🔴 TUM data / action:**
 1. **OPS-12 — pin `requirements.txt`.** Paste the container's `pip freeze` to pin deps.
-2. **PNL-3 — WHT gross vs net.** Needs a real invoice / the accountant.
+2. ~~**PNL-3 — WHT gross vs net.**~~ ✅ **RESOLVED 2026-06-03 — verdict GROSS, NO code change** (see the round-5 section at the top): live-data round-number test on `v_daybook_pnl` proved the stored amounts are gross, so the original `tax = amount × rate` formula is correct; Antigravity's net-assumption gross-up was reverted across `export_routes.py` / `tax_routes.py` / `yearly_routes.py`.
 3. **Set `AI_EXEC_ALLOWED_IPS` in Coolify** — completes **SEC-1b** (full `/ai/exec` lockdown).
 
 **🟢 Antigravity (HANDOFFs written in the VEXONHQ repo):**
