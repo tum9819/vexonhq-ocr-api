@@ -616,6 +616,15 @@ def _categorize_cashflow_one(conn, entry_id: str, allow_llm: bool = True) -> dic
                 "SET category_code=%s, ai_cat_status='confirmed' WHERE id=%s",
                 (cat, entry_id)
             )
+            # AI-6: audit-log the rule-tier decision (same txn as the row update,
+            # so log + categorization commit atomically — mirrors the bills path).
+            cur.execute(
+                "INSERT INTO public.ai_categorization_log "
+                "(source, cashflow_entry_id, tier_used, suggested_category, "
+                " confidence, rule_pattern) "
+                "VALUES ('cashflow', %s, 'rule', %s, 1.0, %s)",
+                (entry_id, cat, rule_result.get("rule_pattern")),
+            )
             conn.commit()
             return {"entry_id": entry_id, "description": description,
                     "tier": "rule", "category_code": cat,
@@ -632,19 +641,33 @@ def _categorize_cashflow_one(conn, entry_id: str, allow_llm: bool = True) -> dic
         llm = _call_llm(prompt)
 
         cat = llm.get("category_code", "misc")
+        conf = llm.get("confidence", 0.5)
+        reason = llm.get("reason")
         if not _validate_category_exists(cur, cat):
             cat = "misc"
+            conf = min(conf, 0.3)
+            reason = ((reason or "") + " [fallback: invalid/empty LLM code]").strip()
 
         cur.execute(
             "UPDATE public.pos_cashflow_entries "
             "SET category_code=%s, ai_cat_status='confirmed' WHERE id=%s",
             (cat, entry_id)
         )
+        # AI-6: audit-log the LLM-tier decision (tier/model/tokens/cost/reason) so
+        # cashflow AI guesses are reviewable like bills. Same txn -> atomic.
+        cost_usd = _calculate_cost(llm.get("prompt_tokens", 0), llm.get("completion_tokens", 0))
+        cur.execute(
+            "INSERT INTO public.ai_categorization_log "
+            "(source, cashflow_entry_id, tier_used, suggested_category, confidence, "
+            " model_name, prompt_tokens, completion_tokens, cost_usd, reason) "
+            "VALUES ('cashflow', %s, 'llm', %s, %s, %s, %s, %s, %s, %s)",
+            (entry_id, cat, conf, llm.get("model_name"),
+             llm.get("prompt_tokens", 0), llm.get("completion_tokens", 0), cost_usd, reason),
+        )
         conn.commit()
         return {"entry_id": entry_id, "description": description,
                 "tier": "llm", "category_code": cat,
-                "confidence": llm.get("confidence", 0.5),
-                "cost_usd": llm.get("cost_usd", 0.0)}
+                "confidence": conf, "cost_usd": cost_usd}
 
 
 @router.post("/ai/categorize/cashflow/batch")
