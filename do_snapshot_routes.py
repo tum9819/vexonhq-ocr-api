@@ -266,6 +266,26 @@ def rotate_auto_snapshots(
         "errors": [],
     }
 
+    # OPS-9 (2026-06-03): verify the create action was accepted BEFORE deleting
+    # anything. DO returns 'in-progress' on a successful enqueue (the snapshot
+    # finishes async ~10 min later); 'errored' means create failed. If it did not
+    # start cleanly we keep ALL existing snapshots (skip deletion) so a failed
+    # create can never reduce the backup count. (Deletion below also only ever
+    # removes durable snapshots beyond keep_n, so we never drop below keep_n.)
+    _cstatus = create_action.get("status")
+    if _cstatus not in ("in-progress", "completed"):
+        report["ok"] = False
+        report["errors"].append(
+            f"create action status={_cstatus!r} not accepted — skipping deletion"
+        )
+        log.error(
+            "rotate_auto_snapshots: create not accepted (status=%s); "
+            "skipping rotation deletes to preserve existing snapshots", _cstatus,
+        )
+        if notify_discord:
+            _post_report(report)
+        return report
+
     try:
         existing = list_droplet_snapshots(droplet_id)
     except DOApiError as e:

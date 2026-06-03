@@ -580,15 +580,18 @@ def budgets_status(
                           ON b.category_code = ec.code
                          AND b.branch_code   = %s
                          AND b.period_month  = %s
+                   -- PNL-2 (2026-06-03): align budget "spent" with the dashboard +
+                   -- P&L. Was vendor_bills-only (missed cash/manual + bank-statement
+                   -- expenses, understating usage). Now reads v_daybook_pnl (same
+                   -- source as dashboard top_categories / food_cost; excludes equity).
                    LEFT JOIN (
-                       SELECT category_code, SUM(amount) AS total
-                       FROM public.vendor_bills
-                       WHERE review_status = 'confirmed'
-                         AND bill_date IS NOT NULL
-                         AND bill_date >= %s
-                         AND bill_date < %s
-                         AND COALESCE(branch_code, %s) = %s
-                       GROUP BY category_code
+                       SELECT d.category_code, SUM(d.amount) AS total
+                       FROM public.v_daybook_pnl d
+                       WHERE d.direction = 'expense'
+                         AND d.entry_date >= %s
+                         AND d.entry_date < %s
+                         AND COALESCE(d.branch_code, %s) = %s
+                       GROUP BY d.category_code
                    ) spent ON spent.category_code = ec.code
                    WHERE ec.is_active = true
                    ORDER BY ec.sort_order, ec.code""",
