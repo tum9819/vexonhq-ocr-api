@@ -38,6 +38,24 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "  OK: all .py files parse cleanly" -ForegroundColor Green
 
 # ──────────────────────────────────────────────────────────
+# 1b. Offline unit tests (pure logic, no network/DB — OPS-10 money-path guards)
+# ──────────────────────────────────────────────────────────
+Write-Host ""
+Write-Host "[1b] Offline unit tests..." -ForegroundColor Yellow
+& python -m pytest --version > $null 2> $null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "  SKIP: pytest not installed (pip install pytest)" -ForegroundColor Yellow
+} else {
+    & python -m pytest tests/ --ignore=tests/test_smoke.py --ignore=tests/test_workflow.py -q
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ""
+        Write-Host "FAIL: offline unit tests failed. NOT safe to push." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "  OK: offline unit tests passed" -ForegroundColor Green
+}
+
+# ──────────────────────────────────────────────────────────
 # 2. Optional live smoke tests (requires pytest + requests installed)
 # ──────────────────────────────────────────────────────────
 if ($Smoke) {

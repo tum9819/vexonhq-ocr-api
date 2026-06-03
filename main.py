@@ -2258,6 +2258,19 @@ def _should_merge_on_invoice_no(
     return True
 
 
+def _compute_backfill(existing: dict[str, Any], parsed: dict[str, Any]) -> dict[str, Any]:
+    """Multi-page merge: header fields to copy from a NEW page onto an EXISTING
+    bill — only where the existing value is null/empty AND the new page provides
+    one. NEVER overwrites a present value (prevents double-count / wrong-page
+    clobber of a header total). batch_id is handled separately by the caller."""
+    out: dict[str, Any] = {}
+    for field in ("merchant_tax_id", "bill_date", "due_date",
+                  "subtotal", "vat", "amount", "payment_type", "notes"):
+        if existing.get(field) in (None, "") and parsed.get(field) not in (None, ""):
+            out[field] = parsed.get(field)
+    return out
+
+
 def _save_invoice(
     parsed: dict[str, Any],
     ocr_text: str,
@@ -2361,11 +2374,7 @@ def _save_invoice(
         backfill: dict[str, Any] = {}
         if not existing.get("batch_id"):
             backfill["batch_id"] = batch_id
-
-        for field in ("merchant_tax_id", "bill_date", "due_date",
-                      "subtotal", "vat", "amount", "payment_type", "notes"):
-            if existing.get(field) in (None, "") and parsed.get(field) not in (None, ""):
-                backfill[field] = parsed.get(field)
+        backfill.update(_compute_backfill(existing, parsed))
 
         if backfill:
             sb.table("vendor_bills").update(backfill).eq("id", invoice_id).execute()
