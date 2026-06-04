@@ -257,7 +257,7 @@ def _validate_category_exists(cur, category_code: str) -> bool:
     return cur.fetchone() is not None
 
 
-def _categorize_one(conn, bill_id: str, allow_llm: bool = True) -> dict:
+def _categorize_one(conn, bill_id: str, allow_llm: bool = True, dry_run: bool = False) -> dict:
     """Run the full 2-tier flow for one bill. Returns log entry dict."""
     with conn.cursor() as cur:
         bill, items = _fetch_bill_with_items(cur, bill_id)
@@ -294,6 +294,19 @@ def _categorize_one(conn, bill_id: str, allow_llm: bool = True) -> dict:
                 result["category_code"] = "misc"
                 result["confidence"] = 0.3
                 result["reason"] = (result.get("reason", "") + " [fallback: invalid code]").strip()
+
+        if dry_run:
+            conn.rollback()
+            return {
+                "log_id": None,
+                "bill_id": str(bill_id),
+                "tier": result["tier"],
+                "category_code": result["category_code"],
+                "confidence": result["confidence"],
+                "cost_usd": cost_usd,
+                "reason": result.get("reason"),
+                "dry_run": True,
+            }
 
         # Apply category to bill
         cur.execute(
@@ -349,6 +362,7 @@ def categorize_one_bill(bill_id: str, allow_llm: bool = Query(True)):
 def categorize_batch(
     limit: int = Query(50, ge=1, le=200),
     allow_llm: bool = Query(True),
+    dry_run: bool = Query(False),
 ):
     """Process all pending bills (called by cron hourly).
     Returns: {processed, by_tier, total_cost_usd, errors}"""
@@ -366,7 +380,7 @@ def categorize_batch(
         errors = []
         for bill_id in bill_ids:
             try:
-                result = _categorize_one(conn, bill_id, allow_llm=allow_llm)
+                result = _categorize_one(conn, bill_id, allow_llm=allow_llm, dry_run=dry_run)
                 processed.append(result)
             except HTTPException as e:
                 # Audit B7-C2: rollback the shared connection so a per-bill failure
@@ -384,13 +398,16 @@ def categorize_batch(
             by_tier[p["tier"]] = by_tier.get(p["tier"], 0) + 1
             total_cost += p.get("cost_usd", 0)
 
-        return {
+        res = {
             "processed": len(processed),
             "total_pending_before": len(bill_ids),
             "by_tier": by_tier,
             "total_cost_usd": round(total_cost, 4),
             "errors": errors,
         }
+        if dry_run:
+            res["dry_run"] = True
+        return res
     finally:
         conn.close()
 
@@ -425,6 +442,12 @@ def user_action(log_id: str, body: UserActionBody):
                 cur.execute(
                     "UPDATE public.vendor_bills SET category_code = %s WHERE id = %s",
                     (body.override_category, bill_id),
+                )
+
+            if body.action == "reject":
+                cur.execute(
+                    "UPDATE public.vendor_bills SET category_code = NULL WHERE id = %s",
+                    (bill_id,),
                 )
 
             cur.execute(
@@ -586,7 +609,7 @@ def _build_cashflow_prompt(description: str, categories: list[dict]) -> str:
 {{"category_code": "<code>", "confidence": <0.0-1.0>, "reason": "<เหตุผลสั้น>"}}"""
 
 
-def _categorize_cashflow_one(conn, entry_id: str, allow_llm: bool = True) -> dict:
+def _categorize_cashflow_one(conn, entry_id: str, allow_llm: bool = True, dry_run: bool = False) -> dict:
     """2-tier categorisation for one pos_cashflow_entries row."""
     with conn.cursor() as cur:
         # Fetch entry
@@ -611,6 +634,12 @@ def _categorize_cashflow_one(conn, entry_id: str, allow_llm: bool = True) -> dic
         rule_result = _try_rule_match(cur, description)
         if rule_result:
             cat = rule_result["category_code"]
+            if dry_run:
+                conn.rollback()
+                return {"entry_id": entry_id, "description": description,
+                        "tier": "rule", "category_code": cat,
+                        "confidence": 1.0, "cost_usd": 0.0,
+                        "dry_run": True}
             cur.execute(
                 "UPDATE public.pos_cashflow_entries "
                 "SET category_code=%s, ai_cat_status='confirmed' WHERE id=%s",
@@ -632,9 +661,12 @@ def _categorize_cashflow_one(conn, entry_id: str, allow_llm: bool = True) -> dic
 
         # Tier 2 — LLM
         if not allow_llm:
-            return {"entry_id": entry_id, "description": description,
-                    "tier": "skipped", "category_code": None,
-                    "confidence": 0.0, "cost_usd": 0.0}
+            res = {"entry_id": entry_id, "description": description,
+                   "tier": "skipped", "category_code": None,
+                   "confidence": 0.0, "cost_usd": 0.0}
+            if dry_run:
+                res["dry_run"] = True
+            return res
 
         cats = _fetch_categories(cur)
         prompt = _build_cashflow_prompt(description, cats)
@@ -647,6 +679,14 @@ def _categorize_cashflow_one(conn, entry_id: str, allow_llm: bool = True) -> dic
             cat = "misc"
             conf = min(conf, 0.3)
             reason = ((reason or "") + " [fallback: invalid/empty LLM code]").strip()
+
+        if dry_run:
+            conn.rollback()
+            cost_usd = _calculate_cost(llm.get("prompt_tokens", 0), llm.get("completion_tokens", 0))
+            return {"entry_id": entry_id, "description": description,
+                    "tier": "llm", "category_code": cat,
+                    "confidence": conf, "cost_usd": cost_usd,
+                    "dry_run": True}
 
         cur.execute(
             "UPDATE public.pos_cashflow_entries "
@@ -674,6 +714,7 @@ def _categorize_cashflow_one(conn, entry_id: str, allow_llm: bool = True) -> dic
 def categorize_cashflow_batch(
     limit: int = Query(100, ge=1, le=500),
     allow_llm: bool = Query(True),
+    dry_run: bool = Query(False),
 ):
     """
     Auto-categorize pending pos_cashflow_entries.
@@ -694,7 +735,7 @@ def categorize_cashflow_batch(
         processed, errors = [], []
         for eid in entry_ids:
             try:
-                result = _categorize_cashflow_one(conn, eid, allow_llm=allow_llm)
+                result = _categorize_cashflow_one(conn, eid, allow_llm=allow_llm, dry_run=dry_run)
                 processed.append(result)
             except HTTPException as e:
                 # Audit B7-C2: rollback shared connection — same reasoning as the
@@ -711,13 +752,16 @@ def categorize_cashflow_batch(
             by_tier[p["tier"]] = by_tier.get(p["tier"], 0) + 1
             total_cost += p.get("cost_usd", 0.0)
 
-        return {
+        res = {
             "processed":           len(processed),
             "total_pending_before": len(entry_ids),
             "by_tier":             by_tier,
             "total_cost_usd":      round(total_cost, 6),
             "errors":              errors,
         }
+        if dry_run:
+            res["dry_run"] = True
+        return res
     finally:
         conn.close()
 
