@@ -1,38 +1,34 @@
-# HANDOFF — FIX: /tax API 500 · vexonhq-ocr-api
+# HANDOFF — SEC-1b: Remove /ai/exec from PUBLIC_PATHS · vexonhq-ocr-api
 
 **From:** Claude Code → **To:** Antigravity · **Date:** 2026-06-04 · **Requested by:** TUM
-**ที่มา:** System audit พบว่า `GET /tax/wht-summary` คืน HTTP 500 เสมอ เพราะ fallback `get_db_conn()` ใน tax_routes.py โยน RuntimeError แทนที่จะ connect DB.
+**ที่มา:** `/ai/exec` ยังอยู่ใน `PUBLIC_PATHS` → bypass JWTAuthMiddleware ได้โดยไม่ต้องมี Bearer token. `compare_digest` + whitelist + no-shell ถูก fix แล้วใน A− round แต่การที่ endpoint public ยังเป็น risk ที่ต้องปิด.
 
-## 🎯 งาน — แก้ 2 บรรทัดใน tax_routes.py
+---
 
-**ไฟล์:** `tax_routes.py` บรรทัด 29-33
+## ⚠️ Deploy Order (สำคัญมาก)
 
-### ก่อน (ผิด):
+ต้อง deploy **marastation-ai ก่อน** (HANDOFF.md ในนั้น) แล้วค่อย push repo นี้  
+ถ้า push repo นี้ก่อน AI chat จะ 401 ตลอด
+
+---
+
+## 🎯 งาน — แก้ 1 บรรทัดใน main.py
+
+**ไฟล์:** `main.py` บรรทัด 330
+
+ก่อน:
 ```python
-try:
-    from main import get_db_conn  # type: ignore
-except ImportError:
-    def get_db_conn():  # type: ignore
-        raise RuntimeError("get_db_conn not available")
+PUBLIC_PATHS = {"/", "/health", "/health/deep", "/cron/health", "/auth/login", "/auth/logout", "/docs", "/openapi.json", "/redoc", "/alerts/uptime-webhook", "/alerts/test-telegram", "/alerts/discord-interaction", "/alerts/discord-restart-test", "/line/webhook", "/snapshots/status", "/snapshots/auto-rotate", "/menu/public", "/ai/exec"}
 ```
 
-### หลัง (ถูก):
+หลัง (ลบแค่ `"/ai/exec"` ออก):
 ```python
-try:
-    from main import get_db_conn  # type: ignore
-except ImportError:
-    import os
-    def get_db_conn():  # type: ignore
-        return psycopg2.connect(os.environ["DATABASE_URL"])
+PUBLIC_PATHS = {"/", "/health", "/health/deep", "/cron/health", "/auth/login", "/auth/logout", "/docs", "/openapi.json", "/redoc", "/alerts/uptime-webhook", "/alerts/test-telegram", "/alerts/discord-interaction", "/alerts/discord-restart-test", "/line/webhook", "/snapshots/status", "/snapshots/auto-rotate", "/menu/public"}
 ```
-
-หมายเหตุ: `psycopg2` ถูก import ไว้แล้ว (บรรทัด 26) — ต้องเพิ่มแค่ `import os` + เปลี่ยน body ของ fallback
 
 ## 🛡️ GUARDRAILS
-- ✅ แก้เฉพาะ `tax_routes.py` เท่านั้น
-- ✅ `pytest tests/ --ignore=tests/test_smoke.py` ต้องผ่าน
-- ✅ log ว่าแก้ไฟล์อะไร บรรทัดอะไร
-- 🚫 ห้าม commit/push — Claude review → push
+- ✅ แก้เฉพาะ `main.py` บรรทัด 330 เท่านั้น
+- ✅ `pytest tests/ -q --ignore=tests/test_smoke.py --ignore=tests/test_backup_prune.py` ต้องผ่าน
+- 🚫 ห้าม push — รอ marastation-ai deploy ก่อน → Claude push + verify
 
-<!-- Antigravity: เสร็จ → append '[tax-fix done — file: tax_routes.py / change: ... / pytest: ...]'. ห้าม commit/push. -->
-[tax-fix done — file: tax_routes.py / change: updated fallback `get_db_conn` to connect using `psycopg2` and `DATABASE_URL` / pytest: 208 offline tests passed, including `test_tax_summary.py`]
+<!-- Antigravity: เสร็จ → append '[sec1b done — file: main.py / change: removed /ai/exec from PUBLIC_PATHS / pytest: ...]'. ห้าม commit/push. -->
