@@ -29,8 +29,9 @@ import psycopg2.extras
 try:
     from main import get_db_conn  # type: ignore
 except ImportError:
+    import os
     def get_db_conn():  # type: ignore
-        raise RuntimeError("get_db_conn not available")
+        return psycopg2.connect(os.environ["DATABASE_URL"])
 
 logger = logging.getLogger("tax")
 
