@@ -230,37 +230,6 @@ _root.setLevel(logging.INFO)
 log = logging.getLogger("vexonhq-ocr")
 
 
-# ─────────────────────────────────────────────────────────────
-# DR Backup — daily 02:00 Asia/Bangkok via APScheduler
-# Runs scripts/backup.py as a subprocess so its module-level
-# sys.exit() on missing deps can't kill the FastAPI process.
-# ─────────────────────────────────────────────────────────────
-def _run_daily_backup() -> None:
-    import subprocess, sys as _sys
-    try:
-        result = subprocess.run(
-            [_sys.executable, "scripts/backup.py"],
-            capture_output=True, text=True, timeout=1800,
-        )
-        if result.returncode != 0:
-            log.error("[backup] DR backup FAILED (exit %d): %s",
-                      result.returncode, result.stderr[:500])
-        else:
-            log.info("[backup] DR backup completed successfully")
-    except Exception as exc:
-        log.error("[backup] DR backup error: %s", exc)
-
-_line_scheduler.add_job(
-    _run_daily_backup,
-    trigger="cron",
-    hour=2,
-    minute=0,
-    id="daily_dr_backup",
-    replace_existing=True,
-)
-log.info("DR backup scheduler registered — fires daily at 02:00 Asia/Bangkok")
-
-
 # ============================================================
 # Clients (lazy init — won't crash on import if env missing)
 # ============================================================
