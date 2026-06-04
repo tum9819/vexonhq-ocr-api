@@ -980,12 +980,37 @@ _scheduler.add_job(
     id="daily_ai_drift_check",
     replace_existing=True,
 )
+def _run_daily_backup() -> None:
+    """Run scripts/backup.py as a subprocess — isolated so its sys.exit() can't kill the server."""
+    import subprocess, sys as _sys
+    try:
+        result = subprocess.run(
+            [_sys.executable, "scripts/backup.py"],
+            capture_output=True, text=True, timeout=1800,
+        )
+        if result.returncode != 0:
+            log.error("[backup] DR backup FAILED (exit %d): %s",
+                      result.returncode, result.stderr[:500])
+        else:
+            log.info("[backup] DR backup completed successfully")
+    except Exception as exc:
+        log.error("[backup] DR backup error: %s", exc)
+
+_scheduler.add_job(
+    _run_daily_backup,
+    trigger="cron",
+    hour=2,
+    minute=0,
+    id="daily_dr_backup",
+    replace_existing=True,
+)
 _scheduler.start()
 log.info("LINE digest scheduler started — fires daily at 06:00 Asia/Bangkok")
 log.info("AP due reminder scheduler started — fires daily at 09:00 Asia/Bangkok")
 log.info("Weekly summary scheduler started — fires every Monday 08:00 Asia/Bangkok")
 log.info("Budget alert scheduler started — fires daily at 20:00 Asia/Bangkok")
 log.info("AI drift check scheduler started — fires daily at 08:30 Asia/Bangkok")
+log.info("DR backup scheduler registered — fires daily at 02:00 Asia/Bangkok")
 
 
 # ─────────────────────────────────────────────
