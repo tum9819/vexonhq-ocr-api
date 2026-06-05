@@ -248,8 +248,27 @@ def to_date(v: Any) -> Optional[date]:
     try:
         return datetime.strptime(s[:10], "%Y-%m-%d").date()
     except ValueError:
-        return None
+        pass
+    # Other common variants can be added if needed
+    return None
 
+
+def delete_pos_sales_items_by_bill_ids(cur, bill_ids: list[Any]) -> int:
+    """Delete existing line items for the given bill IDs.
+
+    psycopg2 adapts Python lists to SQL arrays as text[] by default when the
+    element type is a plain string. Because public.pos_sales_items.bill_id is
+    uuid, we must cast the array parameter explicitly to uuid[] so Postgres can
+    resolve the operator correctly.
+    """
+    normalized = [str(bid) for bid in bill_ids if bid is not None]
+    if not normalized:
+        return 0
+    cur.execute(
+        "DELETE FROM public.pos_sales_items WHERE bill_id = ANY(%s::uuid[])",
+        (normalized,),
+    )
+    return getattr(cur, "rowcount", 0)
 
 def to_thtime(v: Any):
     """Parse HH:MM time strings."""
@@ -1165,9 +1184,7 @@ def _process_import_background(
                         # share this transaction (commit below) so a mid-failure rolls both
                         # back — the bill never ends up with zero items.
                         bill_ids = list({r["bill_id"] for r in rows})
-                        cur.execute(
-                            "DELETE FROM public.pos_sales_items WHERE bill_id = ANY(%s)",
-                            (bill_ids,))
+                        delete_pos_sales_items_by_bill_ids(cur, bill_ids)
                         cols = list(rows[0].keys())
                         cur.executemany(
                             "INSERT INTO public.pos_sales_items ({}) VALUES ({})".format(
@@ -1453,9 +1470,7 @@ def import_pos_excel_sync(
                         # share this transaction (commit below) so a mid-failure rolls both
                         # back — the bill never ends up with zero items.
                         bill_ids = list({r["bill_id"] for r in rows})
-                        cur.execute(
-                            "DELETE FROM public.pos_sales_items WHERE bill_id = ANY(%s)",
-                            (bill_ids,))
+                        delete_pos_sales_items_by_bill_ids(cur, bill_ids)
                         cols = list(rows[0].keys())
                         cur.executemany(
                             "INSERT INTO public.pos_sales_items ({}) VALUES ({})".format(
