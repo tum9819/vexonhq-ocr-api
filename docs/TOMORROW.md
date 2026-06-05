@@ -1,11 +1,26 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-06-03 (SEC-3 DONE on frontend repos — backend auth_routes.py unchanged; GP% costs entered for 25 Wongnai recipes; Supabase FREE ~270 MB confirmed; all systems 200)
+**Last updated**: 2026-06-05 (Sentry removed by TUM request; backend compileall + smoke tests passed. Earlier: OCR-1 DONE; all systems 200)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
 
 ---
+
+## 🟢 2026-06-05 — Sentry removed from backend
+
+TUM asked to remove Sentry and not add more alerts. Backend changes:
+- Removed `sentry_sdk` imports and `sentry_sdk.init()` block from `main.py`.
+- Removed per-request Sentry user attachment from `JWTAuthMiddleware`.
+- Removed `sentry-sdk[fastapi]` from `requirements.txt` and `sentry-sdk` from `requirements-lock.txt`.
+
+Verification: `python -m compileall main.py` passed and `python -m pytest tests/test_smoke.py -q` passed (`70 passed`).
+
+## 🟢 2026-06-04 — OCR-1 (Confirm-Gating for AI Batch Categorization) - DONE
+
+- **OCR-1 (Confirm-Gating) — COMPLETE.** Shipped `dry_run` support for both `/ai/categorize/batch` and `/ai/categorize/cashflow/batch`. When `dry_run=true` is query-passed, the backend runs full rule and LLM categorization but skips DB writes/logs and rolls back any rule hit increments. Returns `"dry_run": true` in response.
+- **Reject action null-out — COMPLETE.** Shipped reject null-out in `/ai/categorize/log/{log_id}` to reset `vendor_bills.category_code = NULL` when user rejects an AI suggestion.
+- **Added unit tests:** `tests/test_ai_categorize_dryrun.py` tests both dry-run and reject null-out behavior offline with mocks. All tests passed.
 
 ## 🟢 2026-06-03 — SEC-3 DONE, GP% costs entered, Supabase FREE, all systems healthy
 
