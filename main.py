@@ -21,6 +21,7 @@ Required env vars (set in Coolify):
 """
 
 import base64
+import hashlib
 import io
 import json
 import asyncio
@@ -673,9 +674,77 @@ async def invoice_upload(file: UploadFile = File(...)):
     )
 
 
+def _find_uploaded_file(file_sha256: str) -> Optional[dict[str, Any]]:
+    """Pre-OCR file-level idempotency. If this exact file (by byte SHA-256) was
+    already ingested into a vendor_bill, return a ready 'already_uploaded'
+    response so the caller can skip OCR + save entirely. Returns None when the
+    file is new — or when the lookup fails (fail-open: a transient DB hiccup must
+    never block a genuine upload)."""
+    try:
+        sb = get_supabase()
+        att = (
+            sb.table("attachments")
+            .select("parent_id")
+            .eq("parent_type", "vendor_bill")
+            .eq("file_sha256", file_sha256)
+            .limit(1)
+            .execute()
+        )
+        if not att.data:
+            return None
+        parent_id = att.data[0]["parent_id"]
+        bill = sb.table("vendor_bills").select("*").eq("id", parent_id).limit(1).execute()
+        if not bill.data:
+            # Orphan attachment (bill was deleted) — treat the file as new.
+            return None
+        b = bill.data[0]
+        page_count = (
+            sb.table("attachments")
+            .select("id", count="exact")
+            .eq("parent_type", "vendor_bill")
+            .eq("parent_id", parent_id)
+            .execute()
+        )
+        att_url = b.get("attachment_url")
+        log.info(
+            "already_uploaded: file_sha256=%s… already on bill %s — skipping OCR",
+            file_sha256[:12], parent_id,
+        )
+        return {
+            "success": True,
+            "invoice_id": parent_id,
+            "batch_id": b.get("batch_id"),
+            "page_no": page_count.count or None,
+            "merged": True,
+            "already_uploaded": True,
+            "parsed": b.get("ocr_json") or {
+                "vendor_name": b.get("vendor_name"),
+                "invoice_no": b.get("invoice_no"),
+                "bill_date": b.get("bill_date"),
+                "amount": b.get("amount"),
+            },
+            "warnings": [],
+            "preview_url": _sign_uploads_url(att_url) if att_url else None,
+            "total_pages_processed": 0,
+        }
+    except Exception as e:
+        log.warning("file_sha256 pre-OCR lookup failed (continuing as new upload): %s", e)
+        return None
+
+
 def _process_upload(contents: bytes, filename: str, content_type: str) -> dict[str, Any]:
     """Heavy synchronous upload pipeline (PDF→images, OCR, GPT Vision, save to Supabase).
     Runs in a thread via asyncio.to_thread so it never blocks the FastAPI event loop."""
+    # File-level idempotency: hash the ORIGINAL upload bytes once. If this exact
+    # file was already ingested into a vendor_bill, skip OCR entirely and return
+    # the existing bill. A byte hash is deterministic, unlike the OCR-content
+    # comparison it backstops, so a re-upload (e.g. a Cloudflare-524 retry) no
+    # longer duplicates items/attachments — and the GPT-4o cost is saved too.
+    file_sha256 = hashlib.sha256(contents).hexdigest()
+    already = _find_uploaded_file(file_sha256)
+    if already is not None:
+        return already
+
     is_pdf = (content_type == "application/pdf") or filename.lower().endswith(".pdf")
 
     if is_pdf:
@@ -723,7 +792,7 @@ def _process_upload(contents: bytes, filename: str, content_type: str) -> dict[s
         last_result = None
         all_warnings: list[dict[str, str]] = []
         for page in ocr_pages:
-            result = _persist_invoice_page(**page)
+            result = _persist_invoice_page(**page, file_sha256=file_sha256)
             last_result = result
             all_warnings.extend(result["warnings"])
 
@@ -734,7 +803,9 @@ def _process_upload(contents: bytes, filename: str, content_type: str) -> dict[s
         return last_result
 
     # Single image path
-    result = _process_single_image(contents, filename, content_type or "image/jpeg")
+    result = _process_single_image(
+        contents, filename, content_type or "image/jpeg", file_sha256=file_sha256
+    )
     result["total_pages_processed"] = 1
     return result
 
@@ -784,6 +855,7 @@ def _persist_invoice_page(
     mime_type: str,
     ocr_text: str,
     parsed: dict[str, Any],
+    file_sha256: Optional[str] = None,
 ) -> dict[str, Any]:
     """Persist one ALREADY-OCR'd page: validate → Supabase storage → DB save
     (multi-page merge) → revalidate. Touches the shared Supabase client and the
@@ -808,6 +880,7 @@ def _persist_invoice_page(
             file_url=file_url,
             file_name=file_name,
             mime_type=mime_type,
+            file_sha256=file_sha256,
         )
     except Exception as e:
         log.exception("db save failed")
@@ -847,13 +920,14 @@ def _process_single_image(
     image_bytes: bytes,
     file_name: str,
     mime_type: str,
+    file_sha256: Optional[str] = None,
 ) -> dict[str, Any]:
     """Full pipeline for ONE image: Tesseract → Vision → validate → store → DB save.
     Thin composition of the OCR stage and the persist stage so the single-image
     path behaves exactly as before; the multi-page path in _process_upload calls
     the two stages separately to parallelize OCR while keeping persist serial."""
     page = _ocr_page(image_bytes, file_name, mime_type)
-    return _persist_invoice_page(**page)
+    return _persist_invoice_page(**page, file_sha256=file_sha256)
 
 
 @app.get("/invoice/queue")
@@ -2405,6 +2479,7 @@ def _save_invoice(
     file_url: Optional[str],
     file_name: str,
     mime_type: Optional[str],
+    file_sha256: Optional[str] = None,
 ) -> tuple[str, str, int, bool]:
     """
     Save invoice with multi-page merge.
@@ -2661,6 +2736,7 @@ def _save_invoice(
             "file_url": file_url,
             "mime_type": mime_type,
             "page_no": page_no,
+            "file_sha256": file_sha256,
         }).execute()
 
     return invoice_id, batch_id, page_no, merged

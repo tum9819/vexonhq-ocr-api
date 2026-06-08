@@ -56,7 +56,7 @@ def _install_mocks(monkeypatch, *, ocr_sleep):
             "parsed": {"tag": tag},
         }
 
-    def fake_persist(image_bytes, file_name, mime_type, ocr_text, parsed):
+    def fake_persist(image_bytes, file_name, mime_type, ocr_text, parsed, file_sha256=None):
         # Assert this never runs concurrently with another persist.
         if state["_persist_active"]:
             state["persist_overlap"] = True
@@ -70,6 +70,8 @@ def _install_mocks(monkeypatch, *, ocr_sleep):
             "warnings": [{"page": parsed["tag"]}],
         }
 
+    # Skip the pre-OCR file-hash lookup (it would otherwise hit Supabase).
+    monkeypatch.setattr(main, "_find_uploaded_file", lambda h: None)
     monkeypatch.setattr(main, "_ocr_page", fake_ocr_page)
     monkeypatch.setattr(main, "_persist_invoice_page", fake_persist)
     return state
