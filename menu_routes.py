@@ -1350,16 +1350,20 @@ def alerts_summary(branch: str = "thawi_watthana"):
             # category_mean — and it was never read). It made this query 500, which
             # the bare `except: pass` below swallowed, leaving the anomaly feed
             # silently empty in the Alert Center.
+            # audit (2026-06-08): column is a.scanned_at, NOT a.created_at —
+            # bill_anomalies has no created_at, so this query 500'd and aborted
+            # the transaction, silently emptying the anomaly/budget/AP/stock
+            # sections of the Alert Center. Verified against information_schema.
             anom_sql = """
                 SELECT a.id, a.severity, a.anomaly_type, a.message,
-                       a.bill_amount, a.created_at,
+                       a.bill_amount, a.scanned_at,
                        vb.vendor_name, vb.bill_date, vb.category_code
                 FROM public.bill_anomalies a
                 JOIN public.vendor_bills vb ON vb.id = a.bill_id
                 WHERE a.user_action IS NULL
                 ORDER BY
                     CASE a.severity WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
-                    a.created_at DESC
+                    a.scanned_at DESC
                 LIMIT 20
             """
             anom_rows = _rows_to_dicts(conn, anom_sql, ())
