@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import types
 
 os.environ.setdefault("DATABASE_URL", "postgresql://u:p@localhost:5432/d")
 os.environ.setdefault("JWT_SECRET", "testsecret")
@@ -35,12 +36,14 @@ GATED_NAMES = {
     "manual_reconcile", "patch_slip", "delete_slip", "slips_rematch_all",
     "slip_match", "slip_manual_match", "slip_reject", "slip_override_category",
     "update_bill_payment",
+    # OCR invoice review mutations must also be admin-only.
+    "invoice_confirm", "invoice_reject",
     # AR/AP financial-record mutations (phase3_arap_routes)
     "create_counterparty", "patch_counterparty", "soft_delete_counterparty",
     "patch_entry", "cancel_entry", "create_payment", "delete_payment",
 }
-# create_entry maps to TWO gated routes (quick-entry + ar-ap), so 25 names -> 26 routes.
-EXPECTED_ROUTE_COUNT = 26
+# create_entry and slip_match each map to TWO gated routes, so 26 names -> 28 routes.
+EXPECTED_ROUTE_COUNT = 28
 
 
 def _fake_verify(token):
@@ -58,7 +61,11 @@ def _gated_routes():
         name = getattr(ep, "__name__", None)
         if name in GATED_NAMES:
             method = next(m for m in r.methods if m not in ("HEAD", "OPTIONS"))
-            path = re.sub(r"{[^}]+}", "x", r.path)
+            path = r.path
+            if "{invoice_id}" in path:
+                path = path.replace("{invoice_id}", "00000000-0000-0000-0000-000000000000")
+            else:
+                path = re.sub(r"{[^}]+}", "x", path)
             out.append((method, path, name))
     return out
 
@@ -68,6 +75,34 @@ def client(monkeypatch):
     # main's middleware uses main.verify_token; _require_admin_role uses auth_routes.verify_token.
     monkeypatch.setattr(main, "verify_token", _fake_verify)
     monkeypatch.setattr(auth_routes, "verify_token", _fake_verify)
+
+    class _DummyQuery:
+        def update(self, *args, **kwargs):
+            return self
+
+        def select(self, *args, **kwargs):
+            return self
+
+        def eq(self, *args, **kwargs):
+            return self
+
+        def limit(self, *args, **kwargs):
+            return self
+
+        def order(self, *args, **kwargs):
+            return self
+
+        def execute(self):
+            return types.SimpleNamespace(data=[{"id": "ok"}])
+
+    class _DummySupabase:
+        def table(self, *args, **kwargs):
+            return _DummyQuery()
+
+    monkeypatch.setattr(main, "get_supabase", lambda: _DummySupabase())
+    monkeypatch.setattr(main, "_revalidate_bill", lambda *args, **kwargs: [])
+    monkeypatch.setattr(main, "_match_invoice_against_statement", lambda *args, **kwargs: {"status": "matched"})
+    monkeypatch.setattr(main, "_auto_sync_ingredient_prices", lambda: {"status": "ok"})
     return TestClient(main.app, raise_server_exceptions=False)
 
 

@@ -37,7 +37,7 @@ import pypdfium2 as pdfium
 import pytesseract
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from llm import get_openai  # OpenAI client factory lives in llm.py (Step 2 AI consolidation)
+from llm import get_openai, openai_chat  # OpenAI client + chat wrapper live in llm.py
 from PIL import Image
 from pydantic import BaseModel
 from supabase import Client, create_client
@@ -1372,6 +1372,26 @@ def _current_username(request: Request) -> Optional[str]:
     return getattr(request.state, "username", None)
 
 
+def _require_admin_request(request: Request) -> str:
+    """
+    Raise 401/403 unless the current request was authenticated as admin.
+
+    The middleware already verified the JWT, but the invoice confirm/reject
+    endpoints are high-impact financial mutations, so we re-check the role
+    here before any database work or warning revalidation happens.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(401, "Not authenticated")
+
+    payload = verify_token(auth_header[7:])
+    if not payload:
+        raise HTTPException(401, "Token expired or invalid")
+    if payload.get("_role") != "admin":
+        raise HTTPException(403, "Admin access required")
+    return str(payload.get("sub") or _current_username(request) or "")
+
+
 def _validate_uuid_param(name: str, value: str) -> None:
     """
     Raise HTTPException(400) if `value` isn't a syntactically-valid UUID.
@@ -1510,6 +1530,7 @@ def invoice_confirm(
     body: Optional[ConfirmRequest] = None,
 ):
     _validate_uuid_param("invoice_id", invoice_id)
+    _require_admin_request(request)
     # OCR-1: refuse to confirm a bill that still carries an error-severity
     # validation warning (e.g. MISSING_TOTAL) unless the caller explicitly
     # forces it. _revalidate_bill reflects the CURRENT merged state. Fail-open
@@ -1533,7 +1554,7 @@ def invoice_confirm(
                     "warnings": _blocking,
                 },
             )
-    # Prefer JWT-derived username (trustworthy) over client-supplied
+
     # `reviewed_by` (legacy + tamperable). Falls back to client value
     # only when middleware didn't populate state.username (shouldn't
     # happen for protected routes).
@@ -1711,9 +1732,13 @@ def invoice_match_statement(invoice_id: str, request: Request):
 
 
 @app.post("/invoice/{invoice_id}/reject")
-def invoice_reject(invoice_id: str, body: RejectRequest, request: Request):
+def invoice_reject(invoice_id: str, request: Request, body: dict[str, Any] | None = None):
     _validate_uuid_param("invoice_id", invoice_id)
-    reviewer = _current_username(request) or body.reviewed_by
+    _require_admin_request(request)
+    reject_reason = (body or {}).get("reject_reason")
+    if not reject_reason:
+        raise HTTPException(422, "reject_reason is required")
+    reviewer = _current_username(request) or (body or {}).get("reviewed_by")
     sb = get_supabase()
     now_iso = datetime.utcnow().isoformat()
     resp = (
@@ -1722,7 +1747,7 @@ def invoice_reject(invoice_id: str, body: RejectRequest, request: Request):
             "review_status":  "rejected",
             "reviewed_by":    reviewer,
             "reviewed_at":    now_iso,
-            "reject_reason":  body.reject_reason,
+            "reject_reason":  reject_reason,
             "updated_by":     reviewer,
             "updated_at":     now_iso,
         })
