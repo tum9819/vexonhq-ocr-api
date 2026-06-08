@@ -29,6 +29,7 @@ import os
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from typing import Any, Optional
 
@@ -694,20 +695,39 @@ def _process_upload(contents: bytes, filename: str, content_type: str) -> dict[s
 
         log.info("processing PDF '%s' with %d page(s)", filename, len(page_images))
 
-        # Process each page through full pipeline.
-        # multi-page merge in _save_invoice() handles merging same-invoice pages.
+        # Process each page through the full pipeline. GPT Vision is the slow
+        # part (~7-40s/page); run it CONCURRENTLY (bounded) so a multi-page Makro
+        # PDF finishes well under Cloudflare's 100s edge timeout instead of
+        # summing per-page latency into a 524 the user reads as "upload failed"
+        # (known-issue 2026-06-08 — the bill actually got saved, prompting risky
+        # re-uploads). Two deliberately separated phases:
+        #   1. _ocr_page (tesseract + vision) — side-effect-free + thread-safe →
+        #      run in a small thread pool; results kept in PAGE ORDER.
+        #   2. _persist_invoice_page (storage + DB save/merge) — run SEQUENTIALLY
+        #      in page order: the multi-page merge keys off the row the previous
+        #      page just wrote and the Supabase client is not thread-safe, so a
+        #      concurrent/out-of-order save would split one bill into duplicates.
         page_filename_base = os.path.splitext(filename)[0]
+        page_args = [
+            (img_bytes, f"{page_filename_base}-p{idx}.png", "image/png")
+            for idx, img_bytes in enumerate(page_images, start=1)
+        ]
+
+        # Phase 1: parallel OCR, capped at 3 in-flight vision calls so we don't
+        # overload the OpenAI API or the shared 4GB box. map() preserves order.
+        max_workers = min(3, len(page_args))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            ocr_pages = list(pool.map(lambda a: _ocr_page(*a), page_args))
+
+        # Phase 2: sequential persist + multi-page merge, strictly in page order.
         last_result = None
         all_warnings: list[dict[str, str]] = []
-
-        for idx, img_bytes in enumerate(page_images, start=1):
-            page_name = f"{page_filename_base}-p{idx}.png"
-            result = _process_single_image(img_bytes, page_name, "image/png")
+        for page in ocr_pages:
+            result = _persist_invoice_page(**page)
             last_result = result
             all_warnings.extend(result["warnings"])
 
-        # Return the LAST page's result (which has the final merged state),
-        # but combined warnings from all pages
+        # Return the LAST page's result (final merged state), combined warnings.
         assert last_result is not None
         last_result["warnings"] = all_warnings
         last_result["total_pages_processed"] = len(page_images)
@@ -719,13 +739,22 @@ def _process_upload(contents: bytes, filename: str, content_type: str) -> dict[s
     return result
 
 
-def _process_single_image(
+def _ocr_page(
     image_bytes: bytes,
     file_name: str,
     mime_type: str,
 ) -> dict[str, Any]:
-    """Full pipeline for ONE image: Tesseract → Vision → validate → store → DB save."""
+    """OCR-only stage for ONE image: Tesseract hint → GPT Vision extraction.
 
+    This is the SLOW, network-bound, side-effect-free half of the per-page
+    pipeline (no Supabase, no DB writes), so multi-page PDFs run it concurrently
+    (see _process_upload). Only thread-safe resources are touched here: the
+    OpenAI client (safe to share), a per-call fresh psycopg2 connection for
+    telemetry, and pytesseract with a unique temp file per call.
+    The storage upload + DB save/merge live in _persist_invoice_page, which MUST
+    stay sequential (Supabase client HTTP/2 is not thread-safe, and the
+    multi-page merge keys off rows the previous page just wrote).
+    """
     # 1) Tesseract OCR (as hint for Vision)
     try:
         ocr_text = _run_tesseract(image_bytes)
@@ -740,6 +769,26 @@ def _process_single_image(
         log.exception("vision failed")
         raise HTTPException(500, f"vision extraction failed: {e}")
 
+    return {
+        "image_bytes": image_bytes,
+        "file_name": file_name,
+        "mime_type": mime_type,
+        "ocr_text": ocr_text,
+        "parsed": parsed,
+    }
+
+
+def _persist_invoice_page(
+    image_bytes: bytes,
+    file_name: str,
+    mime_type: str,
+    ocr_text: str,
+    parsed: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist one ALREADY-OCR'd page: validate → Supabase storage → DB save
+    (multi-page merge) → revalidate. Touches the shared Supabase client and the
+    cross-page merge state, so callers MUST run this SEQUENTIALLY in page order
+    (a concurrent/out-of-order save would split one bill into duplicates)."""
     # 3) Validation warnings
     warnings = _validate_invoice(parsed)
 
@@ -792,6 +841,19 @@ def _process_single_image(
         "warnings": final_warnings,
         "preview_url": _sign_uploads_url(file_url),
     }
+
+
+def _process_single_image(
+    image_bytes: bytes,
+    file_name: str,
+    mime_type: str,
+) -> dict[str, Any]:
+    """Full pipeline for ONE image: Tesseract → Vision → validate → store → DB save.
+    Thin composition of the OCR stage and the persist stage so the single-image
+    path behaves exactly as before; the multi-page path in _process_upload calls
+    the two stages separately to parallelize OCR while keeping persist serial."""
+    page = _ocr_page(image_bytes, file_name, mime_type)
+    return _persist_invoice_page(**page)
 
 
 @app.get("/invoice/queue")
