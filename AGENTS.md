@@ -228,6 +228,10 @@ subcommand after matching the top-level `data["name"] == "vex"`.
 
 ---
 
+**58. `dr_backup` dies SILENTLY if Coolify loses the `SUPABASE_S3_*` env vars — it exits BEFORE writing a heartbeat.** (2026-06-08, H3) `scripts/backup.py` `main()` reads `SUPABASE_S3_ACCESS_KEY_ID` / `SUPABASE_S3_SECRET_ACCESS_KEY` from `os.environ`; on a missing var it `send_discord_alert()` + `sys.exit(1)`. The S3 keys can vanish from the Coolify app on a redeploy (still present in the local `.env`). The 02:00-Bangkok cron then fires nightly but aborts, `job_heartbeat.dr_backup.last_success_at` freezes, `/cron/health` returns 503, and the stale-job watcher only notices hours/days later — NO DR backups in between (this incident: none 2026-06-05→08). **Recovery:** re-add `SUPABASE_S3_ACCESS_KEY_ID` + `SUPABASE_S3_SECRET_ACCESS_KEY` + `SUPABASE_S3_REGION` in Coolify env (values are in the local `.env`) → Restart → run `python scripts/backup.py` in the Coolify Terminal to refresh `last_success_at` immediately. Also set `DISCORD_OPS_WEBHOOK_URL` (was missing) so backup's own ConfigError alert reaches Discord, not just the late stale-job watcher. **Hardening shipped this entry:** the ConfigError path now writes a failure-heartbeat (when `DATABASE_URL` is present) before exit, so the next config failure surfaces in `job_heartbeat` (`error_count` / `last_error_message`) instead of going silent.
+
+---
+
 ## Workspaces
 
 ```

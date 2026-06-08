@@ -510,6 +510,16 @@ def main():
         msg = f"❌ **DR Backup Alert (ConfigError)**\nMissing environment variables: {', '.join(missing_vars)}\nPlease check your .env file or environment configuration."
         print(msg, file=sys.stderr)
         send_discord_alert(msg)
+        # Record a failure heartbeat so a missing-config failure is VISIBLE in
+        # job_heartbeat (error_count / last_error_message) instead of silently freezing
+        # at the last good run. Only possible when DATABASE_URL itself is present;
+        # record_backup_heartbeat swallows its own errors, so this never blocks exit.
+        if database_url:
+            record_backup_heartbeat(
+                database_url,
+                ok=False,
+                error_message=f"ConfigError: missing {', '.join(missing_vars)}",
+            )
         sys.exit(1)
 
     # Generate unique output timestamp folder
