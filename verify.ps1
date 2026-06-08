@@ -21,13 +21,25 @@ Write-Host ""
 Write-Host "VEXONHQ pre-push verify" -ForegroundColor Cyan
 Write-Host "=======================" -ForegroundColor Cyan
 
+# Resolve the Python interpreter. Prefer the project venv so the check never
+# fails spuriously when the shell's PATH `python` is a bare/uv interpreter that
+# lacks the project deps (cv2, pandas, supabase, ...). Falls back to PATH python.
+$Py = "python"
+$venvPy = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+if (Test-Path $venvPy) {
+    $Py = $venvPy
+    Write-Host "  python: $venvPy (.venv)" -ForegroundColor Gray
+} else {
+    Write-Host "  python: PATH default (no .venv found)" -ForegroundColor Gray
+}
+
 # ──────────────────────────────────────────────────────────
 # 1. Python syntax check via compileall (built-in, no deps)
 # ──────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "[1/2] Python syntax check (compileall)..." -ForegroundColor Yellow
 
-& python -m compileall -q -x "(\.venv|venv|__pycache__|\.claude|\.git|\.pytest_cache|node_modules)" .
+& $Py -m compileall -q -x "(\.venv|venv|__pycache__|\.claude|\.git|\.pytest_cache|node_modules)" .
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host ""
@@ -42,11 +54,11 @@ Write-Host "  OK: all .py files parse cleanly" -ForegroundColor Green
 # ──────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "[1b] Offline unit tests..." -ForegroundColor Yellow
-& python -m pytest --version > $null 2> $null
+& $Py -m pytest --version > $null 2> $null
 if ($LASTEXITCODE -ne 0) {
     Write-Host "  SKIP: pytest not installed (pip install pytest)" -ForegroundColor Yellow
 } else {
-    & python -m pytest tests/ --ignore=tests/test_smoke.py --ignore=tests/test_workflow.py -q
+    & $Py -m pytest tests/ --ignore=tests/test_smoke.py --ignore=tests/test_workflow.py -q
     if ($LASTEXITCODE -ne 0) {
         Write-Host ""
         Write-Host "FAIL: offline unit tests failed. NOT safe to push." -ForegroundColor Red
@@ -69,12 +81,12 @@ if ($Smoke) {
     }
 
     # Check pytest availability via python -m (avoids PATH issues)
-    & python -m pytest --version > $null 2> $null
+    & $Py -m pytest --version > $null 2> $null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "  SKIP: pytest not installed. To enable smoke tests run:" -ForegroundColor Yellow
         Write-Host "    pip install pytest requests" -ForegroundColor Yellow
     } else {
-        & python -m pytest tests/test_smoke.py -v --tb=short
+        & $Py -m pytest tests/test_smoke.py -v --tb=short
         if ($LASTEXITCODE -ne 0) {
             Write-Host ""
             Write-Host "FAIL: smoke tests failed. Investigate before pushing." -ForegroundColor Red
