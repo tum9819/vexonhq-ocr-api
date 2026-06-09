@@ -932,6 +932,48 @@ def _scheduled_weekly_summary():
         raise  # let @_heartbeat record the failure (false-healthy fix)
 
 
+# ─────────────────────────────────────────────
+# POS sales-freshness watcher (Reliability Phase, 2026-06-09)
+# ─────────────────────────────────────────────
+# Daily 08:00 BKK: if pos_bills.sales_date is more than POS_FRESHNESS_STALE_DAYS
+# (default 2) behind today (BKK), nudge the ops Discord — a manual POS-import lag
+# must not silently make the dashboard / digests show stale-or-zero sales. Silent
+# when fresh (silence = healthy, like the drift watcher). Pure decision lives in
+# pos_freshness.py (unit-tested with no DB); this wrapper only does the IO.
+
+@_heartbeat("daily_pos_freshness_check", expected_interval_hours=24)
+def _scheduled_pos_freshness_check():
+    """APScheduler job: alert Discord when POS sales data is stale.
+
+    Reads max(sales_date) from pos_bills (POS source of truth). A DB read error
+    is RE-RAISED so @_heartbeat records ok=False and /cron/health + the stale
+    watchdog catch it (#28). The Discord post is best-effort (never fails the
+    job). No POS bills at all (NULL) -> log + return, never alert."""
+    from pos_freshness import pos_freshness_signal  # noqa: PLC0415
+
+    threshold = int(os.environ.get("POS_FRESHNESS_STALE_DAYS", "2"))
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT max(sales_date) FROM pos_bills")
+            latest = cur.fetchone()[0]
+    finally:
+        conn.close()
+
+    today = _today_bkk()
+    stale, days_behind, message = pos_freshness_signal(latest, today, threshold)
+
+    if latest is None:
+        log.info("POS freshness: no POS bills found — skipping alert")
+        return
+    if stale:
+        log.warning("POS freshness: STALE — latest=%s, %d day(s) behind", latest, days_behind)
+        from auto_diagnose import _post_to_discord  # noqa: PLC0415
+        _post_to_discord(message)  # best-effort: swallows its own errors
+    else:
+        log.info("POS freshness: OK — latest=%s, %d day(s) behind", latest, days_behind)
+
+
 # Start scheduler when module loads (FastAPI startup)
 _scheduler = BackgroundScheduler(
     timezone="Asia/Bangkok",
@@ -1002,6 +1044,14 @@ _scheduler.add_job(
     hour=2,
     minute=0,
     id="daily_dr_backup",
+    replace_existing=True,
+)
+_scheduler.add_job(
+    _scheduled_pos_freshness_check,
+    trigger="cron",
+    hour=8,
+    minute=0,                  # 08:00 BKK — free slot (digest 06:00, stock 07:00, drift 08:30)
+    id="daily_pos_freshness_check",
     replace_existing=True,
 )
 _scheduler.start()
