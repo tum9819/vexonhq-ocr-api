@@ -35,11 +35,14 @@ from datetime import date, datetime, timedelta
 from typing import Any, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
+from zoneinfo import ZoneInfo
+
+from auth_routes import _require_admin_role
 
 # Reuse main.get_db_conn (same pattern as pos_import.py)
 try:
@@ -56,6 +59,7 @@ logger = logging.getLogger("phase2_routes")
 router = APIRouter(tags=["phase2"])
 
 DEFAULT_BRANCH = "thawi_watthana"
+_BKK = ZoneInfo("Asia/Bangkok")  # container runs UTC — compute "today" in Bangkok
 
 
 # ============================================================
@@ -544,6 +548,153 @@ def dashboard_overview(
         }
     finally:
         conn.close()
+
+
+# ============================================================
+# Executive Dashboard (owner glance) — admin-only
+# ============================================================
+# A lean 6-card summary for the owner: sales / cost / estimated profit / bills
+# pending review / accounts payable / stock. Each card carries its own `as_of` +
+# `fresh` so a manual POS-import lag can't silently show misleading zeros (the
+# reason the daily_pos_freshness_check watcher exists). Sales/cost reuse
+# _summarize_month so they reconcile with /dashboard/overview BY CONSTRUCTION
+# (same source: v_daybook with P&L exclusions). Read-only, admin-gated.
+
+# Freshness thresholds (days) — a card is stale when (today - as_of) exceeds this.
+_FRESH_SALES_DAYS = 2   # POS/daybook is imported manually; >2 days behind = nudge
+_FRESH_STOCK_DAYS = 7   # stock snapshots are less frequent
+
+# Combined "rest of the cards" metrics — ONE round-trip (matters at cross-region
+# DB latency). Sales/cost come from _summarize_month separately (reconcile guarantee).
+_EXEC_METRICS_SQL = """
+WITH sa AS (
+    SELECT max(sales_date) AS as_of FROM public.pos_bills WHERE branch_code = %s
+)
+SELECT
+    (SELECT as_of FROM sa)                                                  AS sales_as_of,
+    (SELECT max(entry_date) FROM public.v_daybook WHERE branch_code = %s)   AS daybook_as_of,
+    (SELECT COALESCE(SUM(amount),0)::numeric FROM public.v_daybook
+        WHERE branch_code = %s AND direction = 'income'
+          AND entry_date >  (SELECT as_of FROM sa) - 30
+          AND entry_date <= (SELECT as_of FROM sa)
+          AND source NOT IN ('owner_capital','owner_advance','transfer_error','bank_statement',
+                             'vendor_payment','grab_payout','lineman_payout','pos_cash_deposit',
+                             'cash_withdrawal','loan_in','loan_repayment'))               AS sales_30d,
+    (SELECT COUNT(*) FROM public.vendor_bills WHERE review_status = 'needs_review')        AS bills_pending,
+    (SELECT COUNT(*) FROM public.vendor_bills WHERE payment_status = 'unpaid')             AS ap_count,
+    (SELECT COALESCE(SUM(amount),0)::numeric FROM public.vendor_bills
+        WHERE payment_status = 'unpaid')                                                   AS ap_total,
+    (SELECT COALESCE(SUM(amount),0)::numeric FROM public.vendor_bills
+        WHERE payment_status = 'unpaid'
+          AND due_date < (now() AT TIME ZONE 'Asia/Bangkok')::date)                        AS ap_overdue,
+    (SELECT max(snapshot_at)::date FROM public.pos_inventory_snapshots)                    AS stock_as_of,
+    (SELECT COUNT(*) FROM public.v_low_stock WHERE branch_code = %s)                       AS low_stock_count
+"""
+
+
+def _card_freshness(as_of: Optional[date], today: date, max_age_days: int) -> bool:
+    """Pure: True when as_of is within max_age_days of today (inclusive).
+    None (no data) -> False (never claim fresh). DB-free for unit tests."""
+    if as_of is None:
+        return False
+    return (today - as_of).days <= max_age_days
+
+
+def _min_date(*ds: Optional[date]) -> Optional[date]:
+    vals = [d for d in ds if d is not None]
+    return min(vals) if vals else None
+
+
+def _iso(d: Optional[date]) -> Optional[str]:
+    return d.isoformat() if d is not None else None
+
+
+def _build_executive_cards(summ: dict, m: dict, today: date) -> list[dict]:
+    """Pure card assembly (no DB) so freshness + reconciliation are unit-testable.
+    `summ` = _summarize_month output (sales/cost reconcile with /dashboard/overview);
+    `m` = the _EXEC_METRICS_SQL row as a dict."""
+    sales_as_of = m["sales_as_of"]
+    daybook_as_of = m["daybook_as_of"]
+    profit_as_of = _min_date(sales_as_of, daybook_as_of)
+    return [
+        {
+            "key": "sales_mtd", "title": "ยอดขายเดือนนี้",
+            "value": summ["sales_net"], "basis": "cash",
+            "source": "v_daybook (P&L-excluded; same source as /dashboard/overview)",
+            "as_of": _iso(sales_as_of),
+            "fresh": _card_freshness(sales_as_of, today, _FRESH_SALES_DAYS),
+            "secondary": {"label": "30 วันล่าสุด", "value": m["sales_30d"]},
+        },
+        {
+            "key": "cost_mtd", "title": "ต้นทุน/รายจ่ายเดือนนี้",
+            "value": summ["expense_total"], "basis": "cash",
+            "source": "v_daybook (P&L-excluded)",
+            "as_of": _iso(daybook_as_of),
+            "fresh": _card_freshness(daybook_as_of, today, _FRESH_SALES_DAYS),
+        },
+        {
+            "key": "profit_est", "title": "กำไรประมาณการ (cash)",
+            "value": summ["gross_profit"], "margin_pct": summ["gross_margin_pct"],
+            "note": "ประมาณการ cash-basis (income − expense)",
+            "as_of": _iso(profit_as_of),
+            "fresh": _card_freshness(profit_as_of, today, _FRESH_SALES_DAYS),
+        },
+        {
+            "key": "bills_pending_review", "title": "บิลค้างตรวจ",
+            "value": m["bills_pending"], "as_of": "live", "fresh": True,
+        },
+        {
+            "key": "ap_outstanding", "title": "เจ้าหนี้คงค้าง",
+            "value": m["ap_total"], "count": m["ap_count"], "as_of": "live", "fresh": True,
+            "alert": {"label": "เกินกำหนดชำระ", "value": m["ap_overdue"]},
+        },
+        {
+            "key": "stock", "title": "สต็อกล่าสุด",
+            "as_of": _iso(m["stock_as_of"]),
+            "fresh": _card_freshness(m["stock_as_of"], today, _FRESH_STOCK_DAYS),
+            "low_stock_count": m["low_stock_count"],
+        },
+    ]
+
+
+@router.get("/dashboard/executive")
+def dashboard_executive(
+    month: Optional[str] = Query(None, description="YYYY-MM, default current"),
+    branch: str = Query(DEFAULT_BRANCH),
+    _admin: dict = Depends(_require_admin_role),
+):
+    """Executive (owner) glance — ADMIN-ONLY. Six cards, each with as_of + fresh.
+    Sales/cost reuse _summarize_month (reconcile with /dashboard/overview)."""
+    month_start = _month_start(month)
+    today = datetime.now(_BKK).date()
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            summ = _summarize_month(cur, month_start, branch)
+            cur.execute(_EXEC_METRICS_SQL, (branch, branch, branch, branch))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    m = {
+        "sales_as_of": row[0],
+        "daybook_as_of": row[1],
+        "sales_30d": float(row[2] or 0),
+        "bills_pending": int(row[3] or 0),
+        "ap_count": int(row[4] or 0),
+        "ap_total": float(row[5] or 0),
+        "ap_overdue": float(row[6] or 0),
+        "stock_as_of": row[7],
+        "low_stock_count": int(row[8] or 0),
+    }
+    return {
+        "generated_at": datetime.now(_BKK).isoformat(),
+        "currency": "THB",
+        "month": month_start.strftime("%Y-%m"),
+        "branch": branch,
+        "cards": _build_executive_cards(summ, m, today),
+    }
 
 
 # ============================================================

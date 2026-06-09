@@ -81,6 +81,7 @@ AUTHED_ROUTES = [
 
     # Dashboard + Daybook
     ("GET", "/dashboard/overview"),
+    ("GET", "/dashboard/executive"),
     ("GET", "/dashboard/category-trends"),
     ("GET", "/daybook/list"),
     ("GET", "/daybook/summary"),

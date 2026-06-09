@@ -41,9 +41,12 @@ GATED_NAMES = {
     # AR/AP financial-record mutations (phase3_arap_routes)
     "create_counterparty", "patch_counterparty", "soft_delete_counterparty",
     "patch_entry", "cancel_entry", "create_payment", "delete_payment",
+    # Executive Dashboard is a READ but exposes profit/AP/financial overview —
+    # admin-only (staff must not see it even read-only).
+    "dashboard_executive",
 }
-# create_entry and slip_match each map to TWO gated routes, so 26 names -> 28 routes.
-EXPECTED_ROUTE_COUNT = 28
+# create_entry and slip_match each map to TWO gated routes, so 27 names -> 29 routes.
+EXPECTED_ROUTE_COUNT = 29
 
 
 def _fake_verify(token):
