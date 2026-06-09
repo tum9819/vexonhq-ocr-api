@@ -244,10 +244,45 @@ def get_supabase() -> Client:
     return _supabase_client
 
 
+APP_VERSION = "3.7.0"
+
+# ============================================================
+# Sentry (opt-in error tracking) — OPS / Reliability Phase
+# ============================================================
+# Captures unhandled exceptions + tracebacks. Entirely opt-in: with no
+# SENTRY_DSN set, sentry_sdk.init() is never called and the app behaves
+# exactly as before (same pattern as auto_diagnose). The [fastapi] extra
+# auto-instruments Starlette/FastAPI, so unhandled 500s are reported with
+# tracebacks without any manual middleware or webhook. HTTPException (4xx)
+# is not reported. Any init failure is swallowed so monitoring can never
+# break boot.
+_sentry_dsn = os.environ.get("SENTRY_DSN", "").strip()
+if _sentry_dsn:
+    try:
+        import sentry_sdk
+
+        _sentry_env = os.environ.get("SENTRY_ENVIRONMENT", "production")
+        _sentry_release = os.environ.get("SENTRY_RELEASE", APP_VERSION)
+        sentry_sdk.init(
+            dsn=_sentry_dsn,
+            environment=_sentry_env,
+            release=_sentry_release,
+            # Error tracking only by default; performance tracing is opt-in
+            # via env to avoid extra overhead/quota on the 4GB VPS + free tier.
+            traces_sample_rate=float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "0.0")),
+            send_default_pii=False,
+        )
+        log.info("Sentry initialized (release=%s, env=%s)", _sentry_release, _sentry_env)
+    except Exception:
+        # Never let monitoring instrumentation break boot.
+        log.exception("Sentry init failed — continuing without it")
+else:
+    log.info("Sentry disabled (no SENTRY_DSN set)")
+
 # ============================================================
 # FastAPI app
 # ============================================================
-app = FastAPI(title="VEXONHQ OCR API", version="3.7.0")
+app = FastAPI(title="VEXONHQ OCR API", version=APP_VERSION)
 app.include_router(auth_router)   # Auth FIRST — /auth/* routes are public
 app.include_router(pos_router)
 app.include_router(phase2_router)
