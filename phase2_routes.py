@@ -597,7 +597,15 @@ SELECT
         WHERE branch_code = %s AND sales_date = (SELECT as_of FROM sa) AND bill_net > 0)    AS latest_day_sales,
     (SELECT prev FROM pa)                                                                  AS prev_day,
     (SELECT COALESCE(SUM(bill_net),0)::numeric FROM public.pos_bills
-        WHERE branch_code = %s AND sales_date = (SELECT prev FROM pa) AND bill_net > 0)     AS prev_day_sales
+        WHERE branch_code = %s AND sales_date = (SELECT prev FROM pa) AND bill_net > 0)     AS prev_day_sales,
+    (SELECT COALESCE(SUM(amount),0)::numeric FROM public.vendor_bills
+        WHERE payment_status = 'unpaid'
+          AND due_date >= (now() AT TIME ZONE 'Asia/Bangkok')::date
+          AND due_date <= (now() AT TIME ZONE 'Asia/Bangkok')::date + 7)                   AS ap_due_7d,
+    (SELECT COUNT(*) FROM public.vendor_bills
+        WHERE payment_status = 'unpaid'
+          AND due_date >= (now() AT TIME ZONE 'Asia/Bangkok')::date
+          AND due_date <= (now() AT TIME ZONE 'Asia/Bangkok')::date + 7)                   AS ap_due_7d_count
 """
 
 
@@ -656,6 +664,7 @@ def _build_executive_cards(summ: dict, m: dict, today: date) -> list[dict]:
             "key": "ap_outstanding", "title": "เจ้าหนี้คงค้าง",
             "value": m["ap_total"], "count": m["ap_count"], "as_of": "live", "fresh": True,
             "alert": {"label": "เกินกำหนดชำระ", "value": m["ap_overdue"]},
+            "due_soon": {"days": 7, "value": float(m.get("ap_due_7d") or 0), "count": int(m.get("ap_due_7d_count") or 0)},
         },
         {
             "key": "stock", "title": "สต็อกล่าสุด",
@@ -714,6 +723,8 @@ def dashboard_executive(
         "latest_day_sales": float(row[9] or 0),
         "prev_day": row[10],
         "prev_day_sales": float(row[11] or 0),
+        "ap_due_7d": float(row[12] or 0),
+        "ap_due_7d_count": int(row[13] or 0),
     }
     return {
         "generated_at": datetime.now(_BKK).isoformat(),

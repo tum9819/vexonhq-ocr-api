@@ -129,3 +129,16 @@ def test_daily_absent_when_no_sales():
     m = dict(METRICS, sales_as_of=None, latest_day_sales=0.0, prev_day=None, prev_day_sales=0.0)
     card = _cards_by_key(_build_executive_cards(SUMM, m, TODAY))["sales_mtd"]
     assert "daily" not in card
+
+
+# ── P3: AP due in the next 7 days (due_soon) ────────────────────────
+def test_ap_due_soon_present():
+    m = dict(METRICS, ap_due_7d=125000.0, ap_due_7d_count=8)
+    ap = _cards_by_key(_build_executive_cards(SUMM, m, TODAY))["ap_outstanding"]
+    assert ap["due_soon"] == {"days": 7, "value": 125000.0, "count": 8}
+
+
+def test_ap_due_soon_zero_when_none():
+    m = dict(METRICS, ap_due_7d=0.0, ap_due_7d_count=0)
+    ap = _cards_by_key(_build_executive_cards(SUMM, m, TODAY))["ap_outstanding"]
+    assert ap["due_soon"]["value"] == 0.0 and ap["due_soon"]["count"] == 0
