@@ -605,7 +605,11 @@ SELECT
     (SELECT COUNT(*) FROM public.vendor_bills
         WHERE payment_status = 'unpaid'
           AND due_date >= (now() AT TIME ZONE 'Asia/Bangkok')::date
-          AND due_date <= (now() AT TIME ZONE 'Asia/Bangkok')::date + 7)                   AS ap_due_7d_count
+          AND due_date <= (now() AT TIME ZONE 'Asia/Bangkok')::date + 7)                   AS ap_due_7d_count,
+    (SELECT COUNT(*) FROM public.pos_inventory_items
+        WHERE qty_in_stock < 0
+          AND snapshot_id = (SELECT id FROM public.pos_inventory_snapshots
+                             WHERE branch_code = %s ORDER BY snapshot_at DESC LIMIT 1))     AS negative_stock_count
 """
 
 
@@ -624,6 +628,51 @@ def _min_date(*ds: Optional[date]) -> Optional[date]:
 
 def _iso(d: Optional[date]) -> Optional[str]:
     return d.isoformat() if d is not None else None
+
+
+# P4: backend-owned per-card status (level, reason). Pure → unit-testable.
+# Reason keys are stable machine keys; healthy → reason None.
+def _profit_status(profit: float, margin: float):
+    if profit < 0:                      # loss = profit<0 (correct when sales=0 too)
+        return "critical", "loss"
+    if margin < 10:
+        return "warning", "thin_margin"
+    return "healthy", None
+
+
+def _cost_status(sales: float, cost: float):
+    if sales <= 0:                      # can't assess ratio → no false alarm
+        return "healthy", None
+    ratio = cost / sales * 100
+    if ratio <= 70:
+        return "healthy", None
+    if ratio <= 85:
+        return "warning", "high_cost_ratio"
+    return "critical", "high_cost_ratio"
+
+
+def _ap_status(overdue: float):
+    if overdue == 0:
+        return "healthy", None
+    if overdue <= 5000:
+        return "warning", "overdue_amount"
+    return "critical", "overdue_amount"
+
+
+def _bills_status(n: int):
+    if n == 0:
+        return "healthy", None
+    if n <= 10:
+        return "warning", "pending_count"
+    return "critical", "pending_count"
+
+
+def _stock_status(neg: int):
+    if neg == 0:
+        return "healthy", None
+    if neg <= 5:
+        return "warning", "negative_stock"
+    return "critical", "negative_stock"
 
 
 def _build_executive_cards(summ: dict, m: dict, today: date) -> list[dict]:
@@ -671,6 +720,7 @@ def _build_executive_cards(summ: dict, m: dict, today: date) -> list[dict]:
             "as_of": _iso(m["stock_as_of"]),
             "fresh": _card_freshness(m["stock_as_of"], today, _FRESH_STOCK_DAYS),
             "low_stock_count": m["low_stock_count"],
+            "negative_stock_count": int(m.get("negative_stock_count") or 0),
         },
     ]
     # P2: latest-day vs prior-day sales (honest under POS lag). Additive on sales_mtd.
@@ -687,6 +737,13 @@ def _build_executive_cards(summ: dict, m: dict, today: date) -> list[dict]:
             daily["prev"] = {"date": _iso(prev_day), "value": prev_val}
             daily["change_pct"] = round((latest_val - prev_val) / prev_val * 100, 1) if prev_val else None
         cards[0]["daily"] = daily  # cards[0] is the sales_mtd card
+
+    # P4: backend-owned traffic-light status + status_reason (5 cards; sales has none).
+    cards[1]["status"], cards[1]["status_reason"] = _cost_status(summ["sales_net"], summ["expense_total"])
+    cards[2]["status"], cards[2]["status_reason"] = _profit_status(summ["gross_profit"], summ["gross_margin_pct"])
+    cards[3]["status"], cards[3]["status_reason"] = _bills_status(int(m["bills_pending"]))
+    cards[4]["status"], cards[4]["status_reason"] = _ap_status(float(m["ap_overdue"]))
+    cards[5]["status"], cards[5]["status_reason"] = _stock_status(int(m.get("negative_stock_count") or 0))
     return cards
 
 
@@ -705,7 +762,7 @@ def dashboard_executive(
     try:
         with conn.cursor() as cur:
             summ = _summarize_month(cur, month_start, branch)
-            cur.execute(_EXEC_METRICS_SQL, (branch,) * 7)
+            cur.execute(_EXEC_METRICS_SQL, (branch,) * 8)
             row = cur.fetchone()
     finally:
         conn.close()
@@ -725,6 +782,7 @@ def dashboard_executive(
         "prev_day_sales": float(row[11] or 0),
         "ap_due_7d": float(row[12] or 0),
         "ap_due_7d_count": int(row[13] or 0),
+        "negative_stock_count": int(row[14] or 0),
     }
     return {
         "generated_at": datetime.now(_BKK).isoformat(),
