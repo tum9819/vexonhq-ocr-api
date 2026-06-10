@@ -569,6 +569,10 @@ _FRESH_STOCK_DAYS = 7   # stock snapshots are less frequent
 _EXEC_METRICS_SQL = """
 WITH sa AS (
     SELECT max(sales_date) AS as_of FROM public.pos_bills WHERE branch_code = %s
+),
+pa AS (
+    SELECT max(sales_date) AS prev FROM public.pos_bills
+    WHERE branch_code = %s AND bill_net > 0 AND sales_date < (SELECT as_of FROM sa)
 )
 SELECT
     (SELECT as_of FROM sa)                                                  AS sales_as_of,
@@ -588,7 +592,12 @@ SELECT
         WHERE payment_status = 'unpaid'
           AND due_date < (now() AT TIME ZONE 'Asia/Bangkok')::date)                        AS ap_overdue,
     (SELECT max(snapshot_at)::date FROM public.pos_inventory_snapshots)                    AS stock_as_of,
-    (SELECT COUNT(*) FROM public.v_low_stock WHERE branch_code = %s)                       AS low_stock_count
+    (SELECT COUNT(*) FROM public.v_low_stock WHERE branch_code = %s)                       AS low_stock_count,
+    (SELECT COALESCE(SUM(bill_net),0)::numeric FROM public.pos_bills
+        WHERE branch_code = %s AND sales_date = (SELECT as_of FROM sa) AND bill_net > 0)    AS latest_day_sales,
+    (SELECT prev FROM pa)                                                                  AS prev_day,
+    (SELECT COALESCE(SUM(bill_net),0)::numeric FROM public.pos_bills
+        WHERE branch_code = %s AND sales_date = (SELECT prev FROM pa) AND bill_net > 0)     AS prev_day_sales
 """
 
 
@@ -616,7 +625,7 @@ def _build_executive_cards(summ: dict, m: dict, today: date) -> list[dict]:
     sales_as_of = m["sales_as_of"]
     daybook_as_of = m["daybook_as_of"]
     profit_as_of = _min_date(sales_as_of, daybook_as_of)
-    return [
+    cards = [
         {
             "key": "sales_mtd", "title": "ยอดขายเดือนนี้",
             "value": summ["sales_net"], "basis": "cash",
@@ -655,6 +664,21 @@ def _build_executive_cards(summ: dict, m: dict, today: date) -> list[dict]:
             "low_stock_count": m["low_stock_count"],
         },
     ]
+    # P2: latest-day vs prior-day sales (honest under POS lag). Additive on sales_mtd.
+    if sales_as_of is not None:
+        daily = {
+            "latest": {"date": _iso(sales_as_of), "value": float(m.get("latest_day_sales") or 0)},
+            "prev": None,
+            "change_pct": None,
+        }
+        prev_day = m.get("prev_day")
+        if prev_day is not None:
+            prev_val = float(m.get("prev_day_sales") or 0)
+            latest_val = daily["latest"]["value"]
+            daily["prev"] = {"date": _iso(prev_day), "value": prev_val}
+            daily["change_pct"] = round((latest_val - prev_val) / prev_val * 100, 1) if prev_val else None
+        cards[0]["daily"] = daily  # cards[0] is the sales_mtd card
+    return cards
 
 
 @router.get("/dashboard/executive")
@@ -672,7 +696,7 @@ def dashboard_executive(
     try:
         with conn.cursor() as cur:
             summ = _summarize_month(cur, month_start, branch)
-            cur.execute(_EXEC_METRICS_SQL, (branch, branch, branch, branch))
+            cur.execute(_EXEC_METRICS_SQL, (branch,) * 7)
             row = cur.fetchone()
     finally:
         conn.close()
@@ -687,6 +711,9 @@ def dashboard_executive(
         "ap_overdue": float(row[6] or 0),
         "stock_as_of": row[7],
         "low_stock_count": int(row[8] or 0),
+        "latest_day_sales": float(row[9] or 0),
+        "prev_day": row[10],
+        "prev_day_sales": float(row[11] or 0),
     }
     return {
         "generated_at": datetime.now(_BKK).isoformat(),

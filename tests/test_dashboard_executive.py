@@ -101,3 +101,31 @@ def test_freshness_reflected_per_card_when_stale():
     assert cards["stock"]["fresh"] is True          # 4 days <= 7
     assert cards["ap_outstanding"]["fresh"] is True  # live
     assert cards["stock"]["low_stock_count"] == 64
+
+
+# ── P2: latest-day vs prior-day sales (daily) ───────────────────────
+def test_daily_two_days_change_pct():
+    m = dict(METRICS, latest_day_sales=12500.0, prev_day=date(2026, 6, 7), prev_day_sales=14200.0)
+    daily = _cards_by_key(_build_executive_cards(SUMM, m, TODAY))["sales_mtd"]["daily"]
+    assert daily["latest"] == {"date": "2026-06-08", "value": 12500.0}
+    assert daily["prev"] == {"date": "2026-06-07", "value": 14200.0}
+    assert daily["change_pct"] == round((12500.0 - 14200.0) / 14200.0 * 100, 1)
+
+
+def test_daily_one_day_prev_null():
+    m = dict(METRICS, latest_day_sales=12500.0, prev_day=None, prev_day_sales=0.0)
+    daily = _cards_by_key(_build_executive_cards(SUMM, m, TODAY))["sales_mtd"]["daily"]
+    assert daily["latest"]["value"] == 12500.0
+    assert daily["prev"] is None and daily["change_pct"] is None
+
+
+def test_daily_prev_zero_change_null():
+    m = dict(METRICS, latest_day_sales=12500.0, prev_day=date(2026, 6, 7), prev_day_sales=0.0)
+    daily = _cards_by_key(_build_executive_cards(SUMM, m, TODAY))["sales_mtd"]["daily"]
+    assert daily["prev"]["value"] == 0.0 and daily["change_pct"] is None
+
+
+def test_daily_absent_when_no_sales():
+    m = dict(METRICS, sales_as_of=None, latest_day_sales=0.0, prev_day=None, prev_day_sales=0.0)
+    card = _cards_by_key(_build_executive_cards(SUMM, m, TODAY))["sales_mtd"]
+    assert "daily" not in card
