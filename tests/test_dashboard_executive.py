@@ -142,3 +142,62 @@ def test_ap_due_soon_zero_when_none():
     m = dict(METRICS, ap_due_7d=0.0, ap_due_7d_count=0)
     ap = _cards_by_key(_build_executive_cards(SUMM, m, TODAY))["ap_outstanding"]
     assert ap["due_soon"]["value"] == 0.0 and ap["due_soon"]["count"] == 0
+
+
+# ── P4: per-card status + status_reason ─────────────────────────────
+def _ms(**kw):
+    return dict(METRICS, **kw)
+
+
+def test_status_healthy_has_null_reason_all_cards():
+    m = _ms(ap_overdue=0.0, bills_pending=0, negative_stock_count=0)
+    cards = _cards_by_key(_build_executive_cards(SUMM, m, TODAY))
+    for k in ["profit_est", "cost_mtd", "ap_outstanding", "bills_pending_review", "stock"]:
+        assert cards[k]["status"] == "healthy", k
+        assert cards[k]["status_reason"] is None, k
+
+
+def test_sales_card_has_no_status():
+    cards = _cards_by_key(_build_executive_cards(SUMM, _ms(negative_stock_count=0), TODAY))
+    assert "status" not in cards["sales_mtd"]
+    assert "status_reason" not in cards["sales_mtd"]
+
+
+def test_profit_status_levels():
+    m = _ms(negative_stock_count=0)
+    pc = lambda s: _cards_by_key(_build_executive_cards(s, m, TODAY))["profit_est"]
+    loss = dict(SUMM, gross_profit=-100.0, gross_margin_pct=-5.0)
+    thin = dict(SUMM, gross_profit=100.0, gross_margin_pct=5.0)
+    ok = dict(SUMM, gross_profit=100.0, gross_margin_pct=10.0)
+    assert (pc(loss)["status"], pc(loss)["status_reason"]) == ("critical", "loss")
+    assert (pc(thin)["status"], pc(thin)["status_reason"]) == ("warning", "thin_margin")
+    assert (pc(ok)["status"], pc(ok)["status_reason"]) == ("healthy", None)
+
+
+def test_cost_status_levels_and_sales_zero_edge():
+    m = _ms(negative_stock_count=0)
+    cc = lambda s: _cards_by_key(_build_executive_cards(s, m, TODAY))["cost_mtd"]
+    assert cc(dict(SUMM, sales_net=100.0, expense_total=70.0))["status"] == "healthy"   # ratio 70
+    assert cc(dict(SUMM, sales_net=100.0, expense_total=80.0))["status"] == "warning"   # 80
+    assert cc(dict(SUMM, sales_net=100.0, expense_total=90.0))["status"] == "critical"  # 90
+    z = cc(dict(SUMM, sales_net=0.0, expense_total=500.0))
+    assert z["status"] == "healthy" and z["status_reason"] is None
+
+
+def test_ap_status_boundaries():
+    m0 = _ms(ap_overdue=0.0, negative_stock_count=0)
+    mw = _ms(ap_overdue=5000.0, negative_stock_count=0)
+    mc = _ms(ap_overdue=5000.01, negative_stock_count=0)
+    assert _cards_by_key(_build_executive_cards(SUMM, m0, TODAY))["ap_outstanding"]["status"] == "healthy"
+    assert _cards_by_key(_build_executive_cards(SUMM, mw, TODAY))["ap_outstanding"]["status"] == "warning"
+    apc = _cards_by_key(_build_executive_cards(SUMM, mc, TODAY))["ap_outstanding"]
+    assert apc["status"] == "critical" and apc["status_reason"] == "overdue_amount"
+
+
+def test_bills_and_stock_status():
+    assert _cards_by_key(_build_executive_cards(SUMM, _ms(bills_pending=10, negative_stock_count=0), TODAY))["bills_pending_review"]["status"] == "warning"
+    assert _cards_by_key(_build_executive_cards(SUMM, _ms(bills_pending=11, negative_stock_count=0), TODAY))["bills_pending_review"]["status"] == "critical"
+    sw = _cards_by_key(_build_executive_cards(SUMM, _ms(negative_stock_count=5), TODAY))["stock"]
+    assert sw["status"] == "warning" and sw["status_reason"] == "negative_stock"
+    assert sw["negative_stock_count"] == 5
+    assert _cards_by_key(_build_executive_cards(SUMM, _ms(negative_stock_count=6), TODAY))["stock"]["status"] == "critical"
