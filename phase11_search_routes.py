@@ -111,9 +111,37 @@ def _call_claude_filter(query: str) -> SearchFilter:
     return SearchFilter(**parsed)
 
 
-def _build_and_run_query(f: SearchFilter, limit: int) -> list:
+# M0: AI-emitted category codes -> real v_daybook codes. The AI prompt used to
+# emit codes that don't exist in v_daybook, so searches returned almost nothing.
+# A single code may expand to several real codes (a category group).
+_CATEGORY_ALIASES: dict[str, list[str]] = {
+    "beverage_raw": ["raw_beverage"],
+    "reimbursement": ["refund_received"],
+    # "อาหาร/วัตถุดิบ" → all raw food materials, not just food_raw (33 rows).
+    "food_raw": ["food_raw", "raw_meat", "raw_veggies", "raw_seasoning", "raw_oil_gas"],
+}
+
+
+def _expand_category(code: Optional[str]) -> list[str]:
+    """Map an AI-emitted category_code to the real v_daybook code(s).
+
+    Pure + deterministic. Unknown/already-correct codes pass through unchanged.
+    Returns [] for empty input.
+    """
+    if not code:
+        return []
+    return _CATEGORY_ALIASES.get(code, [code])
+
+
+def _build_sql(f: SearchFilter, limit: int) -> tuple[str, list]:
+    """Build the parameterized v_daybook query from a SearchFilter.
+
+    Pure (no DB) so it is unit-testable. The category filter expands the
+    AI-emitted code to the real v_daybook code(s) via `_expand_category` and
+    matches with `IN (...)` so a single intent (e.g. "อาหาร") can cover a group.
+    """
     conditions = ["1=1"]
-    params = []
+    params: list = []
 
     if f.date_from:
         conditions.append("d.entry_date >= %s")
@@ -141,8 +169,11 @@ def _build_and_run_query(f: SearchFilter, limit: int) -> list:
         conditions.append("d.source = %s")
         params.append(f.source)
     if f.category_code:
-        conditions.append("d.category_code = %s")
-        params.append(f.category_code)
+        codes = _expand_category(f.category_code)
+        if codes:
+            placeholders = ", ".join(["%s"] * len(codes))
+            conditions.append(f"d.category_code IN ({placeholders})")
+            params.extend(codes)
 
     sql = """
         SELECT
@@ -160,6 +191,11 @@ def _build_and_run_query(f: SearchFilter, limit: int) -> list:
         LIMIT %s
     """.format(where=" AND ".join(conditions))
     params.append(limit)
+    return sql, params
+
+
+def _build_and_run_query(f: SearchFilter, limit: int) -> list:
+    sql, params = _build_sql(f, limit)
 
     try:
         conn = get_db_conn()
