@@ -1609,3 +1609,85 @@ def test_resolution_validation_errors_via_api():
             conn_clean.close()
 
 
+def test_branch_authority_lifecycle_with_thai_request_branch():
+    """
+    Integration test for Blocker 1 (Branch Authority):
+    - Request branch = 'ทวีวัฒนา' (Thai name alias)
+    - File branch = 'thawi_watthana' or 'ทวีวัฒนา'
+    - Stage succeeds, /diff succeeds, Approve succeeds, no branch_mismatch
+    - Every row in public.stock_in_lines has branch_code = 'thawi_watthana'
+    """
+    import_id = str(uuid.uuid4())
+    conn_setup = psycopg2.connect(_DB_URL)
+    conn_setup.autocommit = True
+    try:
+        with conn_setup.cursor() as cur_setup:
+            from stock_in_import import normalize_branch_code
+            canonical_branch = normalize_branch_code("ทวีวัฒนา")
+            assert canonical_branch == "thawi_watthana"
+            
+            cur_setup.execute("""
+                INSERT INTO public.pos_imports
+                  (id, report_type, branch_code, source_file, file_size,
+                   file_hash, status, uploaded_by, uploaded_at, processing_started_at)
+                VALUES (%s, 'stock_in_refill', %s, 'test_thai_branch.xlsx', 0, %s, 'parsing', 'testuser', now(), now())
+            """, (import_id, canonical_branch, str(uuid.uuid4())))
+    finally:
+        conn_setup.close()
+
+    try:
+        df = _make_df([
+            _base_row(item_name="ไข่", สาขา="ทวีวัฒนา", qty=10, unit_cost=5, net_cost=50, received_date="01/05/2026"),
+        ])
+        
+        def _dummy_set(status_dict):
+            assert status_dict["status"] == "success"
+            
+        _stage_stock_in(import_id, df, "ทวีวัฒนา", "admin-uid", _dummy_set)
+
+        client = TestClient(main.app)
+        main.verify_token = _fake_verify
+        auth_routes.verify_token = _fake_verify
+
+        resp_diff = client.get(
+            f"/pos/stock-in/diff/{import_id}",
+            headers={"Authorization": "Bearer ADMIN"}
+        )
+        assert resp_diff.status_code == 200
+        diff_data = resp_diff.json()
+        assert diff_data["branch_code"] == "thawi_watthana"
+        assert diff_data["counts"]["new"] == 1
+
+        resp_approve = client.post(
+            f"/pos/stock-in/approve/{import_id}",
+            headers={"Authorization": "Bearer ADMIN"},
+            json={
+                "expected_counts": diff_data["counts"],
+                "resolutions": [],
+            }
+        )
+        assert resp_approve.status_code == 200
+
+        conn_verify = psycopg2.connect(_DB_URL)
+        try:
+            with conn_verify.cursor() as cur_verify:
+                cur_verify.execute("SELECT branch_code FROM public.stock_in_lines WHERE import_id=%s", (import_id,))
+                rows = cur_verify.fetchall()
+                assert len(rows) == 1
+                assert rows[0][0] == "thawi_watthana"
+        finally:
+            conn_verify.close()
+
+    finally:
+        conn_clean = psycopg2.connect(_DB_URL)
+        conn_clean.autocommit = True
+        try:
+            with conn_clean.cursor() as cur_clean:
+                cur_clean.execute("DELETE FROM public.stock_in_staging WHERE import_id=%s", (import_id,))
+                cur_clean.execute("DELETE FROM public.stock_in_lines WHERE import_id=%s", (import_id,))
+                cur_clean.execute("DELETE FROM public.stock_in_reconcile_log WHERE import_id_new=%s", (import_id,))
+                cur_clean.execute("DELETE FROM public.pos_imports WHERE id=%s", (import_id,))
+        finally:
+            conn_clean.close()
+
+

@@ -39,7 +39,7 @@ except ImportError:
     def _require_admin_role(request: Request) -> dict:  # type: ignore[misc]
         raise HTTPException(500, "auth not available")
 
-from stock_in_import import parse_stock_in_file, reconcile_diff
+from stock_in_import import parse_stock_in_file, reconcile_diff, normalize_branch_code
 
 logger = logging.getLogger("stock_in_routes")
 router = APIRouter(prefix="/pos", tags=["pos"])
@@ -108,6 +108,7 @@ def _fetch_staged_rows(cur, import_id: str) -> list[dict]:
 
 
 def _fetch_committed_rows(cur, branch_code: str, period_start, period_end) -> list[dict]:
+    branch_code = normalize_branch_code(branch_code)
     cur.execute(
         f"SELECT {', '.join(_LINE_COLS)} FROM public.stock_in_lines "
         "WHERE branch_code = %s AND received_date BETWEEN %s AND %s "
@@ -245,6 +246,7 @@ def _stage_stock_in(
 
     Any single parse error → status='failed', zero rows staged.
     """
+    branch_code = normalize_branch_code(branch_code)
     conn = None
     try:
         # 1. Parse atomically (raises ValueError on any bad row)
@@ -469,6 +471,7 @@ def get_stock_in_diff(import_id: str, _admin: dict = Depends(_require_admin_role
             if not row:
                 raise HTTPException(404, f"Import {import_id} not found")
             status, branch_code, period_start, period_end = row
+            branch_code = normalize_branch_code(branch_code)
 
             if status not in ("needs_review", "staged"):
                 raise HTTPException(
@@ -544,6 +547,7 @@ def approve_stock_in(
             if not row:
                 raise HTTPException(404, f"Import {import_id} not found")
             status, branch_code, period_start, period_end = row
+            branch_code = normalize_branch_code(branch_code)
 
             # ── 4. Status gate ────────────────────────────────────────────────
             if status not in ("needs_review", "staged"):
@@ -719,6 +723,7 @@ def cancel_stock_in(
             if not row:
                 raise HTTPException(404, f"Import {import_id} not found")
             status, branch_code, period_start, period_end = row
+            branch_code = normalize_branch_code(branch_code)
 
             if status not in ("needs_review", "staged"):
                 raise HTTPException(409, {
@@ -819,6 +824,7 @@ def recover_stock_in(import_id: str, _admin: dict = Depends(_require_admin_role)
             if not row:
                 raise HTTPException(404, f"Import {import_id} not found")
             status, branch_code, uploaded_by, processing_started_at = row
+            branch_code = normalize_branch_code(branch_code)
 
             if status != "parsing":
                 raise HTTPException(409, {

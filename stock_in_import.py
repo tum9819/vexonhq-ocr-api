@@ -416,7 +416,7 @@ def reconcile_diff(
     matched_committed_ids = set()
 
     all_iks = set(staged_by_ik.keys()).union(committed_by_ik.keys())
-    for ik in all_iks:
+    for ik in sorted(all_iks):
         s_list = staged_by_ik[ik]
         c_list = committed_by_ik[ik]
         pair_count = min(len(s_list), len(c_list))

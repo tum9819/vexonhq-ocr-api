@@ -1117,6 +1117,24 @@ def _process_import_background(
         with conn.cursor() as cur:
             import_id = str(uuid.uuid4())
 
+            # stock_in_refill uses a staged import flow (not the write-through parser path)
+            if rtype == "stock_in_refill":
+                from stock_in_import import normalize_branch_code
+                canonical_branch = normalize_branch_code(branch_code)
+                cur.execute("""
+                    INSERT INTO public.pos_imports
+                      (id, report_type, branch_code, source_file, file_size,
+                       file_hash, status, uploaded_by, uploaded_at,
+                       processing_started_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, 'parsing', %s, now(), now())
+                """, (import_id, rtype, canonical_branch, filename,
+                      len(content), file_hash, uploaded_by))
+                conn.commit()
+
+                from stock_in_routes import _stage_stock_in  # lazy import — avoids circular
+                _stage_stock_in(import_id, df, canonical_branch, uploaded_by, _set)
+                return
+
             # Insert pos_imports row; processing_started_at stamps when background
             # work begins so the /recover endpoint can detect stuck imports.
             cur.execute("""
@@ -1128,12 +1146,6 @@ def _process_import_background(
             """, (import_id, rtype, branch_code, filename,
                   len(content), file_hash, uploaded_by))
             conn.commit()
-
-            # stock_in_refill uses a staged import flow (not the write-through parser path)
-            if rtype == "stock_in_refill":
-                from stock_in_routes import _stage_stock_in  # lazy import — avoids circular
-                _stage_stock_in(import_id, df, branch_code, uploaded_by, _set)
-                return
 
             # Call parser
             parser = PARSERS[rtype]

@@ -490,3 +490,52 @@ def test_reconcile_diff_multiset_occurrence_index_gaps():
 
     assert len(diff["missing_from_reexport"]) == 0
     assert len(diff["needs_review"]) == 0
+
+
+def test_reconcile_diff_ordering_is_stable():
+    # Set up some rows with different identity keys and canonical keys
+    # Identity Group 1
+    c1 = _with_keys(_row(item_name="ไข่", qty=10.0, net_cost=100.0, source_row_number=1, id="c1-id"))
+    c1["occurrence_index"] = 0
+    s1 = _with_keys(_row(item_name="ไข่", qty=12.0, net_cost=120.0, source_row_number=10)) # Needs review
+    s1["occurrence_index"] = 0
+    s1["identity_key"] = c1["identity_key"]
+    s1["canonical_key"] = "s1-canonical"
+    
+    # Identity Group 2
+    c2 = _with_keys(_row(item_name="หมู", qty=20.0, net_cost=200.0, source_row_number=2, id="c2-id"))
+    c2["occurrence_index"] = 0
+    s2 = _with_keys(_row(item_name="หมู", qty=20.0, net_cost=200.0, source_row_number=11)) # Skip (match)
+    s2["occurrence_index"] = 0
+    s2["identity_key"] = c2["identity_key"]
+    s2["canonical_key"] = c2["canonical_key"]
+
+    # Identity Group 3 (Insert)
+    s3 = _with_keys(_row(item_name="ผัก", qty=30.0, net_cost=300.0, source_row_number=12))
+    s3["occurrence_index"] = 0
+
+    # Identity Group 4 (Missing)
+    c4 = _with_keys(_row(item_name="ปลา", qty=40.0, net_cost=400.0, source_row_number=4, id="c4-id"))
+    c4["occurrence_index"] = 0
+
+    # Run reconcile_diff with different permutations of inputs
+    import itertools
+    staged_permutations = list(itertools.permutations([s1, s2, s3]))
+    committed_permutations = list(itertools.permutations([c1, c2, c4]))
+
+    # Call with first permutation to get the baseline
+    baseline_diff = reconcile_diff(list(staged_permutations[0]), list(committed_permutations[0]))
+
+    for st in staged_permutations:
+        for co in committed_permutations:
+            diff = reconcile_diff(list(st), list(co))
+            
+            # Verify ordering in lists is completely identical to baseline
+            assert [r["source_row_number"] for r in diff["skip"]] == [r["source_row_number"] for r in baseline_diff["skip"]]
+            assert [r["source_row_number"] for r in diff["insert"]] == [r["source_row_number"] for r in baseline_diff["insert"]]
+            assert [r["source_row_number"] for r in diff["needs_review"]] == [r["source_row_number"] for r in baseline_diff["needs_review"]]
+            assert [r["id"] for r in diff["missing_from_reexport"]] == [r["id"] for r in baseline_diff["missing_from_reexport"]]
+            
+            # Verify counterpart_id mapping is exactly identical
+            for r_baseline, r_curr in zip(baseline_diff["needs_review"], diff["needs_review"]):
+                assert r_baseline["counterpart_id"] == r_curr["counterpart_id"]
