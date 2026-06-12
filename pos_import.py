@@ -85,6 +85,12 @@ SIGNATURES: dict[str, list[str]] = {
         "วันที่ชำระเงิน", "เวลาที่ชำระเงิน", "หมายเลขใบเสร็จ / ID",
         "รหัสเมนู", "ชื่อเมนู",
     ],
+    # Stock-in refill report — checked BEFORE inventory (shares ชื่อ/รหัสวัตถุดิบ/ป้ายกำกับ
+    # but has ประเภทการเติมวัตถุดิบ/เติมสินค้า which inventory never has)
+    "stock_in_refill": [
+        "วันที่", "ชื่อ", "รหัสวัตถุดิบ", "ป้ายกำกับ",
+        "ประเภทการเติมวัตถุดิบ", "เติมสินค้า", "ค่าใช้จ่ายต่อหน่วย",
+    ],
     "inventory": [
         "ชื่อ", "รหัสวัตถุดิบ", "ป้ายกำกับ", "จำนวนของในสต็อก",
         "จำนวนสูงสุดของสต็อก",
@@ -1120,6 +1126,12 @@ def _process_import_background(
             """, (import_id, rtype, branch_code, filename,
                   len(content), file_hash, uploaded_by))
             conn.commit()
+
+            # stock_in_refill uses a staged import flow (not the write-through parser path)
+            if rtype == "stock_in_refill":
+                from stock_in_routes import _stage_stock_in  # lazy import — avoids circular
+                _stage_stock_in(import_id, df, branch_code, uploaded_by, _set)
+                return
 
             # Call parser
             parser = PARSERS[rtype]

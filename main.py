@@ -44,6 +44,7 @@ from PIL import Image
 from pydantic import BaseModel
 from supabase import Client, create_client
 from pos_import import router as pos_router
+from stock_in_routes import router as stock_in_router
 from phase2_routes import router as phase2_router
 from phase3_arap_routes import router as phase3_arap_router
 from phase3_quick_entry_routes import router as phase3_quick_entry_router
@@ -285,6 +286,7 @@ else:
 app = FastAPI(title="VEXONHQ OCR API", version=APP_VERSION)
 app.include_router(auth_router)   # Auth FIRST — /auth/* routes are public
 app.include_router(pos_router)
+app.include_router(stock_in_router)
 app.include_router(phase2_router)
 app.include_router(phase3_arap_router)
 app.include_router(phase3_quick_entry_router)
