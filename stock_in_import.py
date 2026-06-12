@@ -309,6 +309,11 @@ def parse_stock_in_file(df: pd.DataFrame, *, branch_code: str) -> list[dict]:
     rows: list[dict] = []
     for i, (_, series) in enumerate(df.iterrows(), start=1):
         row_dict = series.to_dict()
+        date_raw = _get(row_dict, "วันที่", "received_date_raw")
+        if date_raw:
+            date_str = str(date_raw).strip()
+            if date_str.lower() in ("total", "รวม") or "รวม" in date_str:
+                continue
         rows.append(parse_row(row_dict, row_number=i, branch_code=branch_code))
 
     assign_occurrence_indices(rows)
