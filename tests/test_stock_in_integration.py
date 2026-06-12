@@ -35,6 +35,21 @@ _DB_URL = os.environ.get("TEST_DATABASE_URL", "")
 if not _DB_URL:
     pytest.skip("TEST_DATABASE_URL not set — skipping DB integration tests", allow_module_level=True)
 
+# Route DATABASE_URL to the test DB so endpoints use the test database
+os.environ["DATABASE_URL"] = _DB_URL
+
+from fastapi.testclient import TestClient
+import main
+import auth_routes
+
+def _fake_verify(token):
+    if token == "ADMIN":
+        return {"sub": "admin-uid", "_role": "admin"}
+    if token == "STAFF":
+        return {"sub": "staff-uid", "_role": "staff"}
+    return None
+
+
 
 from stock_in_import import parse_stock_in_file, reconcile_diff
 from stock_in_routes import (
@@ -711,3 +726,283 @@ def test_invalid_decision_rejected_by_check(conn, cur):
             str(uuid.uuid4()), import_id, _BRANCH, _PERIOD, _PERIOD,
             json.dumps({}), json.dumps({}),
         ))
+
+
+def test_real_two_connection_concurrency_lock(conn, cur):
+    """
+    Two connections attempting to approve the same import.
+    Connection A locks the row and completes approve.
+    Connection B blocks until A commits, then resumes and gets 409 conflict.
+    """
+    import threading
+    import time
+
+    # Generate a unique import ID so it doesn't conflict
+    import_id = str(uuid.uuid4())
+
+    # 1. Setup import in needs_review with some staged rows using a separate connection
+    # so we don't commit/destroy the test savepoint on `conn`
+    conn_setup = psycopg2.connect(_DB_URL)
+    conn_setup.autocommit = True
+    try:
+        with conn_setup.cursor() as cur_setup:
+            cur_setup.execute("""
+                INSERT INTO public.pos_imports
+                  (id, report_type, branch_code, source_file, file_size,
+                   file_hash, status, uploaded_by, uploaded_at, processing_started_at,
+                   period_start, period_end)
+                VALUES (%s, 'stock_in_refill', %s, 'test.xlsx', 0, %s, 'needs_review', 'testuser', now(), now(), %s, %s)
+            """, (import_id, _BRANCH, str(uuid.uuid4()), _PERIOD, _PERIOD))
+
+            df = _make_df([_base_row(invoice_no="INV-CONCURR-001")])
+            rows = parse_stock_in_file(df, branch_code=_BRANCH)
+            for r in rows:
+                cur_setup.execute("""
+                    INSERT INTO public.stock_in_staging
+                      (import_id, branch_code, received_date, item_name, material_code,
+                       tag, refill_type, invoice_no, gr_ref, po_ref, po_date,
+                       unit, qty, unit_cost, net_cost,
+                       canonical_key, occurrence_index, identity_key,
+                       source_row_number, original_row_json)
+                    VALUES (%s,%s,%s,%s,%s, %s,%s,%s,%s,%s,%s, %s,%s,%s,%s,
+                            %s,%s,%s, %s,%s)
+                """, (
+                    import_id, r["branch_code"], r["received_date"], r["item_name"], r["material_code"],
+                    r["tag"], r["refill_type"], r["invoice_no"], r.get("gr_ref", ""), r.get("po_ref", ""), r.get("po_date"),
+                    r["unit"], r["qty"], r["unit_cost"], r["net_cost"],
+                    r["canonical_key"], r["occurrence_index"], r["identity_key"], r["source_row_number"],
+                    json.dumps(r.get("original_row_json", {}))
+                ))
+    finally:
+        conn_setup.close()
+
+    conn_a = None
+    thread_b = None
+    try:
+        # 2. Connection A (main thread) locks the row using a separate connection
+        conn_a = psycopg2.connect(_DB_URL)
+        conn_a.autocommit = False
+        cur_a = conn_a.cursor()
+        
+        # Start Transaction A and lock the row
+        cur_a.execute("SELECT status FROM public.pos_imports WHERE id=%s FOR UPDATE", (import_id,))
+        assert cur_a.fetchone()[0] == "needs_review"
+
+        # 3. Connection B (in a background thread) attempts to approve the same import
+        import_b_response = {}
+
+        def approve_b():
+            client = TestClient(main.app)
+            # Mock admin auth
+            main.verify_token = _fake_verify
+            auth_routes.verify_token = _fake_verify
+            try:
+                # This call will block on the row lock held by cur_a!
+                resp = client.post(
+                    f"/pos/stock-in/approve/{import_id}",
+                    headers={"Authorization": "Bearer ADMIN"},
+                    json={
+                        "expected_counts": {"new": 1, "unchanged": 0, "changed": 0, "missing": 0},
+                        "resolutions": [],
+                    }
+                )
+                import_b_response["status_code"] = resp.status_code
+                import_b_response["json"] = resp.json()
+            except Exception as e:
+                import_b_response["error"] = str(e)
+
+        thread_b = threading.Thread(target=approve_b)
+        thread_b.start()
+
+        # Sleep briefly to ensure Thread B has started and is blocked on the lock
+        time.sleep(1.0)
+        assert thread_b.is_alive(), "Thread B should be blocked on the lock held by Connection A"
+
+        # 4. Connection A performs the approve and commits
+        staged = _fetch_staged_rows(cur_a, import_id)
+        committed = _fetch_committed_rows(cur_a, _BRANCH, _PERIOD, _PERIOD)
+        diff = reconcile_diff(staged, committed)
+        for r in diff["insert"]:
+            _insert_stock_in_line(cur_a, import_id, r, "active")
+            
+        cur_a.execute("""
+            INSERT INTO public.stock_in_reconcile_log
+              (id, import_id_new, branch_code, period_start, period_end, approved_by, decision, counts_json, before_after_diff)
+            VALUES (%s, %s, %s, %s, %s, 'admin', 'approve', '{}', '{}')
+        """, (str(uuid.uuid4()), import_id, _BRANCH, _PERIOD, _PERIOD))
+        
+        cur_a.execute("UPDATE public.pos_imports SET status='success' WHERE id=%s", (import_id,))
+        cur_a.execute("DELETE FROM public.stock_in_staging WHERE import_id=%s", (import_id,))
+        
+        # Commit Connection A! This releases the lock!
+        conn_a.commit()
+        conn_a.close()
+        conn_a = None
+
+        # 5. Wait for Thread B to wake up, complete, and join
+        thread_b.join(timeout=5.0)
+
+        # 6. Verify B's response is 409 conflict
+        assert not thread_b.is_alive(), "Thread B should have completed after lock release"
+        assert "status_code" in import_b_response
+        assert import_b_response["status_code"] == 409
+        assert import_b_response["json"]["detail"]["error"] == "not_approvable"
+
+        # 7. Check database invariants
+        with conn.cursor() as cur_verify:
+            cur_verify.execute("SELECT COUNT(*) FROM public.stock_in_reconcile_log WHERE import_id_new=%s", (import_id,))
+            assert cur_verify.fetchone()[0] == 1
+            
+            cur_verify.execute("SELECT COUNT(*) FROM public.stock_in_lines WHERE import_id=%s AND row_status='active'", (import_id,))
+            assert cur_verify.fetchone()[0] == 1
+            
+            cur_verify.execute("SELECT COUNT(*) FROM public.stock_in_staging WHERE import_id=%s", (import_id,))
+            assert cur_verify.fetchone()[0] == 0
+
+    finally:
+        if conn_a:
+            try:
+                conn_a.rollback()
+                conn_a.close()
+            except Exception:
+                pass
+        # Manually cleanup committed setup rows
+        try:
+            conn_clean = psycopg2.connect(_DB_URL)
+            conn_clean.autocommit = True
+            with conn_clean.cursor() as cur_clean:
+                cur_clean.execute("DELETE FROM public.stock_in_staging WHERE import_id=%s", (import_id,))
+                cur_clean.execute("DELETE FROM public.stock_in_lines WHERE import_id=%s", (import_id,))
+                cur_clean.execute("DELETE FROM public.stock_in_reconcile_log WHERE import_id_new=%s", (import_id,))
+                cur_clean.execute("DELETE FROM public.pos_imports WHERE id=%s", (import_id,))
+            conn_clean.close()
+        except Exception:
+            pass
+
+
+def test_full_approve_endpoint_lifecycle(conn, cur):
+    """
+    Test the full HTTP API lifecycle of a stock-in import:
+    staged -> diff -> approve -> verify database invariants.
+    Also tests validation failure and rollback.
+    """
+    import_id = str(uuid.uuid4())
+
+    # 1. Setup import in needs_review with some staged rows using a separate connection
+    # so we don't commit/destroy the test savepoint on `conn`
+    conn_setup = psycopg2.connect(_DB_URL)
+    conn_setup.autocommit = True
+    try:
+        with conn_setup.cursor() as cur_setup:
+            cur_setup.execute("""
+                INSERT INTO public.pos_imports
+                  (id, report_type, branch_code, source_file, file_size,
+                   file_hash, status, uploaded_by, uploaded_at, processing_started_at,
+                   period_start, period_end)
+                VALUES (%s, 'stock_in_refill', %s, 'test.xlsx', 0, %s, 'needs_review', 'testuser', now(), now(), %s, %s)
+            """, (import_id, _BRANCH, str(uuid.uuid4()), _PERIOD, _PERIOD))
+
+            df = _make_df([
+                _base_row(item_name="ไข่", material_code="E01", qty=10, unit_cost=5, net_cost=50),
+                _base_row(item_name="หมู", material_code="E02", qty=2, unit_cost=150, net_cost=300),
+            ])
+            rows = parse_stock_in_file(df, branch_code=_BRANCH)
+            for r in rows:
+                cur_setup.execute("""
+                    INSERT INTO public.stock_in_staging
+                      (import_id, branch_code, received_date, item_name, material_code,
+                       tag, refill_type, invoice_no, gr_ref, po_ref, po_date,
+                       unit, qty, unit_cost, net_cost,
+                       canonical_key, occurrence_index, identity_key,
+                       source_row_number, original_row_json)
+                    VALUES (%s,%s,%s,%s,%s, %s,%s,%s,%s,%s,%s, %s,%s,%s,%s,
+                            %s,%s,%s, %s,%s)
+                """, (
+                    import_id, r["branch_code"], r["received_date"], r["item_name"], r["material_code"],
+                    r["tag"], r["refill_type"], r["invoice_no"], r.get("gr_ref", ""), r.get("po_ref", ""), r.get("po_date"),
+                    r["unit"], r["qty"], r["unit_cost"], r["net_cost"],
+                    r["canonical_key"], r["occurrence_index"], r["identity_key"], r["source_row_number"],
+                    json.dumps(r.get("original_row_json", {}))
+                ))
+    finally:
+        conn_setup.close()
+
+    try:
+        client = TestClient(main.app)
+        # Mock admin auth
+        main.verify_token = _fake_verify
+        auth_routes.verify_token = _fake_verify
+
+        # 1. GET /pos/stock-in/diff/{import_id}
+        resp_diff = client.get(
+            f"/pos/stock-in/diff/{import_id}",
+            headers={"Authorization": "Bearer ADMIN"}
+        )
+        assert resp_diff.status_code == 200
+        diff_data = resp_diff.json()
+        assert diff_data["status"] == "needs_review"
+        assert diff_data["counts"]["new"] == 2
+        assert len(diff_data["insert"]) == 2
+
+        # 2. Try to approve with stale counts -> should get 409 stale_review
+        resp_stale = client.post(
+            f"/pos/stock-in/approve/{import_id}",
+            headers={"Authorization": "Bearer ADMIN"},
+            json={
+                "expected_counts": {"new": 999, "unchanged": 0, "changed": 0, "missing": 0},
+                "resolutions": [],
+            }
+        )
+        assert resp_stale.status_code == 409
+        assert resp_stale.json()["detail"]["error"] == "stale_review"
+
+        # 3. Approve with correct counts -> should get 200
+        resp_approve = client.post(
+            f"/pos/stock-in/approve/{import_id}",
+            headers={"Authorization": "Bearer ADMIN"},
+            json={
+                "expected_counts": diff_data["counts"],
+                "resolutions": [],
+            }
+        )
+        assert resp_approve.status_code == 200
+        assert resp_approve.json()["status"] == "success"
+        assert resp_approve.json()["rows_committed"] == 2
+
+        # 4. Verify database invariants
+        with conn.cursor() as cur_verify:
+            # pos_imports is success
+            cur_verify.execute("SELECT status FROM public.pos_imports WHERE id=%s", (import_id,))
+            assert cur_verify.fetchone()[0] == "success"
+
+            # stock_in_staging is cleared
+            cur_verify.execute("SELECT COUNT(*) FROM public.stock_in_staging WHERE import_id=%s", (import_id,))
+            assert cur_verify.fetchone()[0] == 0
+
+            # stock_in_lines has 2 active lines
+            cur_verify.execute("SELECT COUNT(*), SUM(qty) FROM public.stock_in_lines WHERE import_id=%s AND row_status='active'", (import_id,))
+            count, total_qty = cur_verify.fetchone()
+            assert count == 2
+            assert float(total_qty) == 12.0
+
+            # reconcile log is written
+            cur_verify.execute("SELECT decision, approved_by FROM public.stock_in_reconcile_log WHERE import_id_new=%s", (import_id,))
+            row = cur_verify.fetchone()
+            assert row is not None
+            assert row[0] == "approve"
+            assert row[1] == "admin-uid"
+
+    finally:
+        # Manually cleanup committed setup rows
+        try:
+            conn_clean = psycopg2.connect(_DB_URL)
+            conn_clean.autocommit = True
+            with conn_clean.cursor() as cur_clean:
+                cur_clean.execute("DELETE FROM public.stock_in_staging WHERE import_id=%s", (import_id,))
+                cur_clean.execute("DELETE FROM public.stock_in_lines WHERE import_id=%s", (import_id,))
+                cur_clean.execute("DELETE FROM public.stock_in_reconcile_log WHERE import_id_new=%s", (import_id,))
+                cur_clean.execute("DELETE FROM public.pos_imports WHERE id=%s", (import_id,))
+            conn_clean.close()
+        except Exception:
+            pass
+
