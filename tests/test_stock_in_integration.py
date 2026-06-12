@@ -63,9 +63,11 @@ def db():
 @pytest.fixture()
 def conn(db):
     """Per-test savepoint: rolls back after each test, keeps DB clean."""
-    db.execute("SAVEPOINT sp_test")
+    with db.cursor() as c:
+        c.execute("SAVEPOINT sp_test")
     yield db
-    db.execute("ROLLBACK TO SAVEPOINT sp_test")
+    with db.cursor() as c:
+        c.execute("ROLLBACK TO SAVEPOINT sp_test")
 
 
 @pytest.fixture()
@@ -179,7 +181,8 @@ def _commit_row(cur, import_id: str, r: dict) -> str:
 def test_parse_and_stage_writes_to_staging(conn, cur):
     """parse_stock_in_file + manual stage writes rows to stock_in_staging."""
     import_id = _make_import(cur)
-    conn.execute("SAVEPOINT sp_a1")  # nested savepoint not needed; just use cur
+    with conn.cursor() as c:
+        c.execute("SAVEPOINT sp_a1")
 
     df = _make_df([_base_row()])
     rows = parse_stock_in_file(df, branch_code=_BRANCH)
@@ -240,7 +243,6 @@ def test_approve_inserts_new_rows_into_stock_in_lines(conn, cur):
     df = _make_df([_base_row(invoice_no="INV-INTEG-001")])
     rows = parse_stock_in_file(df, branch_code=_BRANCH)
     _stage_rows(cur, import_id, rows)
-    conn.commit()
 
     staged = _fetch_staged_rows(cur, import_id)
     committed = _fetch_committed_rows(cur, _BRANCH, _PERIOD, _PERIOD)
@@ -275,7 +277,6 @@ def test_approve_skip_rows_not_reinserted(conn, cur):
     # Second import: same file
     import_id2 = _make_import(cur, status="needs_review")
     _stage_rows(cur, import_id2, rows)
-    conn.commit()
 
     staged2    = _fetch_staged_rows(cur, import_id2)
     committed2 = _fetch_committed_rows(cur, _BRANCH, _PERIOD, _PERIOD)

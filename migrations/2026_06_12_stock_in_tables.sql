@@ -109,6 +109,12 @@ CREATE INDEX IF NOT EXISTS idx_reconcile_log_import
 ALTER TABLE public.pos_imports
     ADD COLUMN IF NOT EXISTS processing_started_at timestamptz;
 
+-- CHECK: status on pos_imports (allow staged, needs_review, cancelled)
+ALTER TABLE public.pos_imports
+    DROP CONSTRAINT IF EXISTS chk_pos_import_status,
+    ADD CONSTRAINT chk_pos_import_status
+        CHECK (status IN ('pending', 'parsing', 'success', 'failed', 'staged', 'needs_review', 'cancelled'));
+
 -- CHECK: row_status on stock_in_lines
 ALTER TABLE public.stock_in_lines
     DROP CONSTRAINT IF EXISTS chk_stock_in_lines_row_status,
@@ -124,6 +130,8 @@ ALTER TABLE public.stock_in_reconcile_log
 -- ── Rollback instructions ─────────────────────────────────────────────────────
 -- To undo this migration:
 --   ALTER TABLE public.pos_imports DROP COLUMN IF EXISTS processing_started_at;
+--   ALTER TABLE public.pos_imports DROP CONSTRAINT IF EXISTS chk_pos_import_status;
+--   ALTER TABLE public.pos_imports ADD CONSTRAINT chk_pos_import_status CHECK (status IN ('pending', 'parsing', 'success', 'failed'));
 --   ALTER TABLE public.stock_in_lines DROP CONSTRAINT IF EXISTS chk_stock_in_lines_row_status;
 --   ALTER TABLE public.stock_in_reconcile_log DROP CONSTRAINT IF EXISTS chk_reconcile_log_decision;
 --   DROP INDEX IF EXISTS idx_reconcile_log_import;
