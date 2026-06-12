@@ -85,6 +85,12 @@ SIGNATURES: dict[str, list[str]] = {
         "วันที่ชำระเงิน", "เวลาที่ชำระเงิน", "หมายเลขใบเสร็จ / ID",
         "รหัสเมนู", "ชื่อเมนู",
     ],
+    # Stock-in refill report — checked BEFORE inventory (shares ชื่อ/รหัสวัตถุดิบ/ป้ายกำกับ
+    # but has ประเภทการเติมวัตถุดิบ/เติมสินค้า which inventory never has)
+    "stock_in_refill": [
+        "วันที่", "ชื่อ", "รหัสวัตถุดิบ", "ป้ายกำกับ",
+        "ประเภทการเติมวัตถุดิบ", "เติมสินค้า", "ค่าใช้จ่ายต่อหน่วย",
+    ],
     "inventory": [
         "ชื่อ", "รหัสวัตถุดิบ", "ป้ายกำกับ", "จำนวนของในสต็อก",
         "จำนวนสูงสุดของสต็อก",
@@ -1111,12 +1117,32 @@ def _process_import_background(
         with conn.cursor() as cur:
             import_id = str(uuid.uuid4())
 
-            # Insert pos_imports row
+            # stock_in_refill uses a staged import flow (not the write-through parser path)
+            if rtype == "stock_in_refill":
+                from stock_in_import import normalize_branch_code
+                canonical_branch = normalize_branch_code(branch_code)
+                cur.execute("""
+                    INSERT INTO public.pos_imports
+                      (id, report_type, branch_code, source_file, file_size,
+                       file_hash, status, uploaded_by, uploaded_at,
+                       processing_started_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, 'parsing', %s, now(), now())
+                """, (import_id, rtype, canonical_branch, filename,
+                      len(content), file_hash, uploaded_by))
+                conn.commit()
+
+                from stock_in_routes import _stage_stock_in  # lazy import — avoids circular
+                _stage_stock_in(import_id, df, canonical_branch, uploaded_by, _set)
+                return
+
+            # Insert pos_imports row; processing_started_at stamps when background
+            # work begins so the /recover endpoint can detect stuck imports.
             cur.execute("""
                 INSERT INTO public.pos_imports
                   (id, report_type, branch_code, source_file, file_size,
-                   file_hash, status, uploaded_by, uploaded_at)
-                VALUES (%s, %s, %s, %s, %s, %s, 'parsing', %s, now())
+                   file_hash, status, uploaded_by, uploaded_at,
+                   processing_started_at)
+                VALUES (%s, %s, %s, %s, %s, %s, 'parsing', %s, now(), now())
             """, (import_id, rtype, branch_code, filename,
                   len(content), file_hash, uploaded_by))
             conn.commit()
