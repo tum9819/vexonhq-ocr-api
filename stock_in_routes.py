@@ -710,7 +710,7 @@ def cancel_stock_in(
 
 # ─── POST /pos/stock-in/recover/{import_id} ───────────────────────────────────
 
-# Stale threshold: imports stuck in 'parsing' for longer than this are recoverable.
+# An import stuck in 'parsing' for this long is assumed to have crashed.
 _STUCK_THRESHOLD_MINUTES = 10
 
 
@@ -719,22 +719,25 @@ def recover_stock_in(import_id: str, _admin: dict = Depends(_require_admin_role)
     """
     Recover a stuck stock-in import.
 
-    An import is 'stuck' if its status is 'parsing' and processing_started_at
-    is older than _STUCK_THRESHOLD_MINUTES minutes (process likely crashed).
+    An import is 'stuck' if its status is 'parsing' AND processing_started_at
+    is older than _STUCK_THRESHOLD_MINUTES (background process likely crashed).
 
-    Behaviour:
-    - status != 'parsing'       → 409 (already finished — nothing to recover)
-    - status == 'parsing' but   → 409 (still within threshold — too early to recover)
-      started_at is recent
-    - status == 'parsing' and   → re-triggers _stage_stock_in inline (sync) using
-      stuck (past threshold)       the original Excel bytes from pos_imports.source_file
+    Recovery strategy:
+    - If stock_in_staging still has rows for this import:
+        re-compute the reconcile diff from the existing staged data and move the
+        import back to 'needs_review'.  No original file bytes needed.
+    - If staging is empty:
+        mark the import as 'failed' (data was never staged before the crash).
 
-    The original file bytes are re-read from Supabase Storage so no file re-upload
-    is needed.  On re-run the import will write to stock_in_staging and update
-    pos_imports status to 'needs_review' (or 'failed' if parsing fails).
+    Behaviour matrix:
+    - import not found                     → 404
+    - status != 'parsing'                  → 409 not_recoverable
+    - status='parsing', started < threshold → 409 not_stuck_yet (too soon)
+    - status='parsing', started=NULL or old → recover using staging data
+    - already needs_review / success        → 409 not_recoverable
 
-    Returns the same shape as the original upload response.
-    Admin-only.
+    Admin-only.  Idempotent: calling again on an import already recovered (now
+    'needs_review') returns 409 gracefully.
     """
     _validate_uuid(import_id)
     admin_user = _admin_identity(_admin)
@@ -742,6 +745,7 @@ def recover_stock_in(import_id: str, _admin: dict = Depends(_require_admin_role)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
+            # ── Lock + validate state ─────────────────────────────────────────
             cur.execute(
                 "SELECT status, branch_code, uploaded_by, processing_started_at "
                 "FROM public.pos_imports WHERE id=%s FOR UPDATE",
@@ -759,58 +763,81 @@ def recover_stock_in(import_id: str, _admin: dict = Depends(_require_admin_role)
                     "status": status,
                 })
 
-            # Check if stuck (processing_started_at is old enough, or NULL means very old)
+            # ── Threshold check ───────────────────────────────────────────────
             if processing_started_at is not None:
                 now_utc = datetime.now(timezone.utc)
                 if hasattr(processing_started_at, "tzinfo") and processing_started_at.tzinfo:
                     started = processing_started_at
                 else:
                     started = processing_started_at.replace(tzinfo=timezone.utc)
-                age_minutes = (now_utc - started).total_seconds() / 60
-                if age_minutes < _STUCK_THRESHOLD_MINUTES:
+                age_min = (now_utc - started).total_seconds() / 60
+                if age_min < _STUCK_THRESHOLD_MINUTES:
                     raise HTTPException(409, {
                         "error":       "not_stuck_yet",
-                        "detail":      f"Import has been processing for {age_minutes:.1f} min; "
-                                       f"recover is available after {_STUCK_THRESHOLD_MINUTES} min",
-                        "age_minutes": age_minutes,
+                        "detail":      (
+                            f"Import has been processing for {age_min:.1f} min; "
+                            f"recover is available after {_STUCK_THRESHOLD_MINUTES} min"
+                        ),
+                        "age_minutes": age_min,
                     })
 
-        conn.close()
-        conn = None
+            # ── Attempt recovery from existing staging data ───────────────────
+            staged = _fetch_staged_rows(cur, import_id)
 
-        # Re-trigger staging in-process.  This is a best-effort recovery — if the
-        # original file is unavailable the import will be marked failed.
-        try:
-            import main as _main  # noqa: PLC0415
-            df, _filename = _main._reload_import_df_for_recovery(import_id)
-        except (ImportError, AttributeError, Exception) as e:
-            raise HTTPException(500, f"Cannot reload import file for recovery: {e}") from e
+            if not staged:
+                # Crash happened before any rows were staged — cannot recover data.
+                cur.execute(
+                    "UPDATE public.pos_imports "
+                    "SET status='failed', error_message=%s, finished_at=now() "
+                    "WHERE id=%s",
+                    ("Recovery failed: no staged rows found (process crashed before staging)", import_id),
+                )
+                conn.commit()
+                return {
+                    "import_id":    import_id,
+                    "recovered_by": admin_user,
+                    "outcome":      "failed",
+                    "detail":       "No staged rows found; import marked failed.",
+                }
 
-        result_holder: dict = {}
+            # Re-derive period + committed rows from staged data
+            dates = [
+                r["received_date"] for r in staged
+                if r.get("received_date")
+            ]
+            period_start = min(dates) if dates else None
+            period_end   = max(dates) if dates else None
 
-        def _set(v: dict) -> None:
-            result_holder.update(v)
+            committed: list[dict] = []
+            if period_start and period_end:
+                committed = _fetch_committed_rows(cur, branch_code, period_start, period_end)
 
-        _stage_stock_in(import_id, df, branch_code, uploaded_by, _set)
+            diff   = reconcile_diff(staged, committed)
+            counts = _diff_counts(diff)
+
+            cur.execute(
+                "UPDATE public.pos_imports "
+                "SET status='needs_review', period_start=%s, period_end=%s, "
+                "row_count=%s, error_message=%s, finished_at=now() "
+                "WHERE id=%s",
+                (period_start, period_end, len(staged), json.dumps(counts), import_id),
+            )
+            conn.commit()
 
         return {
-            "import_id": import_id,
+            "import_id":    import_id,
             "recovered_by": admin_user,
-            "result": result_holder,
+            "outcome":      "needs_review",
+            "rows_staged":  len(staged),
+            "diff_counts":  counts,
         }
 
     except HTTPException:
-        if conn:
-            conn.rollback()
+        conn.rollback()
         raise
     except Exception as e:
-        if conn:
-            conn.rollback()
+        conn.rollback()
         logger.exception("stock_in recover failed")
         raise HTTPException(500, f"Recover failed: {e}") from e
     finally:
-        if conn:
-            try:
-                conn.close()
-            except Exception:
-                pass
+        conn.close()

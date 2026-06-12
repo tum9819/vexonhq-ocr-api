@@ -246,3 +246,66 @@ def test_validate_resolutions_partial_missing_raises():
     unresolved_ids = [r["row_id"] for r in exc.value.detail["unresolved"]]
     assert "staged-2" in unresolved_ids
     assert "staged-1" not in unresolved_ids
+
+
+# ── Group E: recover endpoint contract ───────────────────────────────────────
+
+def test_recover_non_parsing_import_is_409(client, monkeypatch):
+    """Recover on a 'success' import returns 409 not_recoverable."""
+    import psycopg2
+
+    class _Cur:
+        def execute(self, sql, params=None):
+            self._sql = sql
+        def fetchone(self):
+            # pos_imports row: status='success'
+            return ("success", "branch1", "user1", None)
+        def fetchall(self): return []
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+
+    class _Conn:
+        def cursor(self): return _Cur()
+        def commit(self): pass
+        def rollback(self): pass
+        def close(self): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+
+    monkeypatch.setattr(stock_in_routes, "get_db_conn", lambda: _Conn())
+    resp = client.post(
+        f"/pos/stock-in/recover/{_GOOD_UUID}",
+        headers={"Authorization": "Bearer ADMIN"},
+        json={},
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["error"] == "not_recoverable"
+
+
+def test_recover_recent_parsing_import_is_409(client, monkeypatch):
+    """Recover on a 'parsing' import that started < threshold minutes ago returns 409."""
+    from datetime import datetime, timezone
+
+    class _Cur:
+        def execute(self, sql, params=None): pass
+        def fetchone(self):
+            # processing_started_at = right now (not stuck)
+            return ("parsing", "branch1", "user1", datetime.now(timezone.utc))
+        def fetchall(self): return []
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+
+    class _Conn:
+        def cursor(self): return _Cur()
+        def commit(self): pass
+        def rollback(self): pass
+        def close(self): pass
+
+    monkeypatch.setattr(stock_in_routes, "get_db_conn", lambda: _Conn())
+    resp = client.post(
+        f"/pos/stock-in/recover/{_GOOD_UUID}",
+        headers={"Authorization": "Bearer ADMIN"},
+        json={},
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["error"] == "not_stuck_yet"

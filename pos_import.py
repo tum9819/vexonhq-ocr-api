@@ -1117,12 +1117,14 @@ def _process_import_background(
         with conn.cursor() as cur:
             import_id = str(uuid.uuid4())
 
-            # Insert pos_imports row
+            # Insert pos_imports row; processing_started_at stamps when background
+            # work begins so the /recover endpoint can detect stuck imports.
             cur.execute("""
                 INSERT INTO public.pos_imports
                   (id, report_type, branch_code, source_file, file_size,
-                   file_hash, status, uploaded_by, uploaded_at)
-                VALUES (%s, %s, %s, %s, %s, %s, 'parsing', %s, now())
+                   file_hash, status, uploaded_by, uploaded_at,
+                   processing_started_at)
+                VALUES (%s, %s, %s, %s, %s, %s, 'parsing', %s, now(), now())
             """, (import_id, rtype, branch_code, filename,
                   len(content), file_hash, uploaded_by))
             conn.commit()

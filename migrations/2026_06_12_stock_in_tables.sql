@@ -100,3 +100,33 @@ CREATE TABLE IF NOT EXISTS public.stock_in_reconcile_log (
 
 CREATE INDEX IF NOT EXISTS idx_reconcile_log_import
     ON public.stock_in_reconcile_log (import_id_new);
+
+
+-- ── pos_imports: CHECK constraints + processing_started_at ───────────────────
+-- Harden existing pos_imports table for M1 stock-in flow.
+
+-- Add processing_started_at so we can detect and recover stuck 'parsing' imports.
+ALTER TABLE public.pos_imports
+    ADD COLUMN IF NOT EXISTS processing_started_at timestamptz;
+
+-- CHECK: row_status on stock_in_lines
+ALTER TABLE public.stock_in_lines
+    DROP CONSTRAINT IF EXISTS chk_stock_in_lines_row_status,
+    ADD CONSTRAINT chk_stock_in_lines_row_status
+        CHECK (row_status IN ('active', 'voided', 'superseded'));
+
+-- CHECK: decision on stock_in_reconcile_log
+ALTER TABLE public.stock_in_reconcile_log
+    DROP CONSTRAINT IF EXISTS chk_reconcile_log_decision,
+    ADD CONSTRAINT chk_reconcile_log_decision
+        CHECK (decision IN ('approve', 'cancel'));
+
+-- ── Rollback instructions ─────────────────────────────────────────────────────
+-- To undo this migration:
+--   ALTER TABLE public.pos_imports DROP COLUMN IF EXISTS processing_started_at;
+--   ALTER TABLE public.stock_in_lines DROP CONSTRAINT IF EXISTS chk_stock_in_lines_row_status;
+--   ALTER TABLE public.stock_in_reconcile_log DROP CONSTRAINT IF EXISTS chk_reconcile_log_decision;
+--   DROP INDEX IF EXISTS idx_reconcile_log_import;
+--   DROP TABLE IF EXISTS public.stock_in_reconcile_log;
+--   DROP TABLE IF EXISTS public.stock_in_lines;
+--   DROP TABLE IF EXISTS public.stock_in_staging;
