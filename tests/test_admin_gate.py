@@ -44,9 +44,13 @@ GATED_NAMES = {
     # Executive Dashboard is a READ but exposes profit/AP/financial overview —
     # admin-only (staff must not see it even read-only).
     "dashboard_executive",
+    # Stock-in import: diff (read) + approve + cancel + recover are all admin-only
+    # because they expose raw cost/stock data and commit financial records.
+    "get_stock_in_diff", "approve_stock_in", "cancel_stock_in", "recover_stock_in",
 }
 # create_entry and slip_match each map to TWO gated routes, so 27 names -> 29 routes.
-EXPECTED_ROUTE_COUNT = 29
+# M1 adds 4 stock-in routes: diff, approve, cancel, recover → 29 + 4 = 33.
+EXPECTED_ROUTE_COUNT = 33
 
 
 def _fake_verify(token):
