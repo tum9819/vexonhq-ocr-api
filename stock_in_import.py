@@ -205,6 +205,27 @@ def _get(raw: dict, *keys, default=None):
     return default
 
 
+def normalize_branch_code(branch: str) -> str:
+    """
+    Normalize branch code / branch name to canonical lowercase code.
+    If name is in Thai or has aliases, map them to the canonical code.
+    Supported maps:
+        'ทวีวัฒนา' / 'thawi_watthana' -> 'thawi_watthana'
+    """
+    s = str(branch).strip().lower()
+    mapping = {
+        "ทวีวัฒนา": "thawi_watthana",
+        "thawi_watthana": "thawi_watthana",
+        "thawi-watthana": "thawi_watthana",
+    }
+    if s in mapping:
+        return mapping[s]
+    raw_s = str(branch).strip()
+    if raw_s in mapping:
+        return mapping[raw_s]
+    return s
+
+
 def parse_row(raw: dict, *, row_number: int, branch_code: str) -> dict:
     """
     Parse one raw FoodStory stock-in row dict into the canonical internal form.
@@ -224,9 +245,20 @@ def parse_row(raw: dict, *, row_number: int, branch_code: str) -> dict:
     mc = _to_str(mc_raw, lowercase=False)
     material_code = None if mc.lower() in ("nan", "", "none") else mc
 
-    # branch_code: file column takes priority over argument
+    # branch_code: file column takes priority over argument and must match normalized request branch
     branch_raw = _get(raw, "สาขา", "branch_code_raw")
-    effective_branch = _to_str(branch_raw) if branch_raw else branch_code
+    canonical_request_branch = normalize_branch_code(branch_code)
+
+    if branch_raw:
+        file_branch_str = str(branch_raw).strip()
+        canonical_file_branch = normalize_branch_code(file_branch_str)
+        if canonical_file_branch != canonical_request_branch:
+            raise ValueError(
+                f"Row {row_number}: branch {file_branch_str!r} does not match import branch {branch_code!r}"
+            )
+        effective_branch = canonical_request_branch
+    else:
+        effective_branch = canonical_request_branch
 
     # Numeric columns — blank → 0
     qty = _to_num(_get(raw, "เติมสินค้า", "qty_raw"))
@@ -296,77 +328,118 @@ def reconcile_diff(
     Each input row must have: canonical_key, identity_key, occurrence_index.
 
     Returns:
-        skip                — staged rows already present in committed (no action)
-        insert              — staged rows not in committed (new)
-        needs_review        — staged rows whose identity_key matches a committed row
-                              but canonical_key differs (qty/cost edited)
+        skip                  — staged rows already present in committed (no action)
+        insert                — staged rows not in committed (new)
+        needs_review          — staged rows whose identity_key matches a committed row
+                                but canonical_key differs (qty/cost edited)
         missing_from_reexport — committed active rows absent from the staged set
-                              (NOT auto-deleted; user-gated retain/supersede/void)
+                                (NOT auto-deleted; user-gated retain/supersede/void)
 
     Multiset semantics (spec §2.5): matching is by canonical_key COUNT per group,
     not by physical row order.  Two exports with reordered identical rows produce
     the same diff.
     """
-    result: dict[str, list[dict]] = {
-        "skip": [],
-        "insert": [],
-        "needs_review": [],
-        "missing_from_reexport": [],
+    def _sort_key(row: dict) -> tuple:
+        return (
+            str(row.get("canonical_key") or ""),
+            int(row.get("occurrence_index") or 0),
+            int(row.get("source_row_number") or 0),
+            str(row.get("id") or "")
+        )
+
+    def _c_id(row: dict) -> str:
+        return str(row.get("id") or id(row))
+
+    def _s_id(row: dict) -> str:
+        return str(row.get("source_row_number") or id(row))
+
+    staged_sorted = sorted(staged, key=_sort_key)
+    committed_sorted = sorted(committed, key=_sort_key)
+
+    # Initialize unmatched pools
+    unpaired_staged = list(staged_sorted)
+    unpaired_committed = list(committed_sorted)
+
+    skip_rows = []
+    needs_review_rows = []
+    insert_rows = []
+
+    # 1. Match exact (canonical_key, occurrence_index)
+    matched_staged_indices = set()
+    matched_committed_ids = set()
+
+    for s_row in unpaired_staged:
+        s_ck = s_row["canonical_key"]
+        s_oi = s_row["occurrence_index"]
+        for c_row in unpaired_committed:
+            c_id = _c_id(c_row)
+            if c_id in matched_committed_ids:
+                continue
+            if c_row["canonical_key"] == s_ck and c_row["occurrence_index"] == s_oi:
+                skip_rows.append(s_row)
+                matched_staged_indices.add(_s_id(s_row))
+                matched_committed_ids.add(c_id)
+                break
+
+    unpaired_staged = [r for r in unpaired_staged if _s_id(r) not in matched_staged_indices]
+    unpaired_committed = [r for r in unpaired_committed if _c_id(r) not in matched_committed_ids]
+
+    # 2. Match exact canonical_key only
+    matched_staged_indices = set()
+    matched_committed_ids = set()
+
+    for s_row in unpaired_staged:
+        s_ck = s_row["canonical_key"]
+        for c_row in unpaired_committed:
+            c_id = _c_id(c_row)
+            if c_id in matched_committed_ids:
+                continue
+            if c_row["canonical_key"] == s_ck:
+                skip_rows.append(s_row)
+                matched_staged_indices.add(_s_id(s_row))
+                matched_committed_ids.add(c_id)
+                break
+
+    unpaired_staged = [r for r in unpaired_staged if _s_id(r) not in matched_staged_indices]
+    unpaired_committed = [r for r in unpaired_committed if _c_id(r) not in matched_committed_ids]
+
+    # 3. Match remaining by identity_key one-to-one
+    staged_by_ik = defaultdict(list)
+    for r in unpaired_staged:
+        staged_by_ik[r["identity_key"]].append(r)
+
+    committed_by_ik = defaultdict(list)
+    for r in unpaired_committed:
+        committed_by_ik[r["identity_key"]].append(r)
+
+    matched_staged_indices = set()
+    matched_committed_ids = set()
+
+    all_iks = set(staged_by_ik.keys()).union(committed_by_ik.keys())
+    for ik in all_iks:
+        s_list = staged_by_ik[ik]
+        c_list = committed_by_ik[ik]
+        pair_count = min(len(s_list), len(c_list))
+        for i in range(pair_count):
+            s_row = s_list[i]
+            c_row = c_list[i]
+            # Copy staged row and assign counterpart_id without mutating original dict
+            s_copy = dict(s_row)
+            s_copy["counterpart_id"] = c_row.get("id") or str(id(c_row))
+            needs_review_rows.append(s_copy)
+            matched_staged_indices.add(_s_id(s_row))
+            matched_committed_ids.add(_c_id(c_row))
+
+    unpaired_staged = [r for r in unpaired_staged if _s_id(r) not in matched_staged_indices]
+    unpaired_committed = [r for r in unpaired_committed if _c_id(r) not in matched_committed_ids]
+
+    # 4. Leftovers
+    insert_rows.extend(unpaired_staged)
+    missing_rows = list(unpaired_committed)
+
+    return {
+        "skip": skip_rows,
+        "insert": insert_rows,
+        "needs_review": needs_review_rows,
+        "missing_from_reexport": missing_rows,
     }
-
-    # Index committed by canonical_key (count) and identity_key (set)
-    committed_by_ck: dict[str, list[dict]] = defaultdict(list)
-    for row in committed:
-        committed_by_ck[row["canonical_key"]].append(row)
-
-    committed_ik_set: set[str] = {row["identity_key"] for row in committed}
-
-    # Index staged by canonical_key
-    staged_by_ck: dict[str, list[dict]] = defaultdict(list)
-    for row in staged:
-        staged_by_ck[row["canonical_key"]].append(row)
-
-    staged_ik_set: set[str] = {row["identity_key"] for row in staged}
-
-    # Classify staged rows
-    for ck, s_rows in staged_by_ck.items():
-        c_rows = committed_by_ck.get(ck, [])
-        s_count = len(s_rows)
-        c_count = len(c_rows)
-
-        # min(s, c) rows → skip (already committed, same canonical)
-        skip_n = min(s_count, c_count)
-        result["skip"].extend(s_rows[:skip_n])
-
-        # remaining staged rows → new or changed
-        for row in s_rows[skip_n:]:
-            if row["identity_key"] in committed_ik_set:
-                # Same logical line, different measures → needs human review
-                result["needs_review"].append(row)
-            else:
-                result["insert"].append(row)
-
-    # identity_keys of staged rows classified as needs_review (edited canonical):
-    # committed rows whose identity_key matches one of these are being superseded,
-    # not truly missing — do NOT flag them as missing_from_reexport.
-    # We use needs_review specifically (not skip) so that excess committed rows
-    # sharing the same ck/ik as a skip-matched staged row ARE still flagged missing.
-    review_ik_set: set[str] = {row["identity_key"] for row in result["needs_review"]}
-
-    # Classify committed rows not fully matched by staged
-    for ck, c_rows in committed_by_ck.items():
-        s_rows = staged_by_ck.get(ck, [])
-        s_count = len(s_rows)
-        c_count = len(c_rows)
-
-        if c_count <= s_count:
-            continue  # all committed rows for this ck are covered
-
-        # The excess committed rows are absent from the re-export
-        missing_n = c_count - s_count
-        for row in c_rows[c_count - missing_n:]:
-            # Only exempt from missing if a needs_review staged row is taking its place
-            if row["identity_key"] not in review_ik_set:
-                result["missing_from_reexport"].append(row)
-
-    return result

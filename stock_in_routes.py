@@ -27,14 +27,11 @@ from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, Field
 
-try:
-    from main import get_db_conn  # type: ignore[import]
-except ImportError:
-    import psycopg2
-    def get_db_conn():  # type: ignore[misc]
-        return psycopg2.connect(os.environ["DATABASE_URL"])
+def get_db_conn():
+    import main
+    return main.get_db_conn()
 
 try:
     from auth_routes import _require_admin_role  # type: ignore[import]
@@ -161,42 +158,76 @@ def _insert_stock_in_line(cur, import_id: str, r: dict, row_status: str = "activ
 
 # ─── Resolution contract ──────────────────────────────────────────────────────
 
-def _validate_resolutions(diff: dict, resolution_map: dict) -> None:
+def _validate_resolutions(diff: dict, resolutions_list: list[Resolution]) -> dict[str, Resolution]:
     """
-    Raise HTTPException(409, error="unresolved_rows") if any needs_review or
-    missing_from_reexport row lacks a resolution.
-
-    Args:
-        diff:            reconcile_diff result dict
-        resolution_map:  {row_id: Resolution} keyed by staged/committed row id
+    Validate the resolutions list and return a mapping of {row_id: Resolution}.
+    Raises HTTPException(409) if any validation fails.
     """
-    unresolved: list[dict] = []
+    # 1. Check duplicate row_id from the list before making the dict/map
+    seen_row_ids = set()
+    for res in resolutions_list:
+        if res.row_id in seen_row_ids:
+            raise HTTPException(409, {
+                "error": "invalid_resolution",
+                "detail": f"Duplicate resolution row_id: {res.row_id}"
+            })
+        seen_row_ids.add(res.row_id)
 
+    # 2. Build maps of live diff rows
+    needs_review_ids = {row["id"] for row in diff.get("needs_review", [])}
+    missing_ids = {row["id"] for row in diff.get("missing_from_reexport", [])}
+    allowed_ids = needs_review_ids.union(missing_ids)
+
+    # 3. Check for unknown row_id and incorrect action types
+    resolution_map = {}
+    for res in resolutions_list:
+        if res.row_id not in allowed_ids:
+            raise HTTPException(409, {
+                "error": "invalid_resolution",
+                "detail": f"Resolution row_id {res.row_id} not found in needs_review or missing_from_reexport"
+            })
+        if res.row_id in needs_review_ids:
+            if res.action not in ("retain", "supersede"):
+                raise HTTPException(409, {
+                    "error": "invalid_resolution",
+                    "detail": f"Action '{res.action}' is invalid for needs_review row {res.row_id} (must be 'retain' or 'supersede')"
+                })
+        elif res.row_id in missing_ids:
+            if res.action not in ("retain", "void"):
+                raise HTTPException(409, {
+                    "error": "invalid_resolution",
+                    "detail": f"Action '{res.action}' is invalid for missing_from_reexport row {res.row_id} (must be 'retain' or 'void')"
+                })
+        resolution_map[res.row_id] = res
+
+    # 4. Check that every blocking row has a resolution
+    unresolved = []
     for row in diff.get("needs_review", []):
         if row["id"] not in resolution_map:
             unresolved.append({
-                "type":      "needs_review",
-                "row_id":    row["id"],
+                "type": "needs_review",
+                "row_id": row["id"],
                 "item_name": row.get("item_name"),
             })
-
     for row in diff.get("missing_from_reexport", []):
         if row["id"] not in resolution_map:
             unresolved.append({
-                "type":      "missing_from_reexport",
-                "row_id":    row["id"],
+                "type": "missing_from_reexport",
+                "row_id": row["id"],
                 "item_name": row.get("item_name"),
             })
 
     if unresolved:
         raise HTTPException(409, {
-            "error":      "unresolved_rows",
-            "detail":     (
+            "error": "unresolved_rows",
+            "detail": (
                 "All needs_review and missing_from_reexport rows must have a resolution "
                 "before approving. Provide resolutions[] covering each listed row_id."
             ),
             "unresolved": unresolved,
         })
+
+    return resolution_map
 
 
 # ─── Background staging function (called from pos_import) ────────────────────
@@ -220,19 +251,27 @@ def _stage_stock_in(
         try:
             rows = parse_stock_in_file(df, branch_code=branch_code)
         except ValueError as e:
-            conn = get_db_conn()
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE public.pos_imports "
-                    "SET status='failed', error_message=%s, finished_at=now() "
-                    "WHERE id=%s",
-                    (str(e)[:2000], import_id),
-                )
-                conn.commit()
+            conn_fail = None
+            try:
+                conn_fail = get_db_conn()
+                with conn_fail.cursor() as cur:
+                    cur.execute(
+                        "UPDATE public.pos_imports "
+                        "SET status='failed', error_message=%s, finished_at=now() "
+                        "WHERE id=%s",
+                        (str(e)[:2000], import_id),
+                    )
+                    conn_fail.commit()
+            finally:
+                if conn_fail:
+                    try:
+                        conn_fail.close()
+                    except Exception:
+                        pass
             _set({"status": "error", "error": str(e)})
             return
 
-        # 2. Stage rows into stock_in_staging
+        # 2. Stage rows into stock_in_staging inside a single transaction
         conn = get_db_conn()
         with conn.cursor() as cur:
             for row in rows:
@@ -267,7 +306,6 @@ def _stage_stock_in(
                     row["source_row_number"],
                     json.dumps(row["original_row_json"], ensure_ascii=False),
                 ))
-            conn.commit()
 
             # 3. Compute period from staged rows
             dates = [r["received_date"] for r in rows if r["received_date"]]
@@ -284,7 +322,7 @@ def _stage_stock_in(
             diff = reconcile_diff(staged_for_diff, committed)
             counts = _diff_counts(diff)
 
-            # 6. Update pos_imports
+            # 6. Update pos_imports status
             cur.execute(
                 "UPDATE public.pos_imports "
                 "SET status='needs_review', period_start=%s, period_end=%s, "
@@ -298,6 +336,7 @@ def _stage_stock_in(
                     import_id,
                 ),
             )
+            # Commit exactly once at the end of the transaction
             conn.commit()
 
         _set({
@@ -322,15 +361,30 @@ def _stage_stock_in(
             except Exception:
                 pass
             try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE public.pos_imports SET status='failed', "
-                        "error_message=%s, finished_at=now() WHERE id=%s",
-                        (str(e)[:2000], import_id),
-                    )
-                    conn.commit()
+                conn.close()
             except Exception:
                 pass
+            conn = None
+
+        # Open separate connection to update status to failed
+        conn_fail = None
+        try:
+            conn_fail = get_db_conn()
+            with conn_fail.cursor() as cur:
+                cur.execute(
+                    "UPDATE public.pos_imports SET status='failed', "
+                    "error_message=%s, finished_at=now() WHERE id=%s",
+                    (str(e)[:2000], import_id),
+                )
+                conn_fail.commit()
+        except Exception:
+            pass
+        finally:
+            if conn_fail:
+                try:
+                    conn_fail.close()
+                except Exception:
+                    pass
         _set({"status": "error", "error": str(e)})
     finally:
         if conn:
@@ -380,7 +434,7 @@ class ApproveRequest(BaseModel):
     """
     reason: Optional[str] = None
     expected_counts: dict   # {new, unchanged, changed, missing}
-    resolutions: list[Resolution] = []
+    resolutions: list[Resolution] = Field(default_factory=list)
 
 
 class CancelRequest(BaseModel):
@@ -498,6 +552,19 @@ def approve_stock_in(
                     "detail": f"Import is '{status}'; only needs_review/staged can be approved",
                 })
 
+            # ── 4a. Branch authority check ────────────────────────────────────
+            cur.execute(
+                "SELECT COUNT(*) FROM public.stock_in_staging "
+                "WHERE import_id = %s AND branch_code != %s",
+                (import_id, branch_code),
+            )
+            mismatch_count = cur.fetchone()[0]
+            if mismatch_count > 0:
+                raise HTTPException(409, {
+                    "error": "branch_mismatch",
+                    "detail": f"Found {mismatch_count} staged rows with branch code not matching authoritative import branch '{branch_code}'"
+                })
+
             # ── 5. Re-load under lock ─────────────────────────────────────────
             staged    = _fetch_staged_rows(cur, import_id)
             committed = _fetch_committed_rows(cur, branch_code, period_start, period_end) if period_start else []
@@ -514,8 +581,7 @@ def approve_stock_in(
                 })
 
             # ── 8. Resolution validation ──────────────────────────────────────
-            resolution_map = {r.row_id: r for r in body.resolutions}
-            _validate_resolutions(diff, resolution_map)
+            resolution_map = _validate_resolutions(diff, body.resolutions)
 
             # ── 9. Insert pure-new rows ───────────────────────────────────────
             new_rows_inserted = 0
@@ -524,24 +590,20 @@ def approve_stock_in(
                 new_rows_inserted += 1
 
             # ── 10. needs_review resolutions ──────────────────────────────────
-            # Build index: identity_key → committed row (for supersede lookups)
-            committed_by_ik: dict[str, dict] = {}
-            for c in committed:
-                committed_by_ik.setdefault(c["identity_key"], c)
-
             for staged_row in diff["needs_review"]:
                 res = resolution_map[staged_row["id"]]
                 if res.action == "supersede":
                     new_id = _insert_stock_in_line(cur, import_id, staged_row, "active")
-                    # Mark the matching committed row as superseded
-                    old = committed_by_ik.get(staged_row["identity_key"])
-                    if old:
-                        cur.execute(
-                            "UPDATE public.stock_in_lines "
-                            "SET row_status='superseded', superseded_by=%s "
-                            "WHERE id=%s AND row_status='active'",
-                            (new_id, old["id"]),
-                        )
+                    # Mark the matching committed row as superseded using counterpart_id
+                    old_id = staged_row["counterpart_id"]
+                    cur.execute(
+                        "UPDATE public.stock_in_lines "
+                        "SET row_status='superseded', superseded_by=%s "
+                        "WHERE id=%s AND row_status='active'",
+                        (new_id, old_id),
+                    )
+                    if cur.rowcount != 1:
+                        raise ValueError(f"Supersede failed: committed row {old_id} is not active or not found")
                 # "retain": keep committed row, discard staged — no DB action needed
 
             # ── 11. missing_from_reexport resolutions ─────────────────────────
@@ -554,6 +616,8 @@ def approve_stock_in(
                         "WHERE id=%s AND row_status='active'",
                         (approved_by, res.reason, committed_row["id"]),
                     )
+                    if cur.rowcount != 1:
+                        raise ValueError(f"Void failed: committed row {committed_row['id']} is not active or not found")
                 # "retain": keep committed row active — no DB action needed
 
             # ── 12. Reconcile log ─────────────────────────────────────────────
@@ -577,12 +641,12 @@ def approve_stock_in(
                     "skip":   len(diff["skip"]),
                     "needs_review": [
                         {"canonical_key": r.get("canonical_key"),
-                         "action": resolution_map.get(r["id"], Resolution(row_id=r["id"], action="retain")).action}
+                         "action": resolution_map[r["id"]].action}
                         for r in diff["needs_review"]
                     ],
                     "missing": [
                         {"canonical_key": r.get("canonical_key"),
-                         "action": resolution_map.get(r["id"], Resolution(row_id=r["id"], action="retain")).action}
+                         "action": resolution_map[r["id"]].action}
                         for r in diff["missing_from_reexport"]
                     ],
                 }),
@@ -799,6 +863,19 @@ def recover_stock_in(import_id: str, _admin: dict = Depends(_require_admin_role)
                     "outcome":      "failed",
                     "detail":       "No staged rows found; import marked failed.",
                 }
+
+            # Verify branch authority check
+            cur.execute(
+                "SELECT COUNT(*) FROM public.stock_in_staging "
+                "WHERE import_id = %s AND branch_code != %s",
+                (import_id, branch_code),
+            )
+            mismatch_count = cur.fetchone()[0]
+            if mismatch_count > 0:
+                raise HTTPException(409, {
+                    "error": "branch_mismatch",
+                    "detail": f"Found {mismatch_count} staged rows with branch code not matching authoritative import branch '{branch_code}'"
+                })
 
             # Re-derive period + committed rows from staged data
             dates = [

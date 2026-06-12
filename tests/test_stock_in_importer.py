@@ -421,3 +421,72 @@ def test_signature_does_not_match_inventory():
     ]
     assert detect_report_type(inventory_headers) == "inventory"
     assert detect_report_type(inventory_headers) != "stock_in_refill"
+
+
+# ── H. Branch Normalization & Deterministic Pairing ─────────────────────────
+
+def test_normalize_branch_code():
+    from stock_in_import import normalize_branch_code
+    assert normalize_branch_code("ทวีวัฒนา") == "thawi_watthana"
+    assert normalize_branch_code("thawi_watthana") == "thawi_watthana"
+    assert normalize_branch_code("thawi-watthana") == "thawi_watthana"
+    assert normalize_branch_code("THAWIE") == "thawie"
+
+
+def test_parse_row_branch_checking():
+    # Matching branch
+    row_ok = parse_row(_raw(สาขา="ทวีวัฒนา"), row_number=1, branch_code="thawi_watthana")
+    assert row_ok["branch_code"] == "thawi_watthana"
+
+    # Mismatching branch
+    with pytest.raises(ValueError, match="Row 2: branch 'บางแค' does not match import branch 'thawi_watthana'"):
+        parse_row(_raw(สาขา="บางแค"), row_number=2, branch_code="thawi_watthana")
+
+
+def test_reconcile_diff_multiset_one_to_one_pairing():
+    c0 = _with_keys(_row(qty=10.0, net_cost=1000.0, source_row_number=1, id="c0-uuid"))
+    c1 = _with_keys(_row(qty=20.0, net_cost=2000.0, source_row_number=2, id="c1-uuid"))
+    c0["occurrence_index"] = 0
+    c1["occurrence_index"] = 1
+
+    s0 = _with_keys(_row(qty=15.0, net_cost=1500.0, source_row_number=10))
+    s1 = _with_keys(_row(qty=25.0, net_cost=2500.0, source_row_number=11))
+    s0["occurrence_index"] = 0
+    s1["occurrence_index"] = 1
+
+    s0["identity_key"] = c0["identity_key"]
+    s1["identity_key"] = c1["identity_key"]
+    s0["canonical_key"] = "s0-canonical"
+    s1["canonical_key"] = "s1-canonical"
+
+    diff = reconcile_diff(staged=[s0, s1], committed=[c0, c1])
+    assert len(diff["needs_review"]) == 2
+    assert len(diff["skip"]) == 0
+    assert len(diff["insert"]) == 0
+    assert len(diff["missing_from_reexport"]) == 0
+
+    paired_counterparts = {r["counterpart_id"] for r in diff["needs_review"]}
+    assert paired_counterparts == {"c0-uuid", "c1-uuid"}
+
+
+def test_reconcile_diff_multiset_occurrence_index_gaps():
+    c1 = _with_keys(_row(qty=10.0, net_cost=1000.0, source_row_number=2, id="c1-uuid"))
+    c1["occurrence_index"] = 1
+
+    s0 = _with_keys(_row(qty=10.0, net_cost=1000.0, source_row_number=10))
+    s1 = _with_keys(_row(qty=10.0, net_cost=1000.0, source_row_number=11))
+    s0["occurrence_index"] = 0
+    s1["occurrence_index"] = 1
+
+    s0["canonical_key"] = c1["canonical_key"]
+    s1["canonical_key"] = c1["canonical_key"]
+
+    diff = reconcile_diff(staged=[s0, s1], committed=[c1])
+    assert len(diff["skip"]) == 1
+    assert diff["skip"][0]["source_row_number"] == 11
+
+    assert len(diff["insert"]) == 1
+    assert diff["insert"][0]["source_row_number"] == 10
+
+    assert len(diff["missing_from_reexport"]) == 0
+    assert len(diff["needs_review"]) == 0

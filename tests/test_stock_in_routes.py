@@ -185,7 +185,7 @@ def _make_row(row_id: str, **kwargs) -> dict:
 
 def test_validate_resolutions_passes_when_no_blocking_rows():
     diff = {"insert": [], "skip": [], "needs_review": [], "missing_from_reexport": []}
-    _validate_resolutions(diff, {})  # must not raise
+    _validate_resolutions(diff, [])  # must not raise
 
 
 def test_validate_resolutions_needs_review_unresolved_raises_409():
@@ -196,7 +196,7 @@ def test_validate_resolutions_needs_review_unresolved_raises_409():
         "missing_from_reexport": [],
     }
     with pytest.raises(HTTPException) as exc:
-        _validate_resolutions(diff, {})
+        _validate_resolutions(diff, [])
     assert exc.value.status_code == 409
     assert exc.value.detail["error"] == "unresolved_rows"
     assert any(r["row_id"] == "staged-1" for r in exc.value.detail["unresolved"])
@@ -210,7 +210,7 @@ def test_validate_resolutions_missing_unresolved_raises_409():
         "missing_from_reexport": [_make_row("committed-1")],
     }
     with pytest.raises(HTTPException) as exc:
-        _validate_resolutions(diff, {})
+        _validate_resolutions(diff, [])
     assert exc.value.status_code == 409
     assert any(r["row_id"] == "committed-1" for r in exc.value.detail["unresolved"])
 
@@ -222,10 +222,10 @@ def test_validate_resolutions_all_resolved_passes():
         "needs_review": [_make_row("staged-1")],
         "missing_from_reexport": [_make_row("committed-1")],
     }
-    resolutions = {
-        "staged-1": Resolution(row_id="staged-1", action="supersede"),
-        "committed-1": Resolution(row_id="committed-1", action="void"),
-    }
+    resolutions = [
+        Resolution(row_id="staged-1", action="supersede"),
+        Resolution(row_id="committed-1", action="void"),
+    ]
     _validate_resolutions(diff, resolutions)  # must not raise
 
 
@@ -236,16 +236,88 @@ def test_validate_resolutions_partial_missing_raises():
         "needs_review": [_make_row("staged-1"), _make_row("staged-2")],
         "missing_from_reexport": [],
     }
-    resolutions = {
-        "staged-1": Resolution(row_id="staged-1", action="retain"),
+    resolutions = [
+        Resolution(row_id="staged-1", action="retain"),
         # staged-2 unresolved
-    }
+    ]
     with pytest.raises(HTTPException) as exc:
         _validate_resolutions(diff, resolutions)
     assert exc.value.status_code == 409
     unresolved_ids = [r["row_id"] for r in exc.value.detail["unresolved"]]
     assert "staged-2" in unresolved_ids
     assert "staged-1" not in unresolved_ids
+
+
+def test_validate_resolutions_rejects_duplicates():
+    diff = {
+        "insert": [],
+        "skip": [],
+        "needs_review": [_make_row("staged-1")],
+        "missing_from_reexport": [],
+    }
+    resolutions = [
+        Resolution(row_id="staged-1", action="retain"),
+        Resolution(row_id="staged-1", action="supersede"),
+    ]
+    with pytest.raises(HTTPException) as exc:
+        _validate_resolutions(diff, resolutions)
+    assert exc.value.status_code == 409
+    assert exc.value.detail["error"] == "invalid_resolution"
+    assert "Duplicate" in exc.value.detail["detail"]
+
+
+def test_validate_resolutions_rejects_unknown_ids():
+    diff = {
+        "insert": [],
+        "skip": [],
+        "needs_review": [_make_row("staged-1")],
+        "missing_from_reexport": [],
+    }
+    resolutions = [
+        Resolution(row_id="staged-1", action="retain"),
+        Resolution(row_id="unknown-uuid", action="retain"),
+    ]
+    with pytest.raises(HTTPException) as exc:
+        _validate_resolutions(diff, resolutions)
+    assert exc.value.status_code == 409
+    assert exc.value.detail["error"] == "invalid_resolution"
+    assert "not found in needs_review" in exc.value.detail["detail"]
+
+
+def test_validate_resolutions_rejects_wrong_actions_for_needs_review():
+    diff = {
+        "insert": [],
+        "skip": [],
+        "needs_review": [_make_row("staged-1")],
+        "missing_from_reexport": [],
+    }
+    resolutions = [
+        # void is invalid for needs_review
+        Resolution(row_id="staged-1", action="void"),
+    ]
+    with pytest.raises(HTTPException) as exc:
+        _validate_resolutions(diff, resolutions)
+    assert exc.value.status_code == 409
+    assert exc.value.detail["error"] == "invalid_resolution"
+    assert "Action 'void' is invalid for needs_review" in exc.value.detail["detail"]
+
+
+def test_validate_resolutions_rejects_wrong_actions_for_missing():
+    diff = {
+        "insert": [],
+        "skip": [],
+        "needs_review": [],
+        "missing_from_reexport": [_make_row("committed-1")],
+    }
+    resolutions = [
+        # supersede is invalid for missing
+        Resolution(row_id="committed-1", action="supersede"),
+    ]
+    with pytest.raises(HTTPException) as exc:
+        _validate_resolutions(diff, resolutions)
+    assert exc.value.status_code == 409
+    assert exc.value.detail["error"] == "invalid_resolution"
+    assert "Action 'supersede' is invalid for missing_from_reexport" in exc.value.detail["detail"]
 
 
 # ── Group E: recover endpoint contract ───────────────────────────────────────
@@ -309,3 +381,73 @@ def test_recover_recent_parsing_import_is_409(client, monkeypatch):
     )
     assert resp.status_code == 409
     assert resp.json()["detail"]["error"] == "not_stuck_yet"
+
+
+# ── Group F: Shared DB Connection Resolver ───────────────────────────────────
+
+def test_get_db_conn_lazy_resolver(monkeypatch):
+    sentinel_connection = object()
+    monkeypatch.setattr(main, "get_db_conn", lambda: sentinel_connection)
+
+    conn = stock_in_routes.get_db_conn()
+    assert conn is sentinel_connection
+
+
+def test_routes_use_shared_db_conn_resolver(monkeypatch, client):
+    """
+    Verify M1 routes use main.get_db_conn instead of direct psycopg2.connect fallback.
+    We monkeypatch main.get_db_conn to return a mock connection and monkeypatch
+    psycopg2.connect to raise an error to ensure no fallback direct psycopg2.connect is bypass-called.
+    """
+    import psycopg2
+    import stock_in_routes
+
+    # Monkeypatch psycopg2.connect to raise a loud error if called directly
+    def _faulty_connect(*args, **kwargs):
+        raise RuntimeError("psycopg2.connect called directly!")
+    monkeypatch.setattr(psycopg2, "connect", _faulty_connect)
+
+    class MockCursor:
+        def __init__(self):
+            self.calls = []
+        def execute(self, sql, params=None):
+            self.calls.append((sql, params))
+        def fetchone(self):
+            # Return dummy pos_imports row: status='needs_review'
+            return ("needs_review", "branch1", None, None)
+        def fetchall(self):
+            # return empty list for staged/committed rows
+            return []
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    class MockConnection:
+        def __init__(self):
+            self.cursor_instance = MockCursor()
+            self.closed = False
+            self.commit_called = False
+            self.rollback_called = False
+        def cursor(self):
+            return self.cursor_instance
+        def commit(self):
+            self.commit_called = True
+        def rollback(self):
+            self.rollback_called = True
+        def close(self):
+            self.closed = True
+
+    mock_conn = MockConnection()
+    monkeypatch.setattr(main, "get_db_conn", lambda: mock_conn)
+
+    # Call diff route via client
+    resp = client.get(
+        f"/pos/stock-in/diff/{_GOOD_UUID}",
+        headers={"Authorization": "Bearer ADMIN"}
+    )
+    # The route should succeed because mock connection handles it, returning 200
+    assert resp.status_code == 200
+    # Confirm it fetched data and closed connection
+    assert mock_conn.closed is True
+

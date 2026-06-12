@@ -41,6 +41,7 @@ os.environ["DATABASE_URL"] = _DB_URL
 from fastapi.testclient import TestClient
 import main
 import auth_routes
+import stock_in_routes
 
 def _fake_verify(token):
     if token == "ADMIN":
@@ -264,7 +265,7 @@ def test_approve_inserts_new_rows_into_stock_in_lines(conn, cur):
     diff = reconcile_diff(staged, committed)
 
     resolution_map = {}
-    _validate_resolutions(diff, resolution_map)  # no needs_review / missing → OK
+    _validate_resolutions(diff, [])  # no needs_review / missing → OK
 
     for r in diff["insert"]:
         _insert_stock_in_line(cur, import_id, r, "active")
@@ -350,8 +351,9 @@ def test_resolution_supersede_marks_old_row_superseded(conn, cur):
     assert len(diff["needs_review"]) >= 1
 
     staged_nr = diff["needs_review"][0]
-    res_map = {staged_nr["id"]: Resolution(row_id=staged_nr["id"], action="supersede")}
-    _validate_resolutions(diff, res_map)
+    staged_nr["counterpart_id"] = old_id
+    res_list = [Resolution(row_id=staged_nr["id"], action="supersede")]
+    _validate_resolutions(diff, res_list)
 
     # Execute supersede
     new_id = _insert_stock_in_line(cur, import_id2, staged_nr, "active")
@@ -388,8 +390,8 @@ def test_resolution_void_marks_missing_row_voided(conn, cur):
     missing = [r for r in diff["missing_from_reexport"] if r["id"] == committed_id]
     assert len(missing) >= 1
 
-    res_map = {committed_id: Resolution(row_id=committed_id, action="void", reason="test void")}
-    _validate_resolutions(diff, {committed_id: res_map[committed_id]})
+    res_list = [Resolution(row_id=committed_id, action="void", reason="test void")]
+    _validate_resolutions(diff, res_list)
 
     # Execute void
     cur.execute(
@@ -421,8 +423,8 @@ def test_resolution_retain_leaves_committed_row_active(conn, cur):
     assert len(missing) >= 1
 
     # retain: no DB action needed, just validate it passes _validate_resolutions
-    res_map = {committed_id: Resolution(row_id=committed_id, action="retain")}
-    _validate_resolutions(diff, {committed_id: res_map[committed_id]})
+    res_list = [Resolution(row_id=committed_id, action="retain")]
+    _validate_resolutions(diff, res_list)
 
     # Row should remain active (no change)
     cur.execute("SELECT row_status FROM public.stock_in_lines WHERE id=%s", (committed_id,))
@@ -1005,4 +1007,605 @@ def test_full_approve_endpoint_lifecycle(conn, cur):
             conn_clean.close()
         except Exception:
             pass
+
+
+# ── Group J: Branch Isolation and Authority ──────────────────────────────────
+
+def test_branch_authority_valid_alias_stages_successfully():
+    """Importing for branch 'thawi_watthana' with file branch column as 'ทวีวัฒนา' passes normalization."""
+    import_id = str(uuid.uuid4())
+    conn_setup = psycopg2.connect(_DB_URL)
+    conn_setup.autocommit = True
+    try:
+        with conn_setup.cursor() as cur_setup:
+            cur_setup.execute("""
+                INSERT INTO public.pos_imports
+                  (id, report_type, branch_code, source_file, file_size,
+                   file_hash, status, uploaded_by, uploaded_at, processing_started_at)
+                VALUES (%s, 'stock_in_refill', 'thawi_watthana', 'test.xlsx', 0, %s, 'parsing', 'testuser', now(), now())
+            """, (import_id, str(uuid.uuid4())))
+    finally:
+        conn_setup.close()
+
+    try:
+        df = _make_df([
+            _base_row(item_name="ไข่", สาขา="ทวีวัฒนา", qty=10, unit_cost=5, net_cost=50),
+        ])
+        
+        def _dummy_set(status_dict):
+            assert status_dict["status"] == "success"
+        
+        _stage_stock_in(import_id, df, "thawi_watthana", "admin-uid", _dummy_set)
+
+        conn_verify = psycopg2.connect(_DB_URL)
+        try:
+            with conn_verify.cursor() as cur_verify:
+                cur_verify.execute("SELECT branch_code FROM public.stock_in_staging WHERE import_id=%s", (import_id,))
+                rows = cur_verify.fetchall()
+                assert len(rows) == 1
+                assert rows[0][0] == "thawi_watthana"
+        finally:
+            conn_verify.close()
+    finally:
+        conn_clean = psycopg2.connect(_DB_URL)
+        conn_clean.autocommit = True
+        try:
+            with conn_clean.cursor() as cur_clean:
+                cur_clean.execute("DELETE FROM public.stock_in_staging WHERE import_id=%s", (import_id,))
+                cur_clean.execute("DELETE FROM public.pos_imports WHERE id=%s", (import_id,))
+        finally:
+            conn_clean.close()
+
+
+def test_branch_authority_mismatch_reverts_staging_atomically():
+    """Importing for branch 'thawi_watthana' with file branch column as 'บางแค' fails staging atomically."""
+    import_id = str(uuid.uuid4())
+    conn_setup = psycopg2.connect(_DB_URL)
+    conn_setup.autocommit = True
+    try:
+        with conn_setup.cursor() as cur_setup:
+            cur_setup.execute("""
+                INSERT INTO public.pos_imports
+                  (id, report_type, branch_code, source_file, file_size,
+                   file_hash, status, uploaded_by, uploaded_at, processing_started_at)
+                VALUES (%s, 'stock_in_refill', 'thawi_watthana', 'test.xlsx', 0, %s, 'parsing', 'testuser', now(), now())
+            """, (import_id, str(uuid.uuid4())))
+    finally:
+        conn_setup.close()
+
+    try:
+        df = _make_df([
+            _base_row(item_name="ไข่", สาขา="บางแค", qty=10, unit_cost=5, net_cost=50),
+        ])
+        
+        def _dummy_set(status_dict):
+            assert status_dict["status"] == "error"
+            assert "does not match import branch" in status_dict["error"]
+            
+        _stage_stock_in(import_id, df, "thawi_watthana", "admin-uid", _dummy_set)
+
+        conn_verify = psycopg2.connect(_DB_URL)
+        try:
+            with conn_verify.cursor() as cur_verify:
+                cur_verify.execute("SELECT COUNT(*) FROM public.stock_in_staging WHERE import_id=%s", (import_id,))
+                assert cur_verify.fetchone()[0] == 0
+                
+                cur_verify.execute("SELECT status, error_message FROM public.pos_imports WHERE id=%s", (import_id,))
+                status, err = cur_verify.fetchone()
+                assert status == "failed"
+                assert "does not match import branch" in err
+        finally:
+            conn_verify.close()
+    finally:
+        conn_clean = psycopg2.connect(_DB_URL)
+        conn_clean.autocommit = True
+        try:
+            with conn_clean.cursor() as cur_clean:
+                cur_clean.execute("DELETE FROM public.stock_in_staging WHERE import_id=%s", (import_id,))
+                cur_clean.execute("DELETE FROM public.pos_imports WHERE id=%s", (import_id,))
+        finally:
+            conn_clean.close()
+
+
+def test_branch_authority_mixed_branches_reverts_staging_atomically():
+    """A file containing both matching and mismatching branches fails staging atomically (0 staged rows)."""
+    import_id = str(uuid.uuid4())
+    conn_setup = psycopg2.connect(_DB_URL)
+    conn_setup.autocommit = True
+    try:
+        with conn_setup.cursor() as cur_setup:
+            cur_setup.execute("""
+                INSERT INTO public.pos_imports
+                  (id, report_type, branch_code, source_file, file_size,
+                   file_hash, status, uploaded_by, uploaded_at, processing_started_at)
+                VALUES (%s, 'stock_in_refill', 'thawi_watthana', 'test.xlsx', 0, %s, 'parsing', 'testuser', now(), now())
+            """, (import_id, str(uuid.uuid4())))
+    finally:
+        conn_setup.close()
+
+    try:
+        df = _make_df([
+            _base_row(item_name="ไข่", สาขา="ทวีวัฒนา", qty=10, unit_cost=5, net_cost=50),
+            _base_row(item_name="หมู", สาขา="บางแค", qty=2, unit_cost=150, net_cost=300),
+        ])
+        
+        def _dummy_set(status_dict):
+            assert status_dict["status"] == "error"
+            assert "Row 2: branch" in status_dict["error"]
+            
+        _stage_stock_in(import_id, df, "thawi_watthana", "admin-uid", _dummy_set)
+
+        conn_verify = psycopg2.connect(_DB_URL)
+        try:
+            with conn_verify.cursor() as cur_verify:
+                cur_verify.execute("SELECT COUNT(*) FROM public.stock_in_staging WHERE import_id=%s", (import_id,))
+                assert cur_verify.fetchone()[0] == 0
+
+                cur_verify.execute("SELECT status, error_message FROM public.pos_imports WHERE id=%s", (import_id,))
+                status, err = cur_verify.fetchone()
+                assert status == "failed"
+                assert "Row 2: branch" in err
+        finally:
+            conn_verify.close()
+    finally:
+        conn_clean = psycopg2.connect(_DB_URL)
+        conn_clean.autocommit = True
+        try:
+            with conn_clean.cursor() as cur_clean:
+                cur_clean.execute("DELETE FROM public.stock_in_staging WHERE import_id=%s", (import_id,))
+                cur_clean.execute("DELETE FROM public.pos_imports WHERE id=%s", (import_id,))
+        finally:
+            conn_clean.close()
+
+
+# ── Group K: Multiset pairing, Supersede counterpart and Gap index ─────────────
+
+def test_multiset_one_to_one_supersede_and_gap_index_lifecycle():
+    """
+    Test deterministic multiset pairing:
+    - Set up 2 active committed rows with same identity, but different measures (qty 10 and 20).
+    - Stage 2 rows with same identity, new measures (qty 15 and 25).
+    - Assert GET /diff returns staged rows with counterpart_id pointing to committed rows.
+    - Post approve with resolutions: supersede both. Verify both are superseded.
+    """
+    import_id_old = str(uuid.uuid4())
+    import_id_new = str(uuid.uuid4())
+
+    conn_setup = psycopg2.connect(_DB_URL)
+    conn_setup.autocommit = True
+    try:
+        with conn_setup.cursor() as cur_setup:
+            # Create old and new imports
+            cur_setup.execute("""
+                INSERT INTO public.pos_imports
+                  (id, report_type, branch_code, source_file, file_size,
+                   file_hash, status, uploaded_by, uploaded_at, processing_started_at)
+                VALUES (%s, 'stock_in_refill', %s, 'test1.xlsx', 0, %s, 'success', 'testuser', now(), now())
+            """, (import_id_old, _BRANCH, str(uuid.uuid4())))
+
+            cur_setup.execute("""
+                INSERT INTO public.pos_imports
+                  (id, report_type, branch_code, source_file, file_size,
+                   file_hash, status, uploaded_by, uploaded_at, processing_started_at, period_start, period_end)
+                VALUES (%s, 'stock_in_refill', %s, 'test2.xlsx', 0, %s, 'needs_review', 'testuser', now(), now(), %s, %s)
+            """, (import_id_new, _BRANCH, str(uuid.uuid4()), _PERIOD, _PERIOD))
+
+            # Insert committed rows
+            df_old = _make_df([
+                _base_row(item_name="ไข่", qty=10, unit_cost=5, net_cost=50, received_date="01/05/2026"),
+                _base_row(item_name="ไข่", qty=20, unit_cost=5, net_cost=100, received_date="01/05/2026"),
+            ])
+            rows_old = parse_stock_in_file(df_old, branch_code=_BRANCH)
+            rows_old[0]["occurrence_index"] = 0
+            rows_old[1]["occurrence_index"] = 1
+            
+            c0_id = _insert_stock_in_line(cur_setup, import_id_old, rows_old[0], "active")
+            c1_id = _insert_stock_in_line(cur_setup, import_id_old, rows_old[1], "active")
+
+            # Insert staged rows
+            df_new = _make_df([
+                _base_row(item_name="ไข่", qty=15, unit_cost=5, net_cost=75, received_date="01/05/2026"),
+                _base_row(item_name="ไข่", qty=25, unit_cost=5, net_cost=125, received_date="01/05/2026"),
+            ])
+            rows_new = parse_stock_in_file(df_new, branch_code=_BRANCH)
+            rows_new[0]["occurrence_index"] = 0
+            rows_new[1]["occurrence_index"] = 1
+
+            for r in rows_new:
+                cur_setup.execute("""
+                    INSERT INTO public.stock_in_staging
+                      (import_id, branch_code, received_date, item_name, material_code,
+                       tag, refill_type, invoice_no, gr_ref, po_ref, po_date,
+                       unit, qty, unit_cost, net_cost,
+                       canonical_key, occurrence_index, identity_key,
+                       source_row_number, original_row_json)
+                    VALUES (%s,%s,%s,%s,%s, %s,%s,%s,%s,%s,%s, %s,%s,%s,%s,
+                            %s,%s,%s, %s,%s)
+                """, (
+                    import_id_new, r["branch_code"], r["received_date"], r["item_name"], r["material_code"],
+                    r["tag"], r["refill_type"], r["invoice_no"], r.get("gr_ref", ""), r.get("po_ref", ""), r.get("po_date"),
+                    r["unit"], r["qty"], r["unit_cost"], r["net_cost"],
+                    r["canonical_key"], r["occurrence_index"], r["identity_key"], r["source_row_number"],
+                    json.dumps(r.get("original_row_json", {}))
+                ))
+    finally:
+        conn_setup.close()
+
+    try:
+        client = TestClient(main.app)
+        main.verify_token = _fake_verify
+        auth_routes.verify_token = _fake_verify
+
+        resp_diff = client.get(
+            f"/pos/stock-in/diff/{import_id_new}",
+            headers={"Authorization": "Bearer ADMIN"}
+        )
+        assert resp_diff.status_code == 200
+        diff_data = resp_diff.json()
+        assert diff_data["counts"]["changed"] == 2
+        assert len(diff_data["needs_review"]) == 2
+
+        staged_needs_review = diff_data["needs_review"]
+        counterparts = {r["counterpart_id"] for r in staged_needs_review}
+        assert counterparts == {c0_id, c1_id}
+
+        s0_id = staged_needs_review[0]["id"]
+        s1_id = staged_needs_review[1]["id"]
+
+        resp_approve = client.post(
+            f"/pos/stock-in/approve/{import_id_new}",
+            headers={"Authorization": "Bearer ADMIN"},
+            json={
+                "expected_counts": diff_data["counts"],
+                "resolutions": [
+                    {"row_id": s0_id, "action": "supersede"},
+                    {"row_id": s1_id, "action": "supersede"},
+                ],
+            }
+        )
+        assert resp_approve.status_code == 200
+
+        conn_verify = psycopg2.connect(_DB_URL)
+        try:
+            with conn_verify.cursor() as cur_verify:
+                cur_verify.execute("SELECT id, row_status, superseded_by FROM public.stock_in_lines WHERE id IN (%s, %s) ORDER BY id", (c0_id, c1_id))
+                c_status = cur_verify.fetchall()
+                assert len(c_status) == 2
+                assert c_status[0][1] == "superseded"
+                assert c_status[0][2] is not None
+                assert c_status[1][1] == "superseded"
+                assert c_status[1][2] is not None
+        finally:
+            conn_verify.close()
+
+    finally:
+        conn_clean = psycopg2.connect(_DB_URL)
+        conn_clean.autocommit = True
+        try:
+            with conn_clean.cursor() as cur_clean:
+                cur_clean.execute("DELETE FROM public.stock_in_staging WHERE import_id IN (%s, %s)", (import_id_old, import_id_new))
+                cur_clean.execute("DELETE FROM public.stock_in_lines WHERE import_id IN (%s, %s)", (import_id_old, import_id_new))
+                cur_clean.execute("DELETE FROM public.stock_in_reconcile_log WHERE import_id_new IN (%s, %s)", (import_id_old, import_id_new))
+                cur_clean.execute("DELETE FROM public.pos_imports WHERE id IN (%s, %s)", (import_id_old, import_id_new))
+        finally:
+            conn_clean.close()
+
+
+def test_multiset_occurrence_index_gap_matching():
+    """
+    Verify occurrence index gap handling:
+    - Committed has occurrence index 1 (gap: index 0 missing).
+    - Staged has occurrence index 0 and 1.
+    - Match index 1 as skip, and index 0 as insert (without unique key collision).
+    """
+    import_id_old = str(uuid.uuid4())
+    import_id_new = str(uuid.uuid4())
+
+    conn_setup = psycopg2.connect(_DB_URL)
+    conn_setup.autocommit = True
+    try:
+        with conn_setup.cursor() as cur_setup:
+            cur_setup.execute("""
+                INSERT INTO public.pos_imports
+                  (id, report_type, branch_code, source_file, file_size,
+                   file_hash, status, uploaded_by, uploaded_at, processing_started_at)
+                VALUES (%s, 'stock_in_refill', %s, 'test1.xlsx', 0, %s, 'success', 'testuser', now(), now())
+            """, (import_id_old, _BRANCH, str(uuid.uuid4())))
+
+            cur_setup.execute("""
+                INSERT INTO public.pos_imports
+                  (id, report_type, branch_code, source_file, file_size,
+                   file_hash, status, uploaded_by, uploaded_at, processing_started_at, period_start, period_end)
+                VALUES (%s, 'stock_in_refill', %s, 'test2.xlsx', 0, %s, 'needs_review', 'testuser', now(), now(), %s, %s)
+            """, (import_id_new, _BRANCH, str(uuid.uuid4()), _PERIOD, _PERIOD))
+
+            df_old = _make_df([
+                _base_row(item_name="ไข่", qty=10, unit_cost=5, net_cost=50, received_date="01/05/2026"),
+            ])
+            rows_old = parse_stock_in_file(df_old, branch_code=_BRANCH)
+            rows_old[0]["occurrence_index"] = 1
+            c1_id = _insert_stock_in_line(cur_setup, import_id_old, rows_old[0], "active")
+
+            df_new = _make_df([
+                _base_row(item_name="ไข่", qty=10, unit_cost=5, net_cost=50, received_date="01/05/2026"),
+                _base_row(item_name="ไข่", qty=10, unit_cost=5, net_cost=50, received_date="01/05/2026"),
+            ])
+            rows_new = parse_stock_in_file(df_new, branch_code=_BRANCH)
+            rows_new[0]["occurrence_index"] = 0
+            rows_new[1]["occurrence_index"] = 1
+
+            for r in rows_new:
+                cur_setup.execute("""
+                    INSERT INTO public.stock_in_staging
+                      (import_id, branch_code, received_date, item_name, material_code,
+                       tag, refill_type, invoice_no, gr_ref, po_ref, po_date,
+                       unit, qty, unit_cost, net_cost,
+                       canonical_key, occurrence_index, identity_key,
+                       source_row_number, original_row_json)
+                    VALUES (%s,%s,%s,%s,%s, %s,%s,%s,%s,%s,%s, %s,%s,%s,%s,
+                            %s,%s,%s, %s,%s)
+                """, (
+                    import_id_new, r["branch_code"], r["received_date"], r["item_name"], r["material_code"],
+                    r["tag"], r["refill_type"], r["invoice_no"], r.get("gr_ref", ""), r.get("po_ref", ""), r.get("po_date"),
+                    r["unit"], r["qty"], r["unit_cost"], r["net_cost"],
+                    r["canonical_key"], r["occurrence_index"], r["identity_key"], r["source_row_number"],
+                    json.dumps(r.get("original_row_json", {}))
+                ))
+    finally:
+        conn_setup.close()
+
+    try:
+        client = TestClient(main.app)
+        main.verify_token = _fake_verify
+        auth_routes.verify_token = _fake_verify
+
+        resp_diff = client.get(
+            f"/pos/stock-in/diff/{import_id_new}",
+            headers={"Authorization": "Bearer ADMIN"}
+        )
+        assert resp_diff.status_code == 200
+        diff_data = resp_diff.json()
+        
+        assert diff_data["counts"]["unchanged"] == 1
+        assert diff_data["counts"]["new"] == 1
+        assert len(diff_data["insert"]) == 1
+        assert diff_data["insert"][0]["occurrence_index"] == 0
+
+        resp_approve = client.post(
+            f"/pos/stock-in/approve/{import_id_new}",
+            headers={"Authorization": "Bearer ADMIN"},
+            json={
+                "expected_counts": diff_data["counts"],
+                "resolutions": [],
+            }
+        )
+        assert resp_approve.status_code == 200
+        assert resp_approve.json()["rows_committed"] == 1
+
+    finally:
+        conn_clean = psycopg2.connect(_DB_URL)
+        conn_clean.autocommit = True
+        try:
+            with conn_clean.cursor() as cur_clean:
+                cur_clean.execute("DELETE FROM public.stock_in_staging WHERE import_id IN (%s, %s)", (import_id_old, import_id_new))
+                cur_clean.execute("DELETE FROM public.stock_in_lines WHERE import_id IN (%s, %s)", (import_id_old, import_id_new))
+                cur_clean.execute("DELETE FROM public.stock_in_reconcile_log WHERE import_id_new IN (%s, %s)", (import_id_old, import_id_new))
+                cur_clean.execute("DELETE FROM public.pos_imports WHERE id IN (%s, %s)", (import_id_old, import_id_new))
+        finally:
+            conn_clean.close()
+
+
+# ── Group L: Atomic Staging failure-injection ─────────────────────────────────
+
+def test_atomic_staging_transaction_rollback_on_failure(monkeypatch):
+    """
+    Inject failure after staging inserts but before status update.
+    Assert staging rows are rolled back to 0, pos_imports is 'failed', and no committed rows are changed.
+    """
+    import_id = str(uuid.uuid4())
+    conn_setup = psycopg2.connect(_DB_URL)
+    conn_setup.autocommit = True
+    try:
+        with conn_setup.cursor() as cur_setup:
+            cur_setup.execute("""
+                INSERT INTO public.pos_imports
+                  (id, report_type, branch_code, source_file, file_size,
+                   file_hash, status, uploaded_by, uploaded_at, processing_started_at)
+                VALUES (%s, 'stock_in_refill', %s, 'test.xlsx', 0, %s, 'parsing', 'testuser', now(), now())
+            """, (import_id, _BRANCH, str(uuid.uuid4())))
+    finally:
+        conn_setup.close()
+
+    try:
+        df = _make_df([
+            _base_row(item_name="ไข่", qty=10, unit_cost=5, net_cost=50),
+        ])
+
+        def _faulty_reconcile(*a, **kw):
+            raise RuntimeError("Simulated staging exception")
+
+        monkeypatch.setattr(stock_in_routes, "reconcile_diff", _faulty_reconcile)
+
+        def _dummy_set(status_dict):
+            assert status_dict["status"] == "error"
+            assert "Simulated staging exception" in status_dict["error"]
+
+        _stage_stock_in(import_id, df, _BRANCH, "admin-uid", _dummy_set)
+
+        conn_verify = psycopg2.connect(_DB_URL)
+        try:
+            with conn_verify.cursor() as cur_verify:
+                cur_verify.execute("SELECT COUNT(*) FROM public.stock_in_staging WHERE import_id=%s", (import_id,))
+                assert cur_verify.fetchone()[0] == 0
+
+                cur_verify.execute("SELECT status, error_message FROM public.pos_imports WHERE id=%s", (import_id,))
+                status, err_msg = cur_verify.fetchone()
+                assert status == "failed"
+                assert "Simulated staging exception" in err_msg
+        finally:
+            conn_verify.close()
+
+    finally:
+        conn_clean = psycopg2.connect(_DB_URL)
+        conn_clean.autocommit = True
+        try:
+            with conn_clean.cursor() as cur_clean:
+                cur_clean.execute("DELETE FROM public.stock_in_staging WHERE import_id=%s", (import_id,))
+                cur_clean.execute("DELETE FROM public.pos_imports WHERE id=%s", (import_id,))
+        finally:
+            conn_clean.close()
+
+
+# ── Group M: Resolution Validation actual endpoint ───────────────────────────
+
+def test_resolution_validation_errors_via_api():
+    """
+    Test resolution errors returned via actual approve endpoint:
+    - duplicate row_id
+    - unknown row_id
+    - wrong action for type
+    - unresolved rows
+    """
+    import_id_old = str(uuid.uuid4())
+    import_id_new = str(uuid.uuid4())
+
+    conn_setup = psycopg2.connect(_DB_URL)
+    conn_setup.autocommit = True
+    try:
+        with conn_setup.cursor() as cur_setup:
+            cur_setup.execute("""
+                INSERT INTO public.pos_imports
+                  (id, report_type, branch_code, source_file, file_size,
+                   file_hash, status, uploaded_by, uploaded_at, processing_started_at)
+                VALUES (%s, 'stock_in_refill', %s, 'test1.xlsx', 0, %s, 'success', 'testuser', now(), now())
+            """, (import_id_old, _BRANCH, str(uuid.uuid4())))
+
+            cur_setup.execute("""
+                INSERT INTO public.pos_imports
+                  (id, report_type, branch_code, source_file, file_size,
+                   file_hash, status, uploaded_by, uploaded_at, processing_started_at, period_start, period_end)
+                VALUES (%s, 'stock_in_refill', %s, 'test2.xlsx', 0, %s, 'needs_review', 'testuser', now(), now(), %s, %s)
+            """, (import_id_new, _BRANCH, str(uuid.uuid4()), _PERIOD, _PERIOD))
+
+            df_old = _make_df([
+                _base_row(item_name="ไข่", qty=10, unit_cost=5, net_cost=50, received_date="01/05/2026"),
+                _base_row(item_name="หมู", qty=2, unit_cost=150, net_cost=300, received_date="01/05/2026"),
+            ])
+            rows_old = parse_stock_in_file(df_old, branch_code=_BRANCH)
+            rows_old[0]["occurrence_index"] = 0
+            rows_old[1]["occurrence_index"] = 0
+            c_egg_id = _insert_stock_in_line(cur_setup, import_id_old, rows_old[0], "active")
+            c_pork_id = _insert_stock_in_line(cur_setup, import_id_old, rows_old[1], "active")
+
+            df_new = _make_df([
+                _base_row(item_name="ไข่", qty=15, unit_cost=5, net_cost=75, received_date="01/05/2026"),
+            ])
+            rows_new = parse_stock_in_file(df_new, branch_code=_BRANCH)
+            rows_new[0]["occurrence_index"] = 0
+
+            for r in rows_new:
+                cur_setup.execute("""
+                    INSERT INTO public.stock_in_staging
+                      (import_id, branch_code, received_date, item_name, material_code,
+                       tag, refill_type, invoice_no, gr_ref, po_ref, po_date,
+                       unit, qty, unit_cost, net_cost,
+                       canonical_key, occurrence_index, identity_key,
+                       source_row_number, original_row_json)
+                    VALUES (%s,%s,%s,%s,%s, %s,%s,%s,%s,%s,%s, %s,%s,%s,%s,
+                            %s,%s,%s, %s,%s)
+                """, (
+                    import_id_new, r["branch_code"], r["received_date"], r["item_name"], r["material_code"],
+                    r["tag"], r["refill_type"], r["invoice_no"], r.get("gr_ref", ""), r.get("po_ref", ""), r.get("po_date"),
+                    r["unit"], r["qty"], r["unit_cost"], r["net_cost"],
+                    r["canonical_key"], r["occurrence_index"], r["identity_key"], r["source_row_number"],
+                    json.dumps(r.get("original_row_json", {}))
+                ))
+    finally:
+        conn_setup.close()
+
+    try:
+        client = TestClient(main.app)
+        main.verify_token = _fake_verify
+        auth_routes.verify_token = _fake_verify
+
+        resp_diff = client.get(
+            f"/pos/stock-in/diff/{import_id_new}",
+            headers={"Authorization": "Bearer ADMIN"}
+        )
+        assert resp_diff.status_code == 200
+        diff_data = resp_diff.json()
+        staged_egg_id = diff_data["needs_review"][0]["id"]
+        missing_pork_id = diff_data["missing_from_reexport"][0]["id"]
+
+        resp = client.post(
+            f"/pos/stock-in/approve/{import_id_new}",
+            headers={"Authorization": "Bearer ADMIN"},
+            json={
+                "expected_counts": diff_data["counts"],
+                "resolutions": [
+                    {"row_id": missing_pork_id, "action": "retain"},
+                ]
+            }
+        )
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "unresolved_rows"
+
+        resp = client.post(
+            f"/pos/stock-in/approve/{import_id_new}",
+            headers={"Authorization": "Bearer ADMIN"},
+            json={
+                "expected_counts": diff_data["counts"],
+                "resolutions": [
+                    {"row_id": staged_egg_id, "action": "retain"},
+                    {"row_id": staged_egg_id, "action": "supersede"},
+                ]
+            }
+        )
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "invalid_resolution"
+        assert "Duplicate" in resp.json()["detail"]["detail"]
+
+        resp = client.post(
+            f"/pos/stock-in/approve/{import_id_new}",
+            headers={"Authorization": "Bearer ADMIN"},
+            json={
+                "expected_counts": diff_data["counts"],
+                "resolutions": [
+                    {"row_id": staged_egg_id, "action": "retain"},
+                    {"row_id": missing_pork_id, "action": "retain"},
+                    {"row_id": "00000000-0000-0000-0000-000000009999", "action": "retain"},
+                ]
+            }
+        )
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "invalid_resolution"
+        assert "not found in needs_review" in resp.json()["detail"]["detail"]
+
+        resp = client.post(
+            f"/pos/stock-in/approve/{import_id_new}",
+            headers={"Authorization": "Bearer ADMIN"},
+            json={
+                "expected_counts": diff_data["counts"],
+                "resolutions": [
+                    {"row_id": staged_egg_id, "action": "void"},
+                    {"row_id": missing_pork_id, "action": "retain"},
+                ]
+            }
+        )
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "invalid_resolution"
+        assert "Action 'void' is invalid for needs_review" in resp.json()["detail"]["detail"]
+
+    finally:
+        conn_clean = psycopg2.connect(_DB_URL)
+        conn_clean.autocommit = True
+        try:
+            with conn_clean.cursor() as cur_clean:
+                cur_clean.execute("DELETE FROM public.stock_in_staging WHERE import_id IN (%s, %s)", (import_id_old, import_id_new))
+                cur_clean.execute("DELETE FROM public.stock_in_lines WHERE import_id IN (%s, %s)", (import_id_old, import_id_new))
+                cur_clean.execute("DELETE FROM public.stock_in_reconcile_log WHERE import_id_new IN (%s, %s)", (import_id_old, import_id_new))
+                cur_clean.execute("DELETE FROM public.pos_imports WHERE id IN (%s, %s)", (import_id_old, import_id_new))
+        finally:
+            conn_clean.close()
+
 
