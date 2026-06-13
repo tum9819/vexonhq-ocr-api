@@ -47,10 +47,11 @@ GATED_NAMES = {
     # Stock-in import: diff (read) + approve + cancel + recover are all admin-only
     # because they expose raw cost/stock data and commit financial records.
     "get_stock_in_diff", "approve_stock_in", "cancel_stock_in", "recover_stock_in",
+    "get_stock_in_verification",
 }
 # create_entry and slip_match each map to TWO gated routes, so 27 names -> 29 routes.
-# M1 adds 4 stock-in routes: diff, approve, cancel, recover → 29 + 4 = 33.
-EXPECTED_ROUTE_COUNT = 33
+# M1 adds 5 stock-in routes: diff, approve, cancel, recover, verification → 29 + 5 = 34.
+EXPECTED_ROUTE_COUNT = 34
 
 
 def _fake_verify(token):
