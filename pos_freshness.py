@@ -29,6 +29,7 @@ def pos_freshness_signal(
     latest_sales_date: Optional[date],
     today: date,
     threshold_days: int = 2,
+    branch_code: Optional[str] = None,
 ) -> Tuple[bool, Optional[int], Optional[str]]:
     """Decide whether POS sales data is stale.
 
@@ -44,8 +45,9 @@ def pos_freshness_signal(
 
     days_behind = (today - latest_sales_date).days
     if days_behind > threshold_days:
+        branch_str = f" (สาขา {branch_code})" if branch_code else ""
         message = (
-            "⚠️ POS ยอดขายไม่อัปเดต\n"
+            f"⚠️ POS ยอดขายไม่อัปเดต{branch_str}\n"
             f"ข้อมูลยอดขายล่าสุดถึง {_thai_date(latest_sales_date)} — ค้าง {days_behind} วัน\n"
             "กรุณา import POS เพื่อให้ Dashboard/รายงานยอดขายตรงกับความจริง"
         )
