@@ -945,7 +945,7 @@ def _scheduled_weekly_summary():
 def _scheduled_pos_freshness_check():
     """APScheduler job: alert Discord when POS sales data is stale.
 
-    Reads max(sales_date) from pos_bills (POS source of truth). A DB read error
+    Reads max(sales_date) from pos_bills (POS source of truth) grouped by branch. A DB read error
     is RE-RAISED so @_heartbeat records ok=False and /cron/health + the stale
     watchdog catch it (#28). The Discord post is best-effort (never fails the
     job). No POS bills at all (NULL) -> log + return, never alert."""
@@ -955,23 +955,25 @@ def _scheduled_pos_freshness_check():
     conn = _get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT max(sales_date) FROM pos_bills")
-            latest = cur.fetchone()[0]
+            cur.execute("SELECT branch_code, max(sales_date) FROM pos_bills GROUP BY branch_code")
+            branch_latest = cur.fetchall()
     finally:
         conn.close()
 
-    today = _today_bkk()
-    stale, days_behind, message = pos_freshness_signal(latest, today, threshold)
-
-    if latest is None:
+    if not branch_latest:
         log.info("POS freshness: no POS bills found — skipping alert")
         return
-    if stale:
-        log.warning("POS freshness: STALE — latest=%s, %d day(s) behind", latest, days_behind)
-        from auto_diagnose import _post_to_discord  # noqa: PLC0415
-        _post_to_discord(message)  # best-effort: swallows its own errors
-    else:
-        log.info("POS freshness: OK — latest=%s, %d day(s) behind", latest, days_behind)
+
+    today = _today_bkk()
+    for branch_code, latest in branch_latest:
+        stale, days_behind, message = pos_freshness_signal(latest, today, threshold, branch_code=branch_code)
+
+        if stale:
+            log.warning("POS freshness [%s]: STALE — latest=%s, %d day(s) behind", branch_code, latest, days_behind)
+            from auto_diagnose import _post_to_discord  # noqa: PLC0415
+            _post_to_discord(message)  # best-effort: swallows its own errors
+        else:
+            log.info("POS freshness [%s]: OK — latest=%s, %d day(s) behind", branch_code, latest, days_behind)
 
 
 # Start scheduler when module loads (FastAPI startup)
