@@ -154,3 +154,68 @@ def test_scheduled_freshness_check_db_error(mock_db_conn):
 
     with pytest.raises(Exception, match="DB Error Sanitized Check"):
         _scheduled_pos_freshness_check()
+
+@patch("line_bot_routes._get_db_conn")
+@patch("line_bot_routes._today_bkk")
+@patch("auto_diagnose._post_to_discord")
+def test_scheduled_freshness_check_order_is_deterministic(mock_discord, mock_today, mock_db_conn):
+    from line_bot_routes import _scheduled_pos_freshness_check
+    mock_today.return_value = date(2026, 6, 9)
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+    mock_db_conn.return_value = mock_conn
+
+    # DB with ORDER BY branch_code NULLS LAST returns sorted order:
+    mock_cur.fetchall.return_value = [
+        ("branch_a", date(2026, 6, 1)),
+        ("branch_b", date(2026, 6, 1)),
+        (None, date(2026, 6, 1))
+    ]
+
+    _scheduled_pos_freshness_check()
+
+    # Query must contain the ORDER BY clause
+    query_executed = mock_cur.execute.call_args[0][0]
+    assert "ORDER BY branch_code NULLS LAST" in query_executed
+
+    # Must call Discord sequentially in exactly that order
+    assert mock_discord.call_count == 3
+    assert "branch_a" in mock_discord.call_args_list[0][0][0]
+    assert "branch_b" in mock_discord.call_args_list[1][0][0]
+    assert "branch_b" not in mock_discord.call_args_list[2][0][0]
+    assert "branch_a" not in mock_discord.call_args_list[2][0][0]
+
+@patch("line_bot_routes._get_db_conn")
+@patch("line_bot_routes._today_bkk")
+@patch("auto_diagnose._post_to_discord")
+def test_scheduled_freshness_check_no_mutation(mock_discord, mock_today, mock_db_conn):
+    from line_bot_routes import _scheduled_pos_freshness_check
+    mock_today.return_value = date(2026, 6, 9)
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+    mock_db_conn.return_value = mock_conn
+
+    mock_cur.fetchall.return_value = [("branch_1", date(2026, 6, 1))]
+
+    def fake_execute(query, *args, **kwargs):
+        # Assert that SQL is exclusively SELECT and starts with SELECT
+        q = query.strip().upper()
+        if not q.startswith("SELECT "):
+            raise ValueError(f"Mutation detected in SQL: {query}")
+        for forbidden in ["INSERT ", "UPDATE ", "DELETE ", "ALTER ", "DROP ", "TRUNCATE "]:
+            if forbidden in q:
+                raise ValueError(f"Mutation detected in SQL: {query}")
+
+    mock_cur.execute.side_effect = fake_execute
+
+    _scheduled_pos_freshness_check()
+
+    # Verify no commit was called on the connection
+    mock_conn.commit.assert_not_called()
+
+    # Verify connection was explicitly closed
+    mock_conn.close.assert_called_once()

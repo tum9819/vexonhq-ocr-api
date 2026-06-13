@@ -955,7 +955,7 @@ def _scheduled_pos_freshness_check():
     conn = _get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT branch_code, max(sales_date) FROM pos_bills GROUP BY branch_code")
+            cur.execute("SELECT branch_code, max(sales_date) FROM pos_bills GROUP BY branch_code ORDER BY branch_code NULLS LAST")
             branch_latest = cur.fetchall()
     finally:
         conn.close()
