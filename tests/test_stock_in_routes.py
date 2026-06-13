@@ -451,3 +451,219 @@ def test_routes_use_shared_db_conn_resolver(monkeypatch, client):
     # Confirm it fetched data and closed connection
     assert mock_conn.closed is True
 
+
+# ── Group E: GET /pos/stock-in/verification/{import_id} ──────────────────────
+
+@pytest.mark.parametrize("method,path,body", [
+    ("GET", f"/pos/stock-in/verification/{_GOOD_UUID}", None),
+])
+def test_verification_staff_token_is_forbidden(client, method, path, body):
+    resp = client.request(method, path, headers={"Authorization": "Bearer STAFF"}, json=body)
+    assert resp.status_code == 403
+
+def test_verification_no_token_is_unauthorized(client):
+    resp = client.get(f"/pos/stock-in/verification/{_GOOD_UUID}")
+    assert resp.status_code == 401
+
+def test_verification_invalid_uuid_is_rejected(client):
+    resp = client.get("/pos/stock-in/verification/not-a-uuid", headers={"Authorization": "Bearer ADMIN"})
+    assert resp.status_code == 400
+
+class _MockVerificationCur:
+    def __init__(self, fetch_sequence):
+        self.fetch_sequence = fetch_sequence
+        self.call_idx = 0
+    def __enter__(self): return self
+    def __exit__(self, *a): pass
+    def execute(self, q, p=None): pass
+    def fetchone(self):
+        res = self.fetch_sequence[self.call_idx]
+        self.call_idx += 1
+        return res
+    def fetchall(self):
+        res = self.fetch_sequence[self.call_idx]
+        self.call_idx += 1
+        return res
+
+class _MockVerificationConn:
+    def __init__(self, fetch_sequence):
+        self.cur = _MockVerificationCur(fetch_sequence)
+        self.closed = False
+    def cursor(self): return self.cur
+    def close(self): self.closed = True
+
+def test_verification_unknown_import_is_404(client, monkeypatch):
+    conn = _MockVerificationConn([None])
+    monkeypatch.setattr(main, "get_db_conn", lambda: conn)
+    resp = client.get(f"/pos/stock-in/verification/{_GOOD_UUID}", headers={"Authorization": "Bearer ADMIN"})
+    assert resp.status_code == 404
+    assert conn.closed is True
+
+def test_verification_non_success_status_is_409(client, monkeypatch):
+    conn = _MockVerificationConn([("staged", "report", "bkk", "2026-06-01", "2026-06-01", 10)])
+    monkeypatch.setattr(main, "get_db_conn", lambda: conn)
+    resp = client.get(f"/pos/stock-in/verification/{_GOOD_UUID}", headers={"Authorization": "Bearer ADMIN"})
+    assert resp.status_code == 409
+    assert conn.closed is True
+
+from decimal import Decimal
+def test_verification_success_normal(client, monkeypatch):
+    # 1: import status
+    # 2: staging count
+    # 3: committed row
+    # 4: audit rows (fetchall)
+    # 5: duplicate keys
+    seq = [
+        ("success", "report", "bkk", "2026-06-01", "2026-06-01", 10),
+        (0,), # staging count
+        (10, Decimal('50.00'), Decimal('100.12'), 10, Decimal('50.00'), Decimal('100.12'), "2026-06-01", "2026-06-01", 0), # committed
+        [("approve", "admin_user", {"new": 10, "unchanged": 0, "changed": 0, "missing": 0})], # audit
+        (0,), # duplicates
+    ]
+    conn = _MockVerificationConn(seq)
+    monkeypatch.setattr(main, "get_db_conn", lambda: conn)
+    resp = client.get(f"/pos/stock-in/verification/{_GOOD_UUID}", headers={"Authorization": "Bearer ADMIN"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["verification_status"] == "verified"
+    assert data["integrity"]["warnings"] == []
+    assert data["committed"]["snapshot_rows"] == 10
+    assert data["committed"]["snapshot_qty"] == 50.0
+    assert data["committed"]["snapshot_net_cost"] == 100.12
+    assert conn.closed is True
+
+
+def test_verification_staging_count_warning(client, monkeypatch):
+    seq = [
+        ("success", "report", "bkk", "2026-06-01", "2026-06-01", 10),
+        (5,), # staging count non-zero
+        (10, 50.0, 100.0, 10, 50.0, 100.0, "2026-06-01", "2026-06-01", 0),
+        [("approve", "admin_user", {"new": 10, "unchanged": 0, "changed": 0, "missing": 0})],
+        (0,),
+    ]
+    monkeypatch.setattr(main, "get_db_conn", lambda: _MockVerificationConn(seq))
+    resp = client.get(f"/pos/stock-in/verification/{_GOOD_UUID}", headers={"Authorization": "Bearer ADMIN"})
+    assert resp.status_code == 200
+    assert resp.json()["verification_status"] == "warning"
+    assert "Found 5 staged rows" in resp.json()["integrity"]["warnings"][0]
+
+def test_verification_missing_audit_warning(client, monkeypatch):
+    seq = [
+        ("success", "report", "bkk", "2026-06-01", "2026-06-01", 10),
+        (0,),
+        (10, 50.0, 100.0, 10, 50.0, 100.0, "2026-06-01", "2026-06-01", 0),
+        [], # empty audit
+        (0,),
+    ]
+    monkeypatch.setattr(main, "get_db_conn", lambda: _MockVerificationConn(seq))
+    resp = client.get(f"/pos/stock-in/verification/{_GOOD_UUID}", headers={"Authorization": "Bearer ADMIN"})
+    assert resp.status_code == 200
+    assert resp.json()["verification_status"] == "warning"
+    assert "Missing audit record" in resp.json()["integrity"]["warnings"][0]
+    assert resp.json()["audit"] is None
+
+def test_verification_multiple_audit_warning(client, monkeypatch):
+    seq = [
+        ("success", "report", "bkk", "2026-06-01", "2026-06-01", 10),
+        (0,),
+        (10, 50.0, 100.0, 10, 50.0, 100.0, "2026-06-01", "2026-06-01", 0),
+        [
+            ("approve", "admin1", {"new": 10, "unchanged": 0, "changed": 0, "missing": 0}),
+            ("approve", "admin2", {"new": 10, "unchanged": 0, "changed": 0, "missing": 0})
+        ],
+        (0,),
+    ]
+    monkeypatch.setattr(main, "get_db_conn", lambda: _MockVerificationConn(seq))
+    resp = client.get(f"/pos/stock-in/verification/{_GOOD_UUID}", headers={"Authorization": "Bearer ADMIN"})
+    assert resp.status_code == 200
+    assert resp.json()["verification_status"] == "warning"
+    assert "Multiple audit records" in resp.json()["integrity"]["warnings"][0]
+    assert resp.json()["audit"]["approved_by"] == "admin1"
+
+def test_verification_wrong_audit_decision(client, monkeypatch):
+    seq = [
+        ("success", "report", "bkk", "2026-06-01", "2026-06-01", 10),
+        (0,),
+        (10, 50.0, 100.0, 10, 50.0, 100.0, "2026-06-01", "2026-06-01", 0),
+        [("cancel", "admin", {"new": 10, "unchanged": 0, "changed": 0, "missing": 0})],
+        (0,),
+    ]
+    monkeypatch.setattr(main, "get_db_conn", lambda: _MockVerificationConn(seq))
+    resp = client.get(f"/pos/stock-in/verification/{_GOOD_UUID}", headers={"Authorization": "Bearer ADMIN"})
+    assert resp.status_code == 200
+    assert "not 'approve'" in resp.json()["integrity"]["warnings"][0]
+
+def test_verification_malformed_counts_json(client, monkeypatch):
+    seq = [
+        ("success", "report", "bkk", "2026-06-01", "2026-06-01", 10),
+        (0,),
+        (10, 50.0, 100.0, 10, 50.0, 100.0, "2026-06-01", "2026-06-01", 0),
+        [("approve", "admin", {"missing_keys": True})],
+        (0,),
+    ]
+    monkeypatch.setattr(main, "get_db_conn", lambda: _MockVerificationConn(seq))
+    resp = client.get(f"/pos/stock-in/verification/{_GOOD_UUID}", headers={"Authorization": "Bearer ADMIN"})
+    assert resp.status_code == 200
+    assert any("Malformed" in w for w in resp.json()["integrity"]["warnings"])
+
+def test_verification_snapshot_vs_active_totals(client, monkeypatch):
+    seq = [
+        ("success", "report", "bkk", "2026-06-01", "2026-06-01", 10),
+        (0,),
+        (10, 50.0, 100.0, 8, 40.0, 80.0, "2026-06-01", "2026-06-01", 0),
+        [("approve", "admin", {"new": 10, "unchanged": 0, "changed": 0, "missing": 0})],
+        (0,),
+    ]
+    monkeypatch.setattr(main, "get_db_conn", lambda: _MockVerificationConn(seq))
+    resp = client.get(f"/pos/stock-in/verification/{_GOOD_UUID}", headers={"Authorization": "Bearer ADMIN"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["committed"]["snapshot_rows"] == 10
+    assert data["committed"]["current_active_rows"] == 8
+
+def test_verification_branch_mismatch_and_duplicates(client, monkeypatch):
+    seq = [
+        ("success", "report", "bkk", "2026-06-01", "2026-06-01", 10),
+        (0,),
+        (10, 50.0, 100.0, 10, 50.0, 100.0, "2026-06-01", "2026-06-01", 2), # branch mismatch = 2
+        [("approve", "admin", {"new": 10, "unchanged": 0, "changed": 0, "missing": 0})],
+        (3,), # duplicates = 3
+    ]
+    monkeypatch.setattr(main, "get_db_conn", lambda: _MockVerificationConn(seq))
+    resp = client.get(f"/pos/stock-in/verification/{_GOOD_UUID}", headers={"Authorization": "Bearer ADMIN"})
+    data = resp.json()
+    assert data["verification_status"] == "warning"
+    assert data["integrity"]["branch_mismatch_rows"] == 2
+    assert data["integrity"]["duplicate_active_keys"] == 3
+    warnings = data["integrity"]["warnings"]
+    assert any("branch_code mismatching" in w for w in warnings)
+    assert any("duplicate active keys" in w for w in warnings)
+
+def test_verification_coalesce_empty_aggregate(client, monkeypatch):
+    seq = [
+        ("success", "report", "bkk", "2026-06-01", "2026-06-01", 0),
+        (0,),
+        (0, 0, 0, 0, 0, 0, None, None, 0), # Empty aggregate
+        [("approve", "admin", {"new": 0, "unchanged": 0, "changed": 0, "missing": 0})],
+        (0,),
+    ]
+    monkeypatch.setattr(main, "get_db_conn", lambda: _MockVerificationConn(seq))
+    resp = client.get(f"/pos/stock-in/verification/{_GOOD_UUID}", headers={"Authorization": "Bearer ADMIN"})
+    data = resp.json()
+    assert data["committed"]["snapshot_rows"] == 0
+    assert data["committed"]["snapshot_qty"] == 0.0
+
+def test_verification_db_exception_is_sanitized(client, monkeypatch):
+    class _ErrorConn:
+        def __init__(self):
+            self.closed = False
+        def cursor(self): raise Exception("Secret DB Error")
+        def close(self): self.closed = True
+    conn = _ErrorConn()
+    monkeypatch.setattr(main, "get_db_conn", lambda: conn)
+    resp = client.get(f"/pos/stock-in/verification/{_GOOD_UUID}", headers={"Authorization": "Bearer ADMIN"})
+    assert resp.status_code == 500
+    assert "Secret DB Error" not in resp.text
+    assert resp.json()["detail"] == "Internal Server Error"
+    assert conn.closed is True
+

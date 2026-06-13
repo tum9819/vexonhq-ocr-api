@@ -924,3 +924,173 @@ def recover_stock_in(import_id: str, _admin: dict = Depends(_require_admin_role)
         raise HTTPException(500, f"Recover failed: {e}") from e
     finally:
         conn.close()
+
+# ─── GET /pos/stock-in/verification/{import_id} ──────────────────────────────
+
+@router.get("/stock-in/verification/{import_id}")
+def get_stock_in_verification(import_id: str, _admin: dict = Depends(_require_admin_role)):
+    """
+    Post-approve verification endpoint.
+    """
+    _validate_uuid(import_id)
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # 1. Import Status
+            cur.execute(
+                "SELECT status, report_type, branch_code, period_start, period_end, row_count "
+                "FROM public.pos_imports WHERE id=%s",
+                (import_id,)
+            )
+            import_row = cur.fetchone()
+            if not import_row:
+                raise HTTPException(404, {"error": "import_not_found", "detail": f"Import {import_id} not found"})
+
+            status, report_type, branch_code, period_start, period_end, row_count = import_row
+
+            if status != "success":
+                raise HTTPException(409, {"error": "not_verifiable", "detail": f"Import is '{status}'; only 'success' can be verified"})
+
+            branch_code = normalize_branch_code(branch_code)
+
+            # 2. Staging Count
+            cur.execute("SELECT COUNT(*) FROM public.stock_in_staging WHERE import_id=%s", (import_id,))
+            staging_count = cur.fetchone()[0]
+
+            # 3. Committed Totals & Branch Mismatch
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS snapshot_rows,
+                    COALESCE(SUM(qty), 0) AS snapshot_qty,
+                    COALESCE(SUM(net_cost), 0) AS snapshot_net_cost,
+
+                    COUNT(*) FILTER (WHERE row_status = 'active') AS current_active_rows,
+                    COALESCE(SUM(qty) FILTER (WHERE row_status = 'active'), 0) AS current_active_qty,
+                    COALESCE(SUM(net_cost) FILTER (WHERE row_status = 'active'), 0) AS current_active_net_cost,
+
+                    MIN(received_date) AS min_received_date,
+                    MAX(received_date) AS max_received_date,
+
+                    COUNT(*) FILTER (WHERE branch_code != %s) AS branch_mismatch_rows
+                FROM public.stock_in_lines
+                WHERE import_id = %s
+            """, (branch_code, import_id))
+            committed_row = cur.fetchone()
+
+            (snapshot_rows, snapshot_qty, snapshot_net_cost,
+             current_active_rows, current_active_qty, current_active_net_cost,
+             min_received_date, max_received_date, branch_mismatch_rows) = committed_row
+
+            # 4. Audit Log
+            cur.execute("""
+                SELECT decision, approved_by, counts_json
+                FROM public.stock_in_reconcile_log
+                WHERE import_id_new = %s
+                ORDER BY approved_at ASC, id ASC
+            """, (import_id,))
+            audit_rows = cur.fetchall()
+            audit_record_count = len(audit_rows)
+
+            # 5. Duplicate Active Keys (Branch/Period Scope)
+            duplicate_active_keys = 0
+            if period_start and period_end:
+                cur.execute("""
+                    SELECT COUNT(*)
+                    FROM (
+                        SELECT canonical_key, occurrence_index
+                        FROM public.stock_in_lines
+                        WHERE branch_code = %s
+                          AND received_date BETWEEN %s AND %s
+                          AND row_status = 'active'
+                        GROUP BY canonical_key, occurrence_index
+                        HAVING COUNT(*) > 1
+                    ) dupes
+                """, (branch_code, period_start, period_end))
+                duplicate_active_keys = cur.fetchone()[0]
+
+            # ── Warnings Assembly ──
+            warnings = []
+            if staging_count > 0:
+                warnings.append(f"Found {staging_count} staged rows remaining for a success import")
+            if audit_record_count == 0:
+                warnings.append("Missing audit record in stock_in_reconcile_log")
+            if audit_record_count > 1:
+                warnings.append(f"Multiple audit records found ({audit_record_count})")
+            if snapshot_rows != (row_count or 0):
+                warnings.append(f"Snapshot rows ({snapshot_rows}) do not match pos_imports.row_count ({row_count})")
+            if branch_mismatch_rows > 0:
+                warnings.append(f"Found {branch_mismatch_rows} lines with branch_code mismatching the import record")
+            if duplicate_active_keys > 0:
+                warnings.append(f"Found {duplicate_active_keys} duplicate active keys in this branch and period")
+
+            audit_data = None
+            if audit_record_count > 0:
+                # Deterministically select the first one based on ORDER BY
+                decision, approved_by, counts_json = audit_rows[0]
+                if decision != "approve":
+                    warnings.append(f"Audit decision is not 'approve' (found '{decision}')")
+
+                # Validate counts_json
+                counts_obj = None
+                if not isinstance(counts_json, dict):
+                    warnings.append("Malformed audit counts_json (not an object)")
+                else:
+                    required_keys = {"new", "unchanged", "changed", "missing"}
+                    if not required_keys.issubset(counts_json.keys()):
+                        warnings.append("Malformed audit counts_json (missing required keys)")
+                    else:
+                        counts_obj = {
+                            "new": counts_json.get("new", 0),
+                            "unchanged": counts_json.get("unchanged", 0),
+                            "changed": counts_json.get("changed", 0),
+                            "missing": counts_json.get("missing", 0),
+                        }
+
+                audit_data = {
+                    "decision": decision,
+                    "approved_by": approved_by,
+                    "counts": counts_obj
+                }
+
+            verification_status = "warning" if warnings else "verified"
+
+        return {
+            "verification_status": verification_status,
+            "import": {
+                "import_id": import_id,
+                "status": status,
+                "report_type": report_type,
+                "branch_code": branch_code,
+                "period_start": str(period_start) if period_start else None,
+                "period_end": str(period_end) if period_end else None,
+                "row_count": row_count
+            },
+            "staging_count": staging_count,
+            "committed": {
+                "snapshot_rows": snapshot_rows or 0,
+                "snapshot_qty": snapshot_qty,
+                "snapshot_net_cost": snapshot_net_cost,
+                "current_active_rows": current_active_rows or 0,
+                "current_active_qty": current_active_qty,
+                "current_active_net_cost": current_active_net_cost,
+                "min_received_date": str(min_received_date) if min_received_date else None,
+                "max_received_date": str(max_received_date) if max_received_date else None
+            },
+            "integrity": {
+                "duplicate_active_keys": duplicate_active_keys,
+                "branch_mismatch_rows": branch_mismatch_rows,
+                "audit_record_count": audit_record_count,
+                "warnings": warnings
+            },
+            "audit": audit_data
+        }
+
+    except HTTPException:
+        # Don't rollback on GET, just pass it through
+        raise
+    except Exception as e:
+        logger.exception("stock_in verification failed")
+        raise HTTPException(500, "Internal Server Error")
+    finally:
+        conn.close()
