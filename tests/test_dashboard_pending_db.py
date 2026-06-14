@@ -7,7 +7,7 @@ def test_dashboard_pending_bills_query_contract():
     mock_conn = MagicMock()
     mock_cursor = MagicMock()
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-    
+
     # Mock _summarize_month to avoid its own queries failing
     mock_summ = {
         "sales_net": 1000, "sales_gross": 1000, "expense_total": 500, "gross_profit": 500,
@@ -33,37 +33,37 @@ def test_dashboard_pending_bills_query_contract():
     # 12: pos_items_count
     from datetime import date
     mock_row = [date(2026,6,8), date(2026,6,8), 10000, 11, 5, 5000, 1000, date(2026,6,8), 0, 500, date(2026,6,7), 500, 0, 0, 0]
-    
+
     mock_cursor.fetchone.side_effect = [mock_row, (1000,), (500,), (1,)] # First is metrics, others are for AI insight/top categories maybe?
     mock_cursor.fetchall.return_value = [] # For list queries
-    
+
     with patch("phase2_routes.get_db_conn", return_value=mock_conn), \
          patch("phase2_routes._summarize_month", return_value=mock_summ), \
          patch("phase2_routes._require_admin_role", return_value={"uid": "admin"}):
-        
+
         # Act
         res = dashboard_executive(month=None, branch="HQ", _admin={})
-        
+
         # Assert Query
         executed_queries = [call[0][0] for call in mock_cursor.execute.call_args_list]
         metrics_query = executed_queries[0]
-        
+
         # Check that the contract includes 'pending' and 'needs_attention'
         assert "WHERE review_status IN ('pending', 'needs_attention')" in metrics_query
-        
+
         # Ensure it's read-only
         assert "INSERT" not in metrics_query.upper()
         assert "UPDATE" not in metrics_query.upper()
         assert "DELETE" not in metrics_query.upper()
         assert not mock_conn.commit.called, "Must not commit mutations"
-        
+
         # Check response maps correctly
         cards = res["cards"]
         bills_card = next(c for c in cards if c["key"] == "bills_pending_review")
-        
+
         assert bills_card["value"] == 11
         assert bills_card["status"] == "critical" # 11 is critical
-        
+
         # Test 0 pending
         mock_cursor.fetchone.side_effect = [[date(2026,6,8), date(2026,6,8), 10000, 0, 5, 5000, 1000, date(2026,6,8), 0, 500, date(2026,6,7), 500, 0, 0, 0]] + [[(1000,)]]*10
         res0 = dashboard_executive(month=None, branch="HQ", _admin={})
