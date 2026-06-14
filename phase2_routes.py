@@ -584,7 +584,7 @@ SELECT
           AND source NOT IN ('owner_capital','owner_advance','transfer_error','bank_statement',
                              'vendor_payment','grab_payout','lineman_payout','pos_cash_deposit',
                              'cash_withdrawal','loan_in','loan_repayment'))               AS sales_30d,
-    (SELECT COUNT(*) FROM public.vendor_bills WHERE review_status = 'needs_review')        AS bills_pending,
+    (SELECT COUNT(*) FROM public.vendor_bills WHERE review_status IN ('pending', 'needs_attention'))        AS bills_pending,
     (SELECT COUNT(*) FROM public.vendor_bills WHERE payment_status = 'unpaid')             AS ap_count,
     (SELECT COALESCE(SUM(amount),0)::numeric FROM public.vendor_bills
         WHERE payment_status = 'unpaid')                                                   AS ap_total,
