@@ -61,13 +61,22 @@
 -- assignment instead of calculated dates.
 --
 -- Run this for a preview first:
+-- BEST APPROACH: Use bill_date when available; mark NULL bill_date for manual review
 BEGIN;
   SELECT
     id,
     vendor_name,
     invoice_no,
-    created_at,
-    created_at::date + 30 as calculated_due_date,
+    bill_date,
+    created_at::date as upload_date,
+    CASE
+      WHEN bill_date IS NOT NULL THEN bill_date::date + 30
+      ELSE created_at::date + 30
+    END as calculated_due_date,
+    CASE
+      WHEN bill_date IS NULL THEN '⚠️ MANUAL REVIEW REQUIRED'
+      ELSE 'OK'
+    END as status,
     amount,
     payment_status,
     review_status
@@ -75,8 +84,21 @@ BEGIN;
   WHERE due_date IS NULL
     AND payment_status NOT IN ('paid', 'credit_card')  -- Only unpaid bills need due_date
     AND review_status != 'rejected'  -- Skip rejected bills
-  LIMIT 31;
+  ORDER BY bill_date DESC NULLS FIRST
+  LIMIT 50;
 ROLLBACK;
+
+-- ⚠️ BEFORE PROCEEDING:
+-- Count how many have NULL bill_date:
+-- SELECT COUNT(*) as null_bill_date_count
+-- FROM public.vendor_bills
+-- WHERE due_date IS NULL AND bill_date IS NULL
+--   AND payment_status NOT IN ('paid', 'credit_card')
+--   AND review_status != 'rejected';
+--
+-- If count > 0: Some bills cannot be auto-fixed. Either:
+--   • Use created_at as best guess (risky for delayed uploads)
+--   • Export those N bills and assign due_dates manually
 
 -- Then run the actual update (RECOMMENDED: filter to unpaid + unrejected):
 -- ⚠️ DISABLED: Uncomment only after manual verification of dates and full backup
@@ -165,8 +187,22 @@ WHERE due_date IS NULL;  -- Should be 0 if Option A run with no filters;
 -- ============================================================
 -- After running the UPDATE, verify:
 
--- Check no NULL due_dates remain:
-SELECT COUNT(*) FROM public.vendor_bills WHERE due_date IS NULL;  -- Should be 0
+-- ⚠️ IMPORTANT: Check remaining NULLs (not all will be zero if you used status filters)
+SELECT
+  COUNT(*) as remaining_nulls,
+  COUNT(*) FILTER (WHERE payment_status IN ('paid', 'credit_card')) as in_paid_cc,
+  COUNT(*) FILTER (WHERE review_status = 'rejected') as in_rejected,
+  COUNT(*) FILTER (WHERE payment_status IS NULL) as null_status
+FROM public.vendor_bills
+WHERE due_date IS NULL;
+-- Expected: remaining_nulls may be > 0 (intentional for paid/rejected/null-status rows)
+
+-- Count rows updated in the last 5 minutes (check if UPDATE actually ran):
+SELECT COUNT(*) as recently_updated
+FROM public.vendor_bills
+WHERE (due_date >= CURRENT_DATE - 30)  -- Recent due dates
+  AND payment_status NOT IN ('paid', 'credit_card')
+  AND review_status != 'rejected';
 
 -- Check new due_dates look reasonable:
 SELECT

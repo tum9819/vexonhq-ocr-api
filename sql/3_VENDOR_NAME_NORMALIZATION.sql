@@ -67,8 +67,9 @@ ORDER BY count DESC;
 
 -- OPTION A: Simple trim + lowercase normalization [DISABLED]
 -- ⚠️ DANGEROUS: This destroys official Thai/English vendor names.
--- Example: "บริษัท ซีพี แอ็กซ์ตร้า" becomes "บริษัท ซีพี แอ็กซ์ตร้า"
--- (lowercase breaks Thai legal name requirements)
+-- Example: "บริษัท ซีพี แอ็กซ์ตร้า" (Thai company name)
+-- would be corrupted if lowercase normalization applied
+-- (lowercase breaks Thai legal name requirements and readability)
 --
 -- Also risks unique constraint (vendor_name, invoice_no) conflicts.
 --
