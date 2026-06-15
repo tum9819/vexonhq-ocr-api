@@ -1,11 +1,49 @@
 -- STEP 2: Fix NULL due_date (Multiple options - choose ONE approach)
 --
+-- ⚠️ CRITICAL BUSINESS DECISION:
+-- This fix uses created_at (upload timestamp) to calculate due_dates.
+-- created_at is NOT the invoice date — it's when the invoice was uploaded to the system.
+--
+-- If invoices are uploaded days/weeks after issue, this will CORRUPT:
+--   ❌ AP aging reports
+--   ❌ Cashflow forecasts
+--   ❌ Cash collection timing
+--
+-- BEFORE running any UPDATE:
+-- 1. Verify the NULL due_date bills have bill_date populated from OCR (see Query 0)
+-- 2. If bill_date exists, use it instead of created_at
+-- 3. If bill_date is also NULL, require manual due_date assignment per vendor
+-- 4. NEVER use created_at without confirming upload timing is same-day
+--
+--
 -- BUSINESS CONTEXT:
 --   - 31 bills have NULL due_date (breaks cashflow forecasting)
 --   - Need to infer due_date based on payment terms
 --   - Default terms: 30 or 45 days from invoice date
 --
 -- CHOOSE ONE APPROACH BELOW:
+--
+-- ============================================================
+-- MANDATORY FIRST STEP: Query 0 — Check invoice dates
+-- ============================================================
+-- Before running any UPDATE, verify that NULL due_date records can be fixed safely.
+-- Run this query FIRST:
+--
+-- SELECT
+--   id, vendor_name, invoice_no, bill_date,
+--   created_at::date as upload_date,
+--   (created_at::date - bill_date) as days_after_issue,
+--   amount
+-- FROM public.vendor_bills
+-- WHERE due_date IS NULL
+-- ORDER BY bill_date DESC NULLS LAST;
+--
+-- ⚠️ THEN CHECK:
+-- • If bill_date IS NULL for any row: ❌ Cannot auto-fix (use Option D)
+-- • If (created_at - bill_date) > 3 days: ⚠️ Delayed upload (risky auto-fix)
+-- • If (created_at - bill_date) is 0-2 days: ✅ Safe for Options A/B
+--
+-- Do NOT proceed to Options A-D until you understand the upload timing.
 
 -- ============================================================
 -- OPTION A: Standard 30-day payment terms (RECOMMENDED)
