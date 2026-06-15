@@ -84,6 +84,8 @@ ORDER BY count DESC;
 -- and confirm no duplicate (vendor_name, invoice_no) pairs would result.
 --
 -- Preview query (SAFE - read-only):
+-- ⚠️ IMPORTANT: Only maps EXPLICIT variants. Do NOT add broad ELSE clause
+-- Unmapped vendors are left unchanged to preserve legal names
 BEGIN;
   SELECT
     id,
@@ -92,7 +94,8 @@ BEGIN;
       WHEN vendor_name IN ('บริษัท ABC', 'ABC', 'abc') THEN 'ABC Co., Ltd.'
       WHEN vendor_name IN ('ซัพพลาย XYZ', 'XYZ Supply', 'xyz') THEN 'XYZ Supply'
       WHEN vendor_name IN ('โรงแรม 123', 'Hotel 123') THEN 'Hotel 123'
-      ELSE LOWER(TRIM(vendor_name))
+      -- ELSE clause removed — DO NOT add fallback normalization
+      ELSE vendor_name  -- Keep unmapped names unchanged
     END as normalized_name
   FROM public.vendor_bills
   WHERE vendor_name IS NOT NULL
@@ -108,6 +111,8 @@ ROLLBACK;
 -- 5. Run on a staging environment first
 --
 -- Once approved, uncomment these lines:
+-- ⚠️ SAFETY: CASE statement must ONLY include explicitly mapped vendors.
+-- Do NOT add broad ELSE clause that applies LOWER(TRIM()) to unmapped names.
 --
 -- BEGIN;
 --   UPDATE public.vendor_bills
@@ -115,9 +120,13 @@ ROLLBACK;
 --       WHEN vendor_name IN ('บริษัท ABC', 'ABC', 'abc') THEN 'ABC Co., Ltd.'
 --       WHEN vendor_name IN ('ซัพพลาย XYZ', 'XYZ Supply', 'xyz') THEN 'XYZ Supply'
 --       WHEN vendor_name IN ('โรงแรม 123', 'Hotel 123') THEN 'Hotel 123'
---       ELSE LOWER(TRIM(vendor_name))
+--       ELSE vendor_name  -- Keep unmapped names unchanged
 --     END
---   WHERE vendor_name IS NOT NULL;
+--   WHERE vendor_name IN (  -- Restrict to rows that match at least one mapping
+--     'บริษัท ABC', 'ABC', 'abc',
+--     'ซัพพลาย XYZ', 'XYZ Supply', 'xyz',
+--     'โรงแรม 123', 'Hotel 123'
+--   );
 --
 --   SELECT COUNT(*) as rows_updated FROM public.vendor_bills;
 -- COMMIT;

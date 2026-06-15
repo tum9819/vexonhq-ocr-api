@@ -72,17 +72,30 @@ ROLLBACK;
 
 ### Step 4: Execute Update
 
+⚠️ **IMPORTANT:** The UPDATE block in `sql/2_FIX_NULL_DUE_DATE.sql` is **DISABLED by default** for safety.
+Before running, manually uncomment and verify the date logic.
+
+Postgres-correct syntax to report affected rows:
+
 ```sql
 BEGIN;
   UPDATE public.vendor_bills
   SET due_date = created_at::date + 30
-  WHERE due_date IS NULL;
+  WHERE due_date IS NULL
+  RETURNING id;  -- Returns all updated row IDs
   
-  SELECT COUNT(*) as rows_updated;
+  -- Then count them:
+  -- SELECT COUNT(*) FROM (above query) as updated;
 COMMIT;
 ```
 
-**Expected result:** `rows_updated: 31`
+Or verify separately after UPDATE:
+```sql
+SELECT COUNT(*) FROM public.vendor_bills 
+WHERE due_date IS NOT NULL AND created_at >= '2026-06-15'::date;
+```
+
+**Expected result after execution:** All NULL due_dates converted to `created_at + 30`
 
 ### Step 5: Verify Fix
 

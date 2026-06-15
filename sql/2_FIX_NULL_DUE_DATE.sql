@@ -51,11 +51,13 @@ ROLLBACK;
 --     AND review_status IS NOT NULL  -- Skip if review status is NULL
 --     AND review_status != 'rejected';  -- Skip rejected invoices
 --
---   -- For Postgres: report actually affected rows
---   GET DIAGNOSTICS rows_affected = ROW_COUNT;
---   SELECT rows_affected as rows_updated;
---
 -- COMMIT;
+--
+-- AFTER COMMIT, verify with:
+--   SELECT COUNT(*) FROM public.vendor_bills
+--   WHERE due_date IS NOT NULL
+--     AND updated_at >= (now() - interval '1 minute');
+-- (This counts rows updated in the last minute)
 
 -- NOTE: If you want to also set due_date for paid/rejected bills (for archival),
 -- review each case individually in a separate transaction.
