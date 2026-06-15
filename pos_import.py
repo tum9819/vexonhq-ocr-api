@@ -597,19 +597,22 @@ def parse_inventory(df: pd.DataFrame, snapshot_at: datetime, **_) -> dict:
     for _, r in df.iterrows():
         if is_total_row(r):
             continue
-        name = str(r.get("ชื่อ") or "").strip()
+        # strip_html() is NaN-safe (returns None for pandas NaN); the bare
+        # `str(x or "").strip() or None` pattern leaks 'nan' because float('nan')
+        # is truthy (F-STK-1: 70% of rows had material_code='nan').
+        name = strip_html(r.get("ชื่อ"))
         if not name:
             continue
         value = to_num(r.get("มูลค่าสินค้าในสต๊อก")) or 0
         total_value += value
         items.append({
             "item_name":     name,
-            "material_code": str(r.get("รหัสวัตถุดิบ") or "").strip() or None,
-            "tag":           str(r.get("ป้ายกำกับ") or "").strip() or None,
+            "material_code": strip_html(r.get("รหัสวัตถุดิบ")),
+            "tag":           strip_html(r.get("ป้ายกำกับ")),
             "qty_in_stock":  to_num(r.get("จำนวนของในสต็อก")),
             "qty_max":       to_num(r.get("จำนวนสูงสุดของสต็อก")),
             "qty_diff":      to_num(r.get("ส่วนต่าง")),
-            "unit":          str(r.get("หน่วย") or "").strip() or None,
+            "unit":          strip_html(r.get("หน่วย")),
             "unit_price":    to_num(r.get("ราคาต่อหน่วย")),
             "stock_value":   value,
         })
