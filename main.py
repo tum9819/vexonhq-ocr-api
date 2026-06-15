@@ -39,7 +39,7 @@ import pypdfium2 as pdfium
 import pytesseract
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from llm import get_openai, openai_chat  # OpenAI client + chat wrapper live in llm.py
+from llm import get_openai, openai_chat, openai_chat_structured  # OpenAI client + chat wrappers live in llm.py
 from PIL import Image
 from pydantic import BaseModel
 from supabase import Client, create_client
@@ -2190,26 +2190,55 @@ CRITICAL RULES — read carefully, these errors are common:
 """
 
 
+# OCR structured-output toggle. Default ON: the production OCR uses OpenAI
+# Structured Outputs (strict JSON Schema) so the model STRUCTURALLY guarantees
+# every field is present, correctly typed and enum-constrained — killing the
+# omit/wrong-type/bad-enum class at the source. Set OCR_STRUCTURED=0 in the
+# environment (Coolify) to fall back to plain json_object mode instantly,
+# without a code change/redeploy, if a real receipt ever trips strict mode.
+_OCR_STRUCTURED = os.environ.get("OCR_STRUCTURED", "1") != "0"
+
+
 def _run_gpt_vision(image_bytes: bytes, mime_type: str, ocr_hint: str) -> dict[str, Any]:
-    """Send image to GPT-4 Vision and return parsed JSON."""
+    """Send image to GPT-4 Vision and return parsed JSON.
+
+    Uses Structured Outputs (strict JSON Schema) by default; falls back to plain
+    json_object mode when OCR_STRUCTURED=0. Both routes go through llm.* so token
+    usage/latency/errors land in ai_call_log. The returned dict shape is identical
+    either way (normalize_structured maps the strict result onto the same keys the
+    downstream consumers — _validate_invoice / _insert_items — already expect)."""
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:{mime_type or 'image/jpeg'};base64,{b64}"
     prompt = VISION_PROMPT.format(ocr_hint=(ocr_hint or "(empty)")[:3000])
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }
+    ]
 
-    # Routed through llm.openai_chat so token usage/latency/errors land in
-    # ai_call_log (audit Monitoring remediation). Model unchanged.
+    if _OCR_STRUCTURED:
+        from ocr_schema import invoice_json_schema, normalize_structured
+
+        resp = openai_chat_structured(
+            "vision_ocr",
+            model=OPENAI_VISION_MODEL,
+            messages=messages,
+            schema=invoice_json_schema(),
+            schema_name="invoice",
+            temperature=0.1,
+            max_tokens=4000,  # high-item-count invoices (Makro 20-30 items/page)
+        )
+        raw = (resp.choices[0].message.content or "{}").strip()
+        return normalize_structured(json.loads(raw))
+
     resp = openai_chat(
         "vision_ocr",
         model=OPENAI_VISION_MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            }
-        ],
+        messages=messages,
         response_format={"type": "json_object"},
         temperature=0.1,
         max_tokens=4000,  # increased for high-item-count invoices (Makro 20-30 items/page)

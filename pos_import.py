@@ -553,11 +553,11 @@ def parse_sales_by_product(df: pd.DataFrame, period_start: date,
         name = str(r.get("ชื่อสินค้า") or "").strip()
         if not name:
             continue
-        sku = str(r.get("รหัสสินค้า") or "").strip() or None
+        sku = strip_html(r.get("รหัสสินค้า"))
         avg_cost  = to_num(r.get("ต้นทุนเฉลี่ย"))
         avg_price = to_num(r.get("ราคาขายเฉลี่ย"))
-        category  = str(r.get("หมวดสินค้า") or "").strip() or None
-        group     = str(r.get("กลุ่ม") or "").strip() or None
+        category  = strip_html(r.get("หมวดสินค้า"))
+        group     = strip_html(r.get("กลุ่ม"))
         rows.append({
             "branch_code":   map_branch(r.get("สาขา")),
             "period_start":  period_start,
@@ -597,19 +597,22 @@ def parse_inventory(df: pd.DataFrame, snapshot_at: datetime, **_) -> dict:
     for _, r in df.iterrows():
         if is_total_row(r):
             continue
-        name = str(r.get("ชื่อ") or "").strip()
+        # strip_html() is NaN-safe (returns None for pandas NaN); the bare
+        # `str(x or "").strip() or None` pattern leaks 'nan' because float('nan')
+        # is truthy (F-STK-1: 70% of rows had material_code='nan').
+        name = strip_html(r.get("ชื่อ"))
         if not name:
             continue
         value = to_num(r.get("มูลค่าสินค้าในสต๊อก")) or 0
         total_value += value
         items.append({
             "item_name":     name,
-            "material_code": str(r.get("รหัสวัตถุดิบ") or "").strip() or None,
-            "tag":           str(r.get("ป้ายกำกับ") or "").strip() or None,
+            "material_code": strip_html(r.get("รหัสวัตถุดิบ")),
+            "tag":           strip_html(r.get("ป้ายกำกับ")),
             "qty_in_stock":  to_num(r.get("จำนวนของในสต็อก")),
             "qty_max":       to_num(r.get("จำนวนสูงสุดของสต็อก")),
             "qty_diff":      to_num(r.get("ส่วนต่าง")),
-            "unit":          str(r.get("หน่วย") or "").strip() or None,
+            "unit":          strip_html(r.get("หน่วย")),
             "unit_price":    to_num(r.get("ราคาต่อหน่วย")),
             "stock_value":   value,
         })
@@ -650,10 +653,10 @@ def parse_bill_detail(df: pd.DataFrame, **_) -> dict:
                 "invoice_no":       strip_html(r.get("INV. No")),
                 "sales_date":       d,
                 "sales_time":       to_thtime(r.get("เวลาที่ชำระเงิน")),
-                "drawer_code":      str(r.get("รหัสถาดเก็บเงิน") or "").strip() or None,
+                "drawer_code":      strip_html(r.get("รหัสถาดเก็บเงิน")),
                 "order_type":       strip_html(r.get("ประเภทการสั่ง")),
                 "channel":          strip_html(r.get("ช่องทาง")),
-                "table_label":      str(r.get("โต๊ะ") or "").strip() or None,
+                "table_label":      strip_html(r.get("โต๊ะ")),
                 "customer_name":    strip_html(r.get("ชื่อลูกค้า")),
                 "customer_phone":   strip_html(r.get("เบอร์โทรศัพท์")),
                 "payment_type_raw": strip_html(r.get("ประเภทการชำระเงิน")),
@@ -677,8 +680,8 @@ def parse_bill_detail(df: pd.DataFrame, **_) -> dict:
         items.append({
             "_bill_key":    key,    # resolved to bill_id after bill insert
             "line_no":      line_no,
-            "sku":          str(r.get("รหัสเมนู") or "").strip() or None,
-            "item_name":    str(r.get("ชื่อเมนู") or "").strip(),
+            "sku":          strip_html(r.get("รหัสเมนู")),
+            "item_name":    strip_html(r.get("ชื่อเมนู")) or "",
             "product_group": strip_html(r.get("กลุ่ม")),
             "category":     strip_html(r.get("หมวดสินค้า")),
             "qty":          to_num(r.get("จำนวน")) or 1,
@@ -758,7 +761,7 @@ def parse_cashflow_detail(df: pd.DataFrame, **_) -> dict:
         if txn_at is None:
             continue  # skip malformed rows
 
-        drawer = str(r.get("รหัสถาดเก็บเงิน") or "").strip() or None
+        drawer = strip_html(r.get("รหัสถาดเก็บเงิน"))
         if not drawer:
             continue
 

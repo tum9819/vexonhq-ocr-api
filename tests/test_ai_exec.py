@@ -136,13 +136,28 @@ class TestHealthMonitorParsers(unittest.TestCase):
     """Tests for health_monitor.py parsers using mocked subprocess output."""
 
     def setUp(self):
-        # Stub line_bot_routes to avoid circular import at test time
+        # Stub line_bot_routes to avoid circular import at test time. Snapshot
+        # the real modules first so tearDown can restore them — otherwise the
+        # stub (which lacks e.g. line_bot_routes._today_bkk) leaks into later
+        # tests and breaks them (test_pos_freshness regression).
+        self._saved_modules = {
+            k: sys.modules.get(k) for k in ("line_bot_routes", "health_monitor")
+        }
         stub = types.ModuleType("line_bot_routes")
         stub._push_text = MagicMock()
         sys.modules["line_bot_routes"] = stub
         if "health_monitor" in sys.modules:
             del sys.modules["health_monitor"]
         self.hm = importlib.import_module("health_monitor")
+
+    def tearDown(self):
+        # Restore sys.modules to its pre-test state so the line_bot_routes stub
+        # does not pollute subsequent tests.
+        for k, v in self._saved_modules.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
 
     def test_check_disk_over_threshold(self):
         """Returns True when a mount is > 80% used."""
