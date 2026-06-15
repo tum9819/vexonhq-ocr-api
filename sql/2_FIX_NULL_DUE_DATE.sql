@@ -100,24 +100,42 @@ ROLLBACK;
 --   • Use created_at as best guess (risky for delayed uploads)
 --   • Export those N bills and assign due_dates manually
 
--- Then run the actual update (RECOMMENDED: filter to unpaid + unrejected):
--- ⚠️ DISABLED: Uncomment only after manual verification of dates and full backup
+-- Then run the actual update (RECOMMENDED: uses bill_date when available):
+-- ⚠️ DISABLED: Uncomment only after:
+--   1. Running Query 0 to check invoice dates
+--   2. Confirming bill_date is populated for the NULL due_date records
+--   3. Full database backup
+--
 -- BEGIN;
 --   UPDATE public.vendor_bills
---   SET due_date = created_at::date + 30
+--   SET due_date = CASE
+--       WHEN bill_date IS NOT NULL THEN bill_date::date + 30
+--       ELSE created_at::date + 30  -- Fallback if bill_date missing
+--     END
 --   WHERE due_date IS NULL
 --     AND payment_status IS NOT NULL  -- Skip if status is NULL
---     AND payment_status NOT IN ('paid', 'credit_card')  -- Only unpaid/pending
+--     AND payment_status = 'unpaid'  -- Only unpaid bills (avoid paid/disputed)
 --     AND review_status IS NOT NULL  -- Skip if review status is NULL
 --     AND review_status != 'rejected';  -- Skip rejected invoices
 --
 -- COMMIT;
 --
 -- AFTER COMMIT, verify with:
---   SELECT COUNT(*) FROM public.vendor_bills
---   WHERE due_date IS NOT NULL
---     AND updated_at >= (now() - interval '1 minute');
--- (This counts rows updated in the last minute)
+--   SELECT COUNT(*) as recently_fixed
+--   FROM public.vendor_bills
+--   WHERE payment_status = 'unpaid'
+--     AND review_status != 'rejected'
+--     AND due_date >= CURRENT_DATE - 30;
+-- (This counts unpaid bills with recent due dates)
+
+-- ⚠️ SEPARATE MANUAL REVIEW STEP:
+-- If the above UPDATE leaves any NULL due_dates for unpaid bills, export them:
+-- SELECT id, vendor_name, invoice_no, bill_date, created_at, amount
+-- FROM public.vendor_bills
+-- WHERE due_date IS NULL
+--   AND payment_status = 'unpaid'
+--   AND review_status != 'rejected'
+-- ORDER BY created_at DESC;
 
 -- NOTE: If you want to also set due_date for paid/rejected bills (for archival),
 -- review each case individually in a separate transaction.
