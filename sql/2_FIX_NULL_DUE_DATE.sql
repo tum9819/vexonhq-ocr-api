@@ -13,9 +13,14 @@
 -- Assumption: All vendors get 30 days from invoice_date to pay
 -- Risk: Vendor-specific terms ignored (low risk if mostly uniform)
 --
--- ⚠️ IMPORTANT: created_at is when the record was uploaded to the system,
--- NOT necessarily the actual invoice date. If invoice date column exists,
--- use that instead. If the two differ significantly, results may be inaccurate.
+-- ⚠️ CRITICAL: created_at is when the record was uploaded to the system.
+-- It is NOT the invoice date. If the system has an actual invoice_date column,
+-- use that instead. If invoices are uploaded days/weeks after issue, using
+-- created_at will corrupt AP aging and cashflow forecasts.
+--
+-- For this system: verify that invoices are uploaded same-day before using
+-- created_at as a proxy for invoice_date. If not, require manual due_date
+-- assignment instead of calculated dates.
 --
 -- Run this for a preview first:
 BEGIN;
@@ -40,7 +45,9 @@ BEGIN;
   UPDATE public.vendor_bills
   SET due_date = created_at::date + 30
   WHERE due_date IS NULL
+    AND payment_status IS NOT NULL  -- Skip if status is NULL
     AND payment_status NOT IN ('paid', 'credit_card')  -- Only unpaid/pending
+    AND review_status IS NOT NULL  -- Skip if review status is NULL
     AND review_status != 'rejected';  -- Skip rejected invoices
 
   -- For Postgres: show affected rows
@@ -51,78 +58,35 @@ BEGIN;
 COMMIT;
 
 -- NOTE: If you want to also set due_date for paid/rejected bills (for archival),
--- add a separate transaction after reviewing the impact.
+-- review each case individually in a separate transaction.
 
 -- Verification:
-SELECT COUNT(*) FROM public.vendor_bills WHERE due_date IS NULL;  -- Should be 0
+-- ⚠️ NOTE: If you used status filtering (unpaid/pending only), NULLs may remain.
+SELECT COUNT(*) as remaining_null_due_dates FROM public.vendor_bills
+WHERE due_date IS NULL;  -- Should be 0 if Option A run with no filters;
+                         -- May be >0 if filtering by status (paid/rejected excluded)
 
 
 -- ============================================================
--- OPTION B: Extended 45-day payment terms
+-- OPTION B: Extended 45-day payment terms [DISABLED - USE OPTION A]
 -- ============================================================
--- Assumption: All vendors get 45 days from invoice_date to pay
--- Risk: More lenient than typical, but safer for small vendors
+-- ⚠️ DISABLED: This option uses SQLite syntax (SELECT changes())
+-- which does NOT work in Postgres/Supabase and will error/rollback.
 --
--- Run this for a preview:
-BEGIN;
-  SELECT
-    id,
-    vendor_name,
-    invoice_no,
-    created_at,
-    created_at::date + 45 as calculated_due_date,
-    amount
-  FROM public.vendor_bills
-  WHERE due_date IS NULL
-  LIMIT 31;
-ROLLBACK;
-
--- Then run the actual update:
-BEGIN;
-  UPDATE public.vendor_bills
-  SET due_date = created_at::date + 45
-  WHERE due_date IS NULL;
-
-  SELECT changes() as rows_updated;
-COMMIT;
+-- If you need 45-day terms: Copy Option A, change "+30" to "+45"
+-- and use the corrected Postgres syntax.
 
 
 -- ============================================================
--- OPTION C: Vendor-specific terms (MOST ACCURATE but manual)
+-- OPTION C: Vendor-specific terms [DISABLED - REQUIRES CAUTION]
 -- ============================================================
--- Use different payment terms based on vendor_name
--- Edit the CASE statement to match your vendor agreements
+-- ⚠️ DISABLED: Vendor-specific terms require:
+--   1. Verification that created_at = invoice_date (see warning above)
+--   2. Manual review of each vendor's actual payment terms
+--   3. Testing before production use (can corrupt AP aging if wrong)
 --
--- Preview first:
-BEGIN;
-  SELECT
-    id,
-    vendor_name,
-    invoice_no,
-    created_at,
-    CASE
-      WHEN vendor_name LIKE '%XXX%' THEN created_at::date + 30  -- 30 days
-      WHEN vendor_name LIKE '%YYY%' THEN created_at::date + 45  -- 45 days
-      ELSE created_at::date + 30  -- default 30 days
-    END as calculated_due_date,
-    amount
-  FROM public.vendor_bills
-  WHERE due_date IS NULL
-  LIMIT 31;
-ROLLBACK;
-
--- Then run the actual update (EDIT VENDOR NAMES AND TERMS FIRST):
-BEGIN;
-  UPDATE public.vendor_bills
-  SET due_date = CASE
-      WHEN vendor_name LIKE '%XXX%' THEN created_at::date + 30
-      WHEN vendor_name LIKE '%YYY%' THEN created_at::date + 45
-      ELSE created_at::date + 30
-    END
-  WHERE due_date IS NULL;
-
-  SELECT changes() as rows_updated;
-COMMIT;
+-- If you implement this: Use Option A as template, add CASE statement,
+-- and test thoroughly on a copy of the data first.
 
 
 -- ============================================================

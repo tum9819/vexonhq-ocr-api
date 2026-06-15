@@ -64,30 +64,14 @@ ORDER BY count DESC;
 -- Below are examples. Adjust the mapping based on YOUR vendor list.
 -- Run Query 2 first to see all duplicates, then edit the mapping.
 
--- OPTION A: Simple trim + lowercase normalization
--- (Fixes: "  Vendor ABC  " -> "vendor abc")
+-- OPTION A: Simple trim + lowercase normalization [DISABLED]
+-- ⚠️ DANGEROUS: This destroys official Thai/English vendor names.
+-- Example: "บริษัท ซีพี แอ็กซ์ตร้า" becomes "บริษัท ซีพี แอ็กซ์ตร้า"
+-- (lowercase breaks Thai legal name requirements)
 --
--- Preview:
-BEGIN;
-  SELECT
-    id,
-    vendor_name,
-    LOWER(TRIM(vendor_name)) as normalized_name
-  FROM public.vendor_bills
-  WHERE vendor_name IS NOT NULL
-    AND vendor_name != LOWER(TRIM(vendor_name))
-  LIMIT 20;
-ROLLBACK;
-
--- Run:
-BEGIN;
-  UPDATE public.vendor_bills
-  SET vendor_name = LOWER(TRIM(vendor_name))
-  WHERE vendor_name IS NOT NULL;
-
-  SELECT COUNT(*) as rows_updated FROM public.vendor_bills
-  WHERE vendor_name = LOWER(TRIM(vendor_name));
-COMMIT;
+-- Also risks unique constraint (vendor_name, invoice_no) conflicts.
+--
+-- DO NOT RUN THIS. Use manual review + selective CASE mapping instead.
 
 
 -- OPTION B: Custom mapping (RECOMMENDED)

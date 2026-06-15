@@ -2,6 +2,8 @@
 **Date:** 2026-06-16  
 **Status:** All 3 monitoring tasks completed
 
+⚠️ **SENSITIVE DATA**: This report contains vendor names, invoice numbers, amounts, and overdue payment details. Do not commit to public repositories or share without authorized recipients. Keep in private/internal systems only.
+
 ---
 
 ## ✅ **Task 1: Dashboard "ครบกำหนด 7 วัน" Monitoring**
@@ -9,15 +11,15 @@
 ### Current Status
 - **Bills due in next 7 days:** 4 bills
 - **Total amount:** ฿24,493
-- **Due date:** 2026-06-17 (2 days from now)
+- **Due date:** 2026-06-17 (1 day from now)
 
 ### Bills Requiring Payment:
 | # | Vendor | Amount | Days | Status |
 |---|--------|--------|------|--------|
-| 1 | ขายส่ง | ฿5,268 | 2 | unpaid |
-| 2 | ขายส่ง | ฿3,168 | 2 | unpaid |
-| 3 | ขายส่ง | ฿3,225 | 2 | unpaid |
-| 4 | บจก. บี.บี. ซุปเปอร์สโตร์ | ฿12,832 | 2 | unpaid |
+| 1 | ขายส่ง | ฿5,268 | 1 | unpaid |
+| 2 | ขายส่ง | ฿3,168 | 1 | unpaid |
+| 3 | ขายส่ง | ฿3,225 | 1 | unpaid |
+| 4 | บจก. บี.บี. ซุปเปอร์สโตร์ | ฿12,832 | 1 | unpaid |
 
 ### ✅ Dashboard Status
 - ✅ View `v_invoice_due_soon` working correctly
