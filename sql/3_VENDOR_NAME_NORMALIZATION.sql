@@ -1,7 +1,14 @@
 -- STEP 3: Vendor Name Normalization (P1 - Optional, lower priority)
 --
+-- ⚠️ WARNING: These scripts have unique constraint issues. Do NOT auto-run.
+-- Use for analysis only. Manual review required before any UPDATE.
+--
 -- PURPOSE: Consolidate duplicate vendor names with different spellings/cases
 -- IMPACT: Improves reporting accuracy and analytics
+--
+-- Constraint Risk: The database has a unique constraint on (vendor_name, invoice_no).
+-- Auto-consolidation can create duplicate key violations. Test each vendor group
+-- separately and review conflicts before updating.
 --
 -- ============================================================
 -- Query 1: Find duplicate vendors with similar names

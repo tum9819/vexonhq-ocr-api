@@ -13,6 +13,10 @@
 -- Assumption: All vendors get 30 days from invoice_date to pay
 -- Risk: Vendor-specific terms ignored (low risk if mostly uniform)
 --
+-- ⚠️ IMPORTANT: created_at is when the record was uploaded to the system,
+-- NOT necessarily the actual invoice date. If invoice date column exists,
+-- use that instead. If the two differ significantly, results may be inaccurate.
+--
 -- Run this for a preview first:
 BEGIN;
   SELECT
@@ -21,20 +25,33 @@ BEGIN;
     invoice_no,
     created_at,
     created_at::date + 30 as calculated_due_date,
-    amount
+    amount,
+    payment_status,
+    review_status
   FROM public.vendor_bills
   WHERE due_date IS NULL
+    AND payment_status NOT IN ('paid', 'credit_card')  -- Only unpaid bills need due_date
+    AND review_status != 'rejected'  -- Skip rejected bills
   LIMIT 31;
 ROLLBACK;
 
--- Then run the actual update:
+-- Then run the actual update (RECOMMENDED: filter to unpaid + unrejected):
 BEGIN;
   UPDATE public.vendor_bills
   SET due_date = created_at::date + 30
-  WHERE due_date IS NULL;
+  WHERE due_date IS NULL
+    AND payment_status NOT IN ('paid', 'credit_card')  -- Only unpaid/pending
+    AND review_status != 'rejected';  -- Skip rejected invoices
 
-  SELECT changes() as rows_updated;
+  -- For Postgres: show affected rows
+  SELECT COUNT(*) as rows_updated FROM public.vendor_bills
+  WHERE due_date IS NOT NULL
+    AND payment_status NOT IN ('paid', 'credit_card');
+
 COMMIT;
+
+-- NOTE: If you want to also set due_date for paid/rejected bills (for archival),
+-- add a separate transaction after reviewing the impact.
 
 -- Verification:
 SELECT COUNT(*) FROM public.vendor_bills WHERE due_date IS NULL;  -- Should be 0
