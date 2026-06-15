@@ -14,3 +14,6 @@ venv/
 backups/
 
 wongnai_snapshot/
+
+# Operational/monitoring reports with sensitive data
+MONITORING_REPORT*.md

@@ -41,21 +41,21 @@ BEGIN;
 ROLLBACK;
 
 -- Then run the actual update (RECOMMENDED: filter to unpaid + unrejected):
-BEGIN;
-  UPDATE public.vendor_bills
-  SET due_date = created_at::date + 30
-  WHERE due_date IS NULL
-    AND payment_status IS NOT NULL  -- Skip if status is NULL
-    AND payment_status NOT IN ('paid', 'credit_card')  -- Only unpaid/pending
-    AND review_status IS NOT NULL  -- Skip if review status is NULL
-    AND review_status != 'rejected';  -- Skip rejected invoices
-
-  -- For Postgres: show affected rows
-  SELECT COUNT(*) as rows_updated FROM public.vendor_bills
-  WHERE due_date IS NOT NULL
-    AND payment_status NOT IN ('paid', 'credit_card');
-
-COMMIT;
+-- ⚠️ DISABLED: Uncomment only after manual verification of dates and full backup
+-- BEGIN;
+--   UPDATE public.vendor_bills
+--   SET due_date = created_at::date + 30
+--   WHERE due_date IS NULL
+--     AND payment_status IS NOT NULL  -- Skip if status is NULL
+--     AND payment_status NOT IN ('paid', 'credit_card')  -- Only unpaid/pending
+--     AND review_status IS NOT NULL  -- Skip if review status is NULL
+--     AND review_status != 'rejected';  -- Skip rejected invoices
+--
+--   -- For Postgres: report actually affected rows
+--   GET DIAGNOSTICS rows_affected = ROW_COUNT;
+--   SELECT rows_affected as rows_updated;
+--
+-- COMMIT;
 
 -- NOTE: If you want to also set due_date for paid/rejected bills (for archival),
 -- review each case individually in a separate transaction.
