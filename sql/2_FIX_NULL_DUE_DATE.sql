@@ -75,6 +75,8 @@ WHERE due_date IS NULL;  -- Should be 0 if Option A run with no filters;
 --
 -- If you need 45-day terms: Copy Option A, change "+30" to "+45"
 -- and use the corrected Postgres syntax.
+--
+-- DO NOT UNCOMMENT OR RUN. Option A is active above.
 
 
 -- ============================================================
@@ -87,30 +89,35 @@ WHERE due_date IS NULL;  -- Should be 0 if Option A run with no filters;
 --
 -- If you implement this: Use Option A as template, add CASE statement,
 -- and test thoroughly on a copy of the data first.
+--
+-- DO NOT UNCOMMENT OR RUN. Option A is active above.
 
 
 -- ============================================================
--- OPTION D: Manual review + CSV import
+-- OPTION D: Manual review + CSV import [DISABLED - OPTIONAL ONLY]
 -- ============================================================
 -- For each bill, manually determine correct due_date:
 -- 1. Export NULL due_date bills to CSV
 -- 2. Review each with vendor agreements
 -- 3. Re-import with corrected due_dates
 --
--- Export query:
-COPY (
-  SELECT
-    id,
-    vendor_name,
-    invoice_no,
-    amount,
-    created_at,
-    review_status,
-    payment_status
-  FROM public.vendor_bills
-  WHERE due_date IS NULL
-  ORDER BY created_at DESC
-) TO STDOUT WITH (FORMAT CSV, HEADER);
+-- DISABLED: This is a fallback option only. Use Option A above.
+-- If you need to export for manual review, uncomment the query below.
+--
+-- Export query (COMMENTED OUT - uncomment only if needed):
+-- COPY (
+--   SELECT
+--     id,
+--     vendor_name,
+--     invoice_no,
+--     amount,
+--     created_at,
+--     review_status,
+--     payment_status
+--   FROM public.vendor_bills
+--   WHERE due_date IS NULL
+--   ORDER BY created_at DESC
+-- ) TO STDOUT WITH (FORMAT CSV, HEADER);
 
 
 -- ============================================================

@@ -1,14 +1,15 @@
 -- STEP 3: Vendor Name Normalization (P1 - Optional, lower priority)
 --
--- ⚠️ WARNING: These scripts have unique constraint issues. Do NOT auto-run.
+-- ⚠️ CRITICAL WARNING: These scripts have unique constraint issues. Do NOT auto-run.
 -- Use for analysis only. Manual review required before any UPDATE.
 --
 -- PURPOSE: Consolidate duplicate vendor names with different spellings/cases
 -- IMPACT: Improves reporting accuracy and analytics
 --
 -- Constraint Risk: The database has a unique constraint on (vendor_name, invoice_no).
--- Auto-consolidation can create duplicate key violations. Test each vendor group
--- separately and review conflicts before updating.
+-- Auto-consolidation can create duplicate key violations and CORRUPT VENDOR DATA.
+-- Test each vendor group separately and review conflicts BEFORE updating.
+-- Any destructive UPDATE blocks have been DISABLED and COMMENTED OUT below.
 --
 -- ============================================================
 -- Query 1: Find duplicate vendors with similar names
@@ -78,7 +79,11 @@ ORDER BY count DESC;
 -- Map known vendor spelling variations to canonical form
 -- Edit the CASE statement with your actual vendor names
 --
--- Preview:
+-- ⚠️ DISABLED: The destructive UPDATE block below risks unique constraint violations.
+-- Before running: manually verify each vendor mapping, test on a staging copy,
+-- and confirm no duplicate (vendor_name, invoice_no) pairs would result.
+--
+-- Preview query (SAFE - read-only):
 BEGIN;
   SELECT
     id,
@@ -94,19 +99,28 @@ BEGIN;
   LIMIT 20;
 ROLLBACK;
 
--- Run (AFTER EDITING WITH YOUR VENDOR NAMES):
-BEGIN;
-  UPDATE public.vendor_bills
-  SET vendor_name = CASE
-      WHEN vendor_name IN ('บริษัท ABC', 'ABC', 'abc') THEN 'ABC Co., Ltd.'
-      WHEN vendor_name IN ('ซัพพลาย XYZ', 'XYZ Supply', 'xyz') THEN 'XYZ Supply'
-      WHEN vendor_name IN ('โรงแรม 123', 'Hotel 123') THEN 'Hotel 123'
-      ELSE LOWER(TRIM(vendor_name))
-    END
-  WHERE vendor_name IS NOT NULL;
-
-  SELECT COUNT(*) as rows_updated FROM public.vendor_bills;
-COMMIT;
+-- DESTRUCTIVE UPDATE (COMMENTED OUT - DO NOT RUN WITHOUT EXPLICIT REVIEW):
+-- IMPORTANT: Before uncommenting and running:
+-- 1. Review the CASE statement and customize for YOUR vendor list
+-- 2. Test the preview query above first
+-- 3. Verify no duplicate (vendor_name, invoice_no) pairs would result
+-- 4. Back up the database (snapshot or export)
+-- 5. Run on a staging environment first
+--
+-- Once approved, uncomment these lines:
+--
+-- BEGIN;
+--   UPDATE public.vendor_bills
+--   SET vendor_name = CASE
+--       WHEN vendor_name IN ('บริษัท ABC', 'ABC', 'abc') THEN 'ABC Co., Ltd.'
+--       WHEN vendor_name IN ('ซัพพลาย XYZ', 'XYZ Supply', 'xyz') THEN 'XYZ Supply'
+--       WHEN vendor_name IN ('โรงแรม 123', 'Hotel 123') THEN 'Hotel 123'
+--       ELSE LOWER(TRIM(vendor_name))
+--     END
+--   WHERE vendor_name IS NOT NULL;
+--
+--   SELECT COUNT(*) as rows_updated FROM public.vendor_bills;
+-- COMMIT;
 
 
 -- ============================================================
