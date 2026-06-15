@@ -15,5 +15,7 @@ backups/
 
 wongnai_snapshot/
 
-# Operational/monitoring reports with sensitive data
+# Operational/monitoring/audit reports with sensitive data
+# (Contains vendor names, invoice numbers, amounts, payment status, follow-up actions)
 MONITORING_REPORT*.md
+AUDIT_REPORT*.md

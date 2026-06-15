@@ -20,6 +20,25 @@
 
 ## P0: Fix NULL due_date (31 bills)
 
+### ⚠️ CRITICAL PREREQUISITE — READ BEFORE PROCEEDING
+
+**created_at is UPLOAD time, NOT invoice date.**
+
+If invoices are uploaded days/weeks after they were issued, using `created_at::date + 30` for due_date will:
+- ❌ Corrupt AP aging reports
+- ❌ Corrupt cashflow forecasts
+- ❌ Show invoices as overdue when they're not
+
+**MUST verify before applying fix:**
+1. Check actual invoice dates in OCR data (`ocr_json->>'bill_date'`)
+2. Confirm invoices are uploaded same-day (or very close to) issue date
+3. If NOT same-day uploads, require manual due_date assignment per invoice
+
+**This fix assumes:** All NULL due_date invoices were uploaded within 1-2 days of issue.
+**If this assumption is wrong,** the fix will corrupt your financial data.
+
+---
+
 ### Step 1: Analyze Current State
 Run `1_ANALYZE_NULL_DUE_DATE.sql` to:
 - List all 31 bills
@@ -100,19 +119,34 @@ WHERE due_date IS NOT NULL AND created_at >= '2026-06-15'::date;
 ### Step 5: Verify Fix
 
 ```sql
--- Check no NULL remain
+-- Check remaining NULL due_dates (will vary by filtering)
 SELECT COUNT(*) FROM public.vendor_bills 
-WHERE due_date IS NULL;  -- Should be 0
+WHERE due_date IS NULL;
+-- Expected: 0 if no filters, or >0 if you filtered out paid/rejected bills
 
 -- Check new due dates look good
-SELECT vendor_name, invoice_no, created_at, due_date, amount
+SELECT vendor_name, invoice_no, created_at, due_date, amount, payment_status
 FROM public.vendor_bills
-WHERE created_at >= '2026-06-10'  -- Recently updated
+WHERE due_date >= '2026-06-15'  -- Recently set due_dates
 ORDER BY due_date;
+
+-- If using the recommended filters (unpaid + unrejected only):
+SELECT COUNT(*) FROM public.vendor_bills
+WHERE payment_status = 'unpaid'
+  AND due_date >= '2026-06-15';
+-- Should match the count of bills that were fixed
 ```
 
+**⚠️ Important:** If you used status filtering in the UPDATE, NULL due_dates may remain for:
+- `payment_status = 'paid'` or `'credit_card'` (already paid/archived)
+- `review_status = 'rejected'` (disputed invoices)
+- Any row with NULL status fields
+
+This is intentional — you only want to track active unpaid bills. If you need to fix the others separately, repeat the fix with different WHERE conditions.
+
 **Impact after fix:**
-- ✅ Dashboard "Due Soon" card now includes these 31 bills
+- ✅ Dashboard "Due Soon" card now includes active unpaid bills
+- ✅ Overdue tracking now accurate for unpaid invoices
 - ✅ Cashflow forecasting no longer has gaps
 - ✅ Payment alerts can trigger on due_date
 
