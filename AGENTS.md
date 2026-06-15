@@ -9,6 +9,8 @@ description: AI coding agent for vexonhq-ocr-api FastAPI backend (Mara Station r
 > Stack / DB column cheat sheet / route inventory → see `CLAUDE.md`.
 > Project history / specs → `C:\Users\rapee\VEXONHQ\docs\`.
 
+> **🔁 Multi-agent flow + 3-AI self-review → source of truth = global `~/.claude/CLAUDE.md`.**
+> ตั้งแต่ **2026-06-08 roles สลับ**: *Claude เขียนโค้ดเอง*, Antigravity เป็น reviewer. ก่อนรายงาน TUM, Claude self-review ด้วย `C:\Users\rapee\review.ps1` (Tier 2 **Codex** → Tier 3 **Gemini REST** ฟรี สลับอัตโนมัติเมื่อ Codex หมด limit). รันเฉพาะงานสำคัญ (auth/เงิน/security/migration/หลายไฟล์); งาน routine ใช้ `-Engine gemini`.
 ---
 
 ## Persona
@@ -20,14 +22,15 @@ language a non-programmer can act on. Default to terse + verifiable.
 
 ---
 
-## Division of labor — FIRM RULE (updated 2026-06-02)
+## Division of labor — FIRM RULE (updated 2026-06-08, roles swapped)
 
-This repo now follows the same model as all of TUM's projects:
-- **Antigravity (Gemini IDE) writes ALL the code** — every source edit in this repo. It implements the tasks Claude specs, runs the local gates, and reports back.
-- **Claude Code is commander + QA — does NOT write application code.** Claude specs the task + acceptance criteria, runs the tests / health checks, reviews Antigravity's diff, reports to TUM, and owns **git commit + push (only after TUM Confirm) + the mandatory clean-rebuild verification + the doc updates**. Claude may edit only docs / coordination files + tiny copy/typo fixes.
-- Hand off via a `HANDOFF.md` spec (task + exact files + acceptance criteria); Antigravity reads it, implements all the code, and writes a factual status back into the same file.
+Follows TUM's global rule (`~/.claude/CLAUDE.md`):
+- **Claude Code writes, edits, and owns the application code** in this repo (backend). Implement directly — no `HANDOFF.md` specs.
+- **Antigravity (Gemini IDE) is the reviewer** — it adversarially reviews Claude's diffs after the fact. Take its findings as genuine signal.
+- Claude self-reviews BEFORE Antigravity sees a diff: code-review / simplify / verify skills + `review.ps1` (Codex → Gemini failover) on substantive changes.
+- Claude owns git commit + push (**only after TUM Confirm**) + the mandatory clean-rebuild verification + doc updates.
 
-The Persona above + the 6-step workflow, pitfalls, and boundaries below apply to **whoever writes the code (now Antigravity)**; Claude uses them to spec and to review. (Earlier wording of this file assumed Claude wrote the code — superseded 2026-06-02 per TUM's global rule.)
+The Persona above + the 6-step workflow, pitfalls, and boundaries below apply to Claude as the author. (Supersedes the 2026-06-02 split where Antigravity wrote the code and Claude was QA-only.)
 
 ---
 
@@ -513,7 +516,7 @@ A loan is a balance-sheet/financing event: money borrowed in is a liability (not
 
 **AUDIT (2026-06-02):** Independent full-system audit of VEXONHQ (frontend) + vexonhq-ocr-api (this backend) by 6 parallel auditors (OCR, P&L/accounting, AI, frontend/UX, security, reliability/ops) + live read-only prod tests + Supabase advisors. 52 findings: 2 Critical, 9 High, 19 Medium, 18 Low, 4 Info. **Overall grade B+.** Key conclusions: no active data leak found; all prior Session-47/49/50 fixes still hold; P&L/accounting core trustworthy (no hallucinated SQL columns, exports reconcile). Main themes = the 2 Criticals + UI page sprawl (73 routes; recommend ~18 core + admin) + AI monitoring statistically hollow (anomaly had only 1 usable baseline; drift monitor inert at this volume). **Self-correction during the round — audit OPS-2 was WRONG:** the `backup.py` `:5432`→`:6543` pooler rewrite is INTENTIONAL/correct (avoids "max clients reached"; COPY works on 6543) → downgraded to Low. Report file: `VEXONHQ_System_Audit_2026-06-02.html` (in the Antigravity/IDE working dir).
 
-**RULE RELAXATION (A+ plan only):** TUM approved a one-off relaxation scoped strictly to the A+ remediation plan — Claude Code implemented + verified + pushed these items WITHOUT a per-push Confirm. The firm "Antigravity writes ALL code / Claude does NOT write application code" rule (see Division of labor above) STILL applies to every other task; this exception does not generalize.
+**RULE RELAXATION (A+ plan only):** TUM approved a one-off relaxation scoped strictly to the A+ remediation plan — Claude Code implemented + verified + pushed these items WITHOUT a per-push Confirm. At that date the firm rule was "Antigravity writes ALL code / Claude does NOT write application code" (since superseded 2026-06-08 — roles swapped, see Division of labor above); the dated exception does not generalize.
 
 **A+ REMEDIATION ROUND 1 (2026-06-03, B+ → A-):** 9 items shipped to prod + verified (smoke 70/70, deploy settled each push, independent adversarial re-review = 0 regressions, live-tested). BACKEND items:
 - **SEC-1 / AI-1 (Critical) — `/ai/exec` hardened** (commit `6e98a57`): `secrets.compare_digest` (constant-time key check) + removed `shell=True` (whitelisted cmds run as argv lists; docker-restart resolved in Python, no shell pipe) + timeout message 10s → 30s. Kept on `PUBLIC_PATHS` so the `ai.marastation.com` chat keeps working. Verified live: bad key → HTTP 401.

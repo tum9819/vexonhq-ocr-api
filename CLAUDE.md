@@ -5,7 +5,7 @@
 ---
 
 ## Who is the user
-**TUM** (`tum9819@gmail.com`) — owner of มาลาทวีวัฒนา restaurant (mala skewer shop, ทวีวัฒนา district, ~660 bills/month, ~282k baht/month). Building VEXONHQ end-to-end as a non-developer; technical enough to deploy and run SQL. Copies and pastes code Claude produces — Claude must not push to git itself.
+**TUM** (`tum9819@gmail.com`) — owner of มาลาทวีวัฒนา restaurant (mala skewer shop, ทวีวัฒนา district, ~660 bills/month, ~282k baht/month). Building VEXONHQ end-to-end as a non-developer; technical enough to deploy and run SQL. Claude writes the code and pushes only after TUM confirms each push (see Working rule 4); Antigravity reviews.
 
 Language: respond in Thai mixed with English, technical when needed. Keep things plain enough that a non-dev can act on them.
 
