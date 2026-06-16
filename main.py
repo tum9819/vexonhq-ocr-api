@@ -2326,6 +2326,33 @@ def _validate_invoice(parsed: dict[str, Any]) -> list[dict[str, str]]:
         except (TypeError, ValueError):
             pass
 
+    if subtotal is not None:
+        try:
+            items_list = parsed.get("items") or []
+            amounts = []
+            for it in items_list:
+                if isinstance(it, dict) and it.get("amount") is not None:
+                    try:
+                        amounts.append(float(it["amount"]))
+                    except (TypeError, ValueError):
+                        pass
+            if amounts:
+                items_total = round(sum(amounts), 2)
+                doc_subtotal = round(float(subtotal), 2)
+                if abs(items_total - doc_subtotal) > 1.0:
+                    warnings.append({
+                        "severity": "warn",
+                        "code": "ITEMS_SUBTOTAL_MISMATCH",
+                        "message": (
+                            f"ยอดรวม items ({items_total:,.2f}) "
+                            f"ไม่ตรงกับ subtotal ในเอกสาร ({doc_subtotal:,.2f}) "
+                            f"— โปรดตรวจสอบ qty/ราคา/ส่วนลด"
+                        ),
+                        "field": "subtotal",
+                    })
+        except (TypeError, ValueError):
+            pass
+
     if total is not None:
         try:
             if float(total) > 10000:
@@ -3067,7 +3094,10 @@ def _revalidate_bill(invoice_id: str) -> list[dict[str, str]]:
         return []
     bill = res.data[0]
 
-    # Build a "parsed-like" dict from the bill row
+    # Build a "parsed-like" dict from the bill row (+ items for ITEMS_SUBTOTAL_MISMATCH)
+    items_res = sb.table("invoice_items").select("amount").eq(
+        "vendor_bill_id", invoice_id
+    ).execute()
     parsed_like = {
         "vendor_name": bill.get("vendor_name"),
         "merchant_tax_id": bill.get("merchant_tax_id"),
@@ -3077,6 +3107,7 @@ def _revalidate_bill(invoice_id: str) -> list[dict[str, str]]:
         "subtotal": bill.get("subtotal"),
         "vat": bill.get("vat"),
         "amount": bill.get("amount"),
+        "items": items_res.data or [],
     }
 
     # Re-run validation against merged bill state
