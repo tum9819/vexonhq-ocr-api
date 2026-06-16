@@ -1549,11 +1549,17 @@ def invoice_detail(invoice_id: str):
         .execute()
     )
 
+    signed_pages = []
+    for p in (pages.data or []):
+        p = dict(p)
+        p["file_url"] = _sign_uploads_url(p.get("file_url"))
+        signed_pages.append(p)
+
     return {
         "success": True,
         "invoice": invoice,
         "items": items.data or [],
-        "pages": pages.data or [],
+        "pages": signed_pages,
         "warnings": warns.data or [],
     }
 
