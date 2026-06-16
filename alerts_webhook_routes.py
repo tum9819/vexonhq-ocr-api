@@ -39,6 +39,7 @@ Security:
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
@@ -62,7 +63,7 @@ ALERTS_WEBHOOK_SECRET = os.environ.get("ALERTS_WEBHOOK_SECRET", "")
 # ─────────────────────────────────────────────────────────
 
 def _send_telegram(text: str) -> dict:
-    """Send a Markdown message to Telegram. Raises RuntimeError on config issue."""
+    """Send an HTML-formatted message to Telegram. Raises RuntimeError on config issue."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         raise RuntimeError(
             "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars must be set in Coolify"
@@ -72,7 +73,7 @@ def _send_telegram(text: str) -> dict:
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        "parse_mode": "Markdown",
+        "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
     body = json.dumps(payload).encode("utf-8")
@@ -148,23 +149,23 @@ async def uptime_webhook(request: Request, secret: str = Query("")):
     icon = {"1": "🚨", "2": "✅", "3": "⚠️"}.get(alert_type, "ℹ️")
 
     lines = [
-        f"{icon} *VEXONHQ Alert: {alert_friendly}*",
+        f"<b>{html.escape(icon)} VEXONHQ Alert: {html.escape(alert_friendly)}</b>",
         "",
-        f"*Monitor:* {monitor_name}",
+        f"<b>Monitor:</b> {html.escape(monitor_name)}",
     ]
     if monitor_url:
-        # Escape underscores for Markdown (defensive for URLs with snake_case path segments)
-        safe_url = monitor_url.replace("_", "\\_")
-        lines.append(f"*URL:* `{safe_url}`")
+        safe_url = html.escape(monitor_url, quote=True)
+        lines.append(f'<b>URL:</b> <a href="{safe_url}">{safe_url}</a>')
     if alert_details:
-        lines.append(f"*Reason:* {alert_details}")
+        lines.append(f"<b>Reason:</b> {html.escape(str(alert_details))}")
     if alert_duration:
         try:
             secs = int(float(alert_duration))
             mins, s = divmod(secs, 60)
-            lines.append(f"*Downtime:* {mins}m {s}s" if mins else f"*Downtime:* {s}s")
+            duration_text = f"{mins}m {s}s" if mins else f"{s}s"
+            lines.append(f"<b>Downtime:</b> {html.escape(duration_text)}")
         except (ValueError, TypeError):
-            lines.append(f"*Duration:* {alert_duration}")
+            lines.append(f"<b>Duration:</b> {html.escape(str(alert_duration))}")
 
     text = "\n".join(lines)
 
@@ -191,7 +192,7 @@ def test_telegram(secret: str = Query("")):
 
     try:
         result = _send_telegram(
-            "🟢 *VEXONHQ Alert Test*\n\n"
+            "<b>🟢 VEXONHQ Alert Test</b>\n\n"
             "ถ้าคุณเห็นข้อความนี้ — webhook proxy ทำงานปกติ\n"
             "Uptime Robot alerts จะถูกส่งมาที่นี่ตั้งแต่ตอนนี้"
         )
