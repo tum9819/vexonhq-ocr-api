@@ -67,3 +67,78 @@ def test_confidence_warnings_tolerate_garbage():
     assert isinstance(main._confidence_warnings({"field_confidence": "not-a-dict"}), list)
     assert isinstance(main._confidence_warnings({}), list)
     assert isinstance(main._confidence_warnings({"field_confidence": {"amount": "bad"}}), list)
+
+
+# ── ITEMS_SUBTOTAL_MISMATCH ──────────────────────────────────────────────────
+
+def test_items_match_subtotal_no_warning():
+    w = main._validate_invoice({
+        "vendor_name": "V", "invoice_no": "INV-1",
+        "subtotal": 268.96, "vat": 18.83, "amount": 287.79,
+        "items": [{"amount": 134.48}, {"amount": 134.48}],
+    })
+    assert "ITEMS_SUBTOTAL_MISMATCH" not in _codes(w)
+
+
+def test_items_mismatch_subtotal_triggers_warn():
+    # screenshot case: items total 336.24 vs subtotal 268.96
+    w = main._validate_invoice({
+        "vendor_name": "V", "invoice_no": "INV-1",
+        "subtotal": 268.96, "vat": 18.83, "amount": 287.79,
+        "items": [{"amount": 168.12}, {"amount": 168.12}],
+    })
+    assert "ITEMS_SUBTOTAL_MISMATCH" in _codes(w)
+    match = next(x for x in w if x["code"] == "ITEMS_SUBTOTAL_MISMATCH")
+    assert match["severity"] == "warn"
+    assert match["field"] == "subtotal"
+    assert "336.24" in match["message"] and "268.96" in match["message"]
+
+
+def test_items_bad_amount_string_skipped_not_crash():
+    # one malformed item amount should be skipped; valid ones still checked
+    w = main._validate_invoice({
+        "vendor_name": "V", "invoice_no": "INV-1",
+        "subtotal": 268.96, "vat": 18.83, "amount": 287.79,
+        "items": [{"amount": 168.12}, {"amount": "bad"}, {"amount": 168.12}],
+    })
+    assert "ITEMS_SUBTOTAL_MISMATCH" in _codes(w)
+
+
+def test_items_within_1_baht_tolerance():
+    # 268.96 + 0.99 gap — should NOT fire
+    w = main._validate_invoice({
+        "vendor_name": "V", "invoice_no": "INV-1",
+        "subtotal": 268.96, "vat": 18.83, "amount": 287.79,
+        "items": [{"amount": 269.95}],
+    })
+    assert "ITEMS_SUBTOTAL_MISMATCH" not in _codes(w)
+
+
+def test_items_mismatch_no_subtotal_no_crash():
+    # subtotal=None → skip check entirely
+    w = main._validate_invoice({
+        "vendor_name": "V", "invoice_no": "INV-1",
+        "subtotal": None, "amount": 287.79,
+        "items": [{"amount": 168.12}, {"amount": 168.12}],
+    })
+    assert "ITEMS_SUBTOTAL_MISMATCH" not in _codes(w)
+
+
+def test_items_null_amounts_ignored():
+    # items with null amount should not contribute to sum
+    w = main._validate_invoice({
+        "vendor_name": "V", "invoice_no": "INV-1",
+        "subtotal": 268.96, "vat": 18.83, "amount": 287.79,
+        "items": [{"amount": 268.96}, {"amount": None}],
+    })
+    assert "ITEMS_SUBTOTAL_MISMATCH" not in _codes(w)
+
+
+def test_no_items_no_warning():
+    # no items → skip check (can't blame OCR for missing data)
+    w = main._validate_invoice({
+        "vendor_name": "V", "invoice_no": "INV-1",
+        "subtotal": 268.96, "vat": 18.83, "amount": 287.79,
+        "items": [],
+    })
+    assert "ITEMS_SUBTOTAL_MISMATCH" not in _codes(w)
