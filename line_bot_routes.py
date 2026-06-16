@@ -1056,6 +1056,73 @@ _scheduler.add_job(
     id="daily_pos_freshness_check",
     replace_existing=True,
 )
+
+# ─────────────────────────────────────────────
+# Breakeven analysis: Wednesday 09:30 + 1st of month 08:00
+# ─────────────────────────────────────────────
+from breakeven_routes import (  # noqa: E402 — imported here to avoid circular at module top
+    calc_breakeven_status as _calc_breakeven_status,
+    gen_breakeven_ai_message as _gen_breakeven_ai_message,
+    build_breakeven_line_message as _build_breakeven_line_message,
+)
+
+
+@_heartbeat("weekly_breakeven", expected_interval_hours=168)
+def _scheduled_weekly_breakeven():
+    """APScheduler job: send breakeven status to LINE every Wednesday 09:30 Bangkok."""
+    log.info("Scheduled weekly breakeven — running")
+    try:
+        today = _today_bkk()
+        ctx = _calc_breakeven_status(today.year, today.month)
+        if not ctx.get("breakeven_configured"):
+            log.warning("Weekly breakeven: no fixed-cost categories configured — skipping LINE push")
+            return
+        ai_msg = _gen_breakeven_ai_message(ctx)
+        _push_text(_build_breakeven_line_message(ctx, ai_msg))
+        log.info("Weekly breakeven sent OK — %s", ctx["month_label"])
+    except Exception as e:
+        log.error("Weekly breakeven FAILED: %s", e)
+        raise  # let @_heartbeat record the failure
+
+
+@_heartbeat("monthly_breakeven_close", expected_interval_hours=760)
+def _scheduled_monthly_breakeven_close():
+    """APScheduler job: send previous month's final breakeven on 1st of month 08:00 Bangkok."""
+    log.info("Scheduled monthly breakeven close — running")
+    try:
+        today = _today_bkk()
+        prev = (today.replace(day=1) - timedelta(days=1))
+        ctx = _calc_breakeven_status(prev.year, prev.month)
+        if not ctx.get("breakeven_configured"):
+            log.warning("Monthly breakeven close: no fixed-cost categories configured — skipping LINE push")
+            return
+        ai_msg = _gen_breakeven_ai_message(ctx)
+        _push_text(_build_breakeven_line_message(ctx, ai_msg))
+        log.info("Monthly breakeven close sent OK — %s", ctx["month_label"])
+    except Exception as e:
+        log.error("Monthly breakeven close FAILED: %s", e)
+        raise  # let @_heartbeat record the failure
+
+
+_scheduler.add_job(
+    _scheduled_weekly_breakeven,
+    trigger="cron",
+    day_of_week="wed",
+    hour=9,
+    minute=30,
+    id="weekly_breakeven",
+    replace_existing=True,
+)
+_scheduler.add_job(
+    _scheduled_monthly_breakeven_close,
+    trigger="cron",
+    day=1,
+    hour=8,
+    minute=0,
+    id="monthly_breakeven_close",
+    replace_existing=True,
+)
+
 _scheduler.start()
 log.info("LINE digest scheduler started — fires daily at 06:00 Asia/Bangkok")
 log.info("AP due reminder scheduler started — fires daily at 09:00 Asia/Bangkok")
@@ -1063,6 +1130,8 @@ log.info("Weekly summary scheduler started — fires every Monday 08:00 Asia/Ban
 log.info("Budget alert scheduler started — fires daily at 20:00 Asia/Bangkok")
 log.info("AI drift check scheduler started — fires daily at 08:30 Asia/Bangkok")
 log.info("DR backup scheduler registered — fires daily at 02:00 Asia/Bangkok")
+log.info("Weekly breakeven scheduler started — fires every Wednesday 09:30 Asia/Bangkok")
+log.info("Monthly breakeven close scheduler started — fires on 1st of month 08:00 Asia/Bangkok")
 
 
 # ─────────────────────────────────────────────
