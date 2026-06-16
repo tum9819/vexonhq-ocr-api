@@ -1147,6 +1147,13 @@ def line_test():
     return {"success": True, "message_sent": text, "line_response": result}
 
 
+@router.post("/breakeven/trigger")
+def trigger_breakeven():
+    """Manually trigger the breakeven LINE push (same as the Wednesday job)."""
+    _scheduled_weekly_breakeven()
+    return {"success": True}
+
+
 @router.post("/digest/today")
 def digest_today():
     """Build and send today's financial digest to LINE."""
