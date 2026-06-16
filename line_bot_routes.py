@@ -36,7 +36,8 @@ from zoneinfo import ZoneInfo
 
 import psycopg2
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
+from auth_routes import _require_admin_role
 
 # Audit B8-M3 (2026-05-29): the Coolify container runs on UTC, so date.today()
 # returns the UTC date — at 06:00 BKK (23:00 UTC previous day) it gives the
@@ -1145,6 +1146,13 @@ def line_test():
     text = f"✅ VEXONHQ LINE Bot พร้อมใช้งานแล้วครับ!\n📅 {now}"
     result = _push_text(text)
     return {"success": True, "message_sent": text, "line_response": result}
+
+
+@router.post("/breakeven/trigger")
+def trigger_breakeven(_admin: dict = Depends(_require_admin_role)):
+    """Manually trigger the breakeven LINE push (same as the Wednesday job). Admin only."""
+    _scheduled_weekly_breakeven()
+    return {"success": True}
 
 
 @router.post("/digest/today")
