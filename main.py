@@ -713,12 +713,16 @@ async def invoice_upload(file: UploadFile = File(...)):
     )
 
 
-def _find_uploaded_file(file_sha256: str) -> Optional[dict[str, Any]]:
+def _find_uploaded_file(file_sha256: str, expected_pages: int = 1) -> Optional[dict[str, Any]]:
     """Pre-OCR file-level idempotency. If this exact file (by byte SHA-256) was
     already ingested into a vendor_bill, return a ready 'already_uploaded'
     response so the caller can skip OCR + save entirely. Returns None when the
-    file is new — or when the lookup fails (fail-open: a transient DB hiccup must
-    never block a genuine upload)."""
+    file is new, partially saved, or when the lookup fails (fail-open: a transient
+    DB hiccup must never block a genuine upload).
+
+    expected_pages: total pages expected for this upload (1 for images, N for PDFs).
+    If fewer pages are found in DB than expected, the previous upload was truncated
+    mid-way — treat the file as new so the missing pages get processed."""
     try:
         sb = get_supabase()
         att = (
@@ -742,8 +746,18 @@ def _find_uploaded_file(file_sha256: str) -> Optional[dict[str, Any]]:
             .select("id", count="exact")
             .eq("parent_type", "vendor_bill")
             .eq("parent_id", parent_id)
+            .eq("file_sha256", file_sha256)
             .execute()
         )
+        saved_pages = page_count.count or 0
+        if saved_pages < expected_pages:
+            # Partial upload from a previous failed attempt — re-process so the
+            # missing pages are not silently dropped.
+            log.info(
+                "partial upload detected for file_sha256=%s… (%d/%d pages saved) — re-processing",
+                file_sha256[:12], saved_pages, expected_pages,
+            )
+            return None
         att_url = b.get("attachment_url")
         log.info(
             "already_uploaded: file_sha256=%s… already on bill %s — skipping OCR",
@@ -753,7 +767,7 @@ def _find_uploaded_file(file_sha256: str) -> Optional[dict[str, Any]]:
             "success": True,
             "invoice_id": parent_id,
             "batch_id": b.get("batch_id"),
-            "page_no": page_count.count or None,
+            "page_no": saved_pages or None,
             "merged": True,
             "already_uploaded": True,
             "parsed": b.get("ocr_json") or {
@@ -780,11 +794,17 @@ def _process_upload(contents: bytes, filename: str, content_type: str) -> dict[s
     # comparison it backstops, so a re-upload (e.g. a Cloudflare-524 retry) no
     # longer duplicates items/attachments — and the GPT-4o cost is saved too.
     file_sha256 = hashlib.sha256(contents).hexdigest()
-    already = _find_uploaded_file(file_sha256)
-    if already is not None:
-        return already
 
     is_pdf = (content_type == "application/pdf") or filename.lower().endswith(".pdf")
+
+    # For single-image uploads, the early idempotency check is safe — 1 file = 1 page,
+    # so partial-save truncation cannot occur. For PDFs we defer the check until after
+    # page-count is known, so _find_uploaded_file can detect a previously truncated
+    # upload and re-process the missing pages instead of silently skipping them.
+    if not is_pdf:
+        already = _find_uploaded_file(file_sha256, expected_pages=1)
+        if already is not None:
+            return already
 
     if is_pdf:
         # Convert PDF → list of PNG images (1 per page)
@@ -800,6 +820,12 @@ def _process_upload(contents: bytes, filename: str, content_type: str) -> dict[s
         # huge PDF would otherwise fan out unbounded paid calls.
         if len(page_images) > 40:
             raise HTTPException(413, f"PDF has too many pages ({len(page_images)}, max 40)")
+
+        # Idempotency check for PDFs: only skip re-processing when ALL expected
+        # pages are already saved — a partial previous upload is treated as new.
+        already = _find_uploaded_file(file_sha256, expected_pages=len(page_images))
+        if already is not None:
+            return already
 
         log.info("processing PDF '%s' with %d page(s)", filename, len(page_images))
 
@@ -904,12 +930,11 @@ def _persist_invoice_page(
     warnings = _validate_invoice(parsed)
 
     # 4) Upload to Supabase Storage
-    file_url = None
-    storage_path = None
     try:
         file_url, storage_path = _upload_to_storage(image_bytes, file_name, mime_type)
     except Exception:
-        log.exception("storage upload failed (continuing without file_url)")
+        log.exception("storage upload failed")
+        raise HTTPException(500, "storage upload failed")
 
     # 5) Save to DB (multi-page merge)
     try:
