@@ -14,8 +14,10 @@ from phase11_search_routes import _expand_category, _build_sql, SearchFilter
 
 
 def test_beverage_raw_maps_to_real_db_code():
-    # AI emits 'beverage_raw' but the real v_daybook code is 'raw_beverage'.
-    assert _expand_category("beverage_raw") == ["raw_beverage"]
+    # AI emits 'beverage_raw'. v_daybook has two real codes:
+    # 'raw_beverage' (bank_stmt entries) and 'beverage' (vendor_bills tagged
+    # by migration 2026-06-01). Both must be in the expansion.
+    assert _expand_category("beverage_raw") == ["raw_beverage", "beverage"]
 
 
 def test_reimbursement_maps_to_refund_received():
