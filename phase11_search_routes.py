@@ -2,8 +2,10 @@
 VEXONHQ Phase 11 — Smart Receipt Search (AI)
 =============================================
 Endpoints:
-    POST /search/receipt      -> Thai natural language -> SQL -> results
-    GET  /search/suggestions  -> query hints for UI
+    POST /search/receipt          -> Thai natural language -> SQL -> results
+    GET  /search/suggestions      -> query hints for UI
+    GET  /search/empty-hints      -> vendor hints when receipt search returns 0
+    GET  /search/product-summary  -> purchase qty/value by canonical SKU + period
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ import logging
 import os
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timedelta, date as _date, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
@@ -115,7 +117,9 @@ def _call_claude_filter(query: str) -> SearchFilter:
 # emit codes that don't exist in v_daybook, so searches returned almost nothing.
 # A single code may expand to several real codes (a category group).
 _CATEGORY_ALIASES: dict[str, list[str]] = {
-    "beverage_raw": ["raw_beverage"],
+    # vendor_bills tagged 'beverage' (migration 2026-06-01); bank_stmt uses 'raw_beverage'.
+    # Both must be in the expansion so AI search for เบียร์/เครื่องดื่ม hits both sources.
+    "beverage_raw": ["raw_beverage", "beverage"],
     "reimbursement": ["refund_received"],
     # "อาหาร/วัตถุดิบ" → all raw food materials, not just food_raw (33 rows).
     "food_raw": ["food_raw", "raw_meat", "raw_veggies", "raw_seasoning", "raw_oil_gas"],
@@ -201,7 +205,7 @@ def _build_and_run_query(f: SearchFilter, limit: int) -> list:
         conn = get_db_conn()
     except Exception as exc:
         logger.exception("DB connection failed: %s", exc)
-        raise HTTPException(503, f"Database connection failed: {exc}")
+        raise HTTPException(503, "Database unavailable — please retry")
 
     try:
         with conn.cursor() as cur:
@@ -216,7 +220,7 @@ def _build_and_run_query(f: SearchFilter, limit: int) -> list:
             return rows
     except Exception as exc:
         logger.exception("Search query failed: %s", exc)
-        raise HTTPException(500, f"Database query failed: {exc}")
+        raise HTTPException(500, "Query failed — please retry")
     finally:
         conn.close()
 
@@ -298,7 +302,7 @@ def get_empty_hints(q: str = ""):
         conn = get_db_conn()
     except Exception as exc:
         logger.exception("DB connection failed: %s", exc)
-        raise HTTPException(503, f"Database connection failed: {exc}")
+        raise HTTPException(503, "Database unavailable — please retry")
 
     try:
         with conn.cursor() as cur:
@@ -381,7 +385,7 @@ def get_empty_hints(q: str = ""):
                 ]
     except Exception as exc:
         logger.exception("empty-hints query failed: %s", exc)
-        raise HTTPException(500, f"Database query failed: {exc}")
+        raise HTTPException(500, "Query failed — please retry")
     finally:
         conn.close()
 
@@ -391,3 +395,137 @@ def get_empty_hints(q: str = ""):
         "alias_hints": alias_hints,
         "fuzzy_matches": fuzzy_matches,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Product-level purchase summary  (invoice_items × products × vendor_bills)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PRODUCT_CATEGORIES = {
+    "beer":       ["beer"],
+    "soft_drink": ["soft_drink", "water"],
+    "food":       ["food"],
+    "liquor":     ["liquor"],
+    "all":        [],  # empty = no filter
+}
+
+
+_BKK = timezone(timedelta(hours=7))
+
+
+def _resolve_period(period: str) -> tuple[str, str]:
+    """Return (date_from, date_to) for the given period token.
+
+    Accepts: this_month | last_month | YYYY-MM  (e.g. 2026-04)
+    Uses Bangkok time (UTC+7) so month boundaries match the user's clock.
+    """
+    now = datetime.now(_BKK)
+    if period == "this_month":
+        first = now.replace(day=1)
+        # last day = first of next month minus one day
+        if first.month == 12:
+            last = first.replace(year=first.year + 1, month=1, day=1)
+        else:
+            last = first.replace(month=first.month + 1, day=1)
+        last = (last - timedelta(days=1))
+        return first.strftime("%Y-%m-%d"), last.strftime("%Y-%m-%d")
+    if period == "last_month":
+        first = now.replace(day=1)
+        if first.month == 1:
+            prev_first = first.replace(year=first.year - 1, month=12, day=1)
+        else:
+            prev_first = first.replace(month=first.month - 1, day=1)
+        prev_last = (now.replace(day=1) - timedelta(days=1))
+        return prev_first.strftime("%Y-%m-%d"), prev_last.strftime("%Y-%m-%d")
+    # YYYY-MM — strict parse prevents malformed strings from silently resolving
+    try:
+        parsed = datetime.strptime(period, "%Y-%m")
+        y, m = parsed.year, parsed.month
+        first = _date(y, m, 1)
+        if m == 12:
+            last = _date(y + 1, 1, 1) - timedelta(days=1)
+        else:
+            last = _date(y, m + 1, 1) - timedelta(days=1)
+        return str(first), str(last)
+    except ValueError:
+        raise HTTPException(400, f"Invalid period '{period}'. Use this_month, last_month, or YYYY-MM.")
+
+
+@router.get("/product-summary")
+def product_summary(period: str = "last_month", category: str = "all"):
+    """Return purchase totals grouped by canonical SKU for a given period.
+
+    Query params:
+    - period: this_month | last_month | YYYY-MM  (default: last_month)
+    - category: all | beer | soft_drink | food | liquor  (default: all)
+    """
+    date_from, date_to = _resolve_period(period)
+    cats = _PRODUCT_CATEGORIES.get(category)
+    if cats is None:
+        raise HTTPException(400, f"Invalid category '{category}'. Use: {list(_PRODUCT_CATEGORIES)}")
+
+    cat_clause = ""
+    cat_params: list = []
+    if cats:
+        placeholders = ", ".join(["%s"] * len(cats))
+        cat_clause = f"AND p.category IN ({placeholders})"
+        cat_params = cats
+
+    sql = f"""
+        SELECT
+            ii.canonical_sku,
+            p.name_th,
+            p.category,
+            p.default_unit,
+            SUM(ii.quantity)   AS total_qty,
+            SUM(ii.amount)     AS total_value,
+            COUNT(DISTINCT ii.vendor_bill_id) AS bills
+        FROM public.invoice_items ii
+        JOIN public.products p       ON p.sku = ii.canonical_sku
+        JOIN public.vendor_bills vb  ON vb.id = ii.vendor_bill_id
+        WHERE vb.bill_date >= %s
+          AND vb.bill_date <= %s
+          AND vb.review_status = 'confirmed'
+          AND ii.canonical_sku IS NOT NULL
+          AND ii.canonical_sku <> 'other'
+          {cat_clause}
+        GROUP BY ii.canonical_sku, p.name_th, p.category, p.default_unit, p.sort_order
+        ORDER BY p.sort_order, total_value DESC NULLS LAST
+    """
+    params = [date_from, date_to] + cat_params
+
+    try:
+        conn = get_db_conn()
+    except Exception as exc:
+        logger.exception("product-summary DB connect failed: %s", exc)
+        raise HTTPException(503, "Database unavailable — please retry")
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = []
+            for r in cur.fetchall():
+                rows.append({
+                    "sku":         r[0],
+                    "name_th":     r[1],
+                    "category":    r[2],
+                    "unit":        r[3] or "",
+                    "total_qty":   float(r[4] or 0),
+                    "total_value": float(r[5] or 0),
+                    "bills":       int(r[6] or 0),
+                })
+            total_value = sum(r["total_value"] for r in rows)
+            return {
+                "period": period,
+                "date_from": date_from,
+                "date_to": date_to,
+                "category": category,
+                "total_value": total_value,
+                "count": len(rows),
+                "rows": rows,
+            }
+    except Exception as exc:
+        logger.exception("product-summary query failed: %s", exc)
+        raise HTTPException(500, "Query failed — please retry")
+    finally:
+        conn.close()
