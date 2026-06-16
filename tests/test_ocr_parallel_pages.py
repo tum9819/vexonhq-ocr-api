@@ -71,7 +71,7 @@ def _install_mocks(monkeypatch, *, ocr_sleep):
         }
 
     # Skip the pre-OCR file-hash lookup (it would otherwise hit Supabase).
-    monkeypatch.setattr(main, "_find_uploaded_file", lambda h: None)
+    monkeypatch.setattr(main, "_find_uploaded_file", lambda h, expected_pages=1: None)
     monkeypatch.setattr(main, "_ocr_page", fake_ocr_page)
     monkeypatch.setattr(main, "_persist_invoice_page", fake_persist)
     return state

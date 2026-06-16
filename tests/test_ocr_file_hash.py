@@ -105,20 +105,24 @@ def test_find_uploaded_file_miss_returns_none_even_if_amount_matches(monkeypatch
 
 def test_duplicate_upload_skips_ocr(monkeypatch):
     # _find_uploaded_file finds the file → _process_upload must short-circuit
-    # BEFORE any OCR work (pdf render or vision).
+    # BEFORE any OCR/Vision work.
+    # For PDFs, _pdf_to_images (cheap local conversion) runs first so the page
+    # count is known; the idempotency check happens after that. _ocr_page (the
+    # expensive GPT-4o call) must NOT be invoked.
     sentinel = {"success": True, "already_uploaded": True, "invoice_id": "bill-1",
                 "total_pages_processed": 0}
     seen = {}
 
-    def fake_find(h):
+    def fake_find(h, expected_pages=1):
         seen["hash"] = h
+        seen["expected_pages"] = expected_pages
         return sentinel
 
     def boom(*a, **k):
         raise AssertionError("OCR must not run for an already-uploaded file")
 
     monkeypatch.setattr(main, "_find_uploaded_file", fake_find)
-    monkeypatch.setattr(main, "_pdf_to_images", boom)
+    monkeypatch.setattr(main, "_pdf_to_images", lambda c: [b"p1", b"p2"])
     monkeypatch.setattr(main, "_ocr_page", boom)
 
     contents = b"DUPLICATE-FILE-BYTES"
@@ -126,10 +130,12 @@ def test_duplicate_upload_skips_ocr(monkeypatch):
 
     assert out is sentinel
     assert seen["hash"] == hashlib.sha256(contents).hexdigest()
+    # expected_pages must equal the page count returned by _pdf_to_images
+    assert seen["expected_pages"] == 2
 
 
 def test_new_multipage_writes_same_hash_to_every_page(monkeypatch):
-    monkeypatch.setattr(main, "_find_uploaded_file", lambda h: None)
+    monkeypatch.setattr(main, "_find_uploaded_file", lambda h, expected_pages=1: None)
     monkeypatch.setattr(main, "_pdf_to_images", lambda c: [b"p1", b"p2", b"p3"])
     monkeypatch.setattr(main, "_ocr_page",
                         lambda img, fn, mt: {"image_bytes": img, "file_name": fn,
@@ -151,7 +157,7 @@ def test_new_multipage_writes_same_hash_to_every_page(monkeypatch):
 
 
 def test_single_page_passes_hash_once(monkeypatch):
-    monkeypatch.setattr(main, "_find_uploaded_file", lambda h: None)
+    monkeypatch.setattr(main, "_find_uploaded_file", lambda h, expected_pages=1: None)
     monkeypatch.setattr(main, "_ocr_page",
                         lambda img, fn, mt: {"image_bytes": img, "file_name": fn,
                                              "mime_type": mt, "ocr_text": "", "parsed": {}})
