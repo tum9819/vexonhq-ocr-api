@@ -36,7 +36,8 @@ from zoneinfo import ZoneInfo
 
 import psycopg2
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
+from auth_routes import _require_admin_role
 
 # Audit B8-M3 (2026-05-29): the Coolify container runs on UTC, so date.today()
 # returns the UTC date — at 06:00 BKK (23:00 UTC previous day) it gives the
@@ -1148,8 +1149,8 @@ def line_test():
 
 
 @router.post("/breakeven/trigger")
-def trigger_breakeven(year: int = None, month: int = None):
-    """Manually trigger the breakeven LINE push. Optionally pass ?year=&month= to override."""
+def trigger_breakeven(year: int = None, month: int = None, _admin: dict = Depends(_require_admin_role)):
+    """Manually trigger the breakeven LINE push. Optionally pass ?year=&month= to override. Admin only."""
     from breakeven_routes import (
         calc_breakeven_status as _calc,
         gen_breakeven_ai_message as _ai,
