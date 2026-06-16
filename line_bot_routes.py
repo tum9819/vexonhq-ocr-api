@@ -1148,10 +1148,21 @@ def line_test():
 
 
 @router.post("/breakeven/trigger")
-def trigger_breakeven():
-    """Manually trigger the breakeven LINE push (same as the Wednesday job)."""
-    _scheduled_weekly_breakeven()
-    return {"success": True}
+def trigger_breakeven(year: int = None, month: int = None):
+    """Manually trigger the breakeven LINE push. Optionally pass ?year=&month= to override."""
+    from breakeven_routes import (
+        calc_breakeven_status as _calc,
+        gen_breakeven_ai_message as _ai,
+        build_breakeven_line_message as _build,
+    )
+    today = _today_bkk()
+    y = year  if year  else today.year
+    m = month if month else today.month
+    ctx = _calc(y, m)
+    ai_msg = _ai(ctx)
+    _push_text(_build(ctx, ai_msg))
+    return {"success": True, "month_label": ctx["month_label"],
+            "fixed_costs": ctx["fixed_costs"], "revenue": ctx["revenue"]}
 
 
 @router.post("/digest/today")
