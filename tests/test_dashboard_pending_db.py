@@ -34,7 +34,10 @@ def test_dashboard_pending_bills_query_contract():
     from datetime import date
     mock_row = [date(2026,6,8), date(2026,6,8), 10000, 11, 5, 5000, 1000, date(2026,6,8), 0, 500, date(2026,6,7), 500, 0, 0, 0]
 
-    mock_cursor.fetchone.side_effect = [mock_row, (1000,), (500,), (1,)] # First is metrics, others are for AI insight/top categories maybe?
+    # dashboard_executive does TWO fetchone()s: (1) the _EXEC_METRICS row, then
+    # (2) the sales-waterfall row (foodstory_gross, delivery_gross, delivery_net).
+    wf_row = (186788.03, 46376.03, 29610.38)  # -> commission 16,765.65; net 170,022.38
+    mock_cursor.fetchone.side_effect = [mock_row, wf_row]
     mock_cursor.fetchall.return_value = [] # For list queries
 
     with patch("phase2_routes.get_db_conn", return_value=mock_conn), \
@@ -64,8 +67,19 @@ def test_dashboard_pending_bills_query_contract():
         assert bills_card["value"] == 11
         assert bills_card["status"] == "critical" # 11 is critical
 
-        # Test 0 pending
-        mock_cursor.fetchone.side_effect = [[date(2026,6,8), date(2026,6,8), 10000, 0, 5, 5000, 1000, date(2026,6,8), 0, 500, date(2026,6,7), 500, 0, 0, 0]] + [[(1000,)]]*10
+        # Sales waterfall is attached to the sales card and reconciles to sales_net,
+        # WITHOUT touching the profit/cost cards (display-only, no double-count).
+        sales_card = next(c for c in cards if c["key"] == "sales_mtd")
+        assert sales_card["waterfall"]["foodstory_gross"] == 186788.03
+        assert sales_card["waterfall"]["delivery_commission"] == 16765.65
+        assert sales_card["waterfall"]["net_received"] == mock_summ["sales_net"]
+        assert sales_card["value"] == mock_summ["sales_net"]  # headline unchanged
+
+        # Test 0 pending — again two fetchone()s (metrics row, then waterfall row).
+        mock_cursor.fetchone.side_effect = [
+            [date(2026,6,8), date(2026,6,8), 10000, 0, 5, 5000, 1000, date(2026,6,8), 0, 500, date(2026,6,7), 500, 0, 0, 0],
+            wf_row,
+        ]
         res0 = dashboard_executive(month=None, branch="HQ", _admin={})
         bills_card_0 = next(c for c in res0["cards"] if c["key"] == "bills_pending_review")
         assert bills_card_0["value"] == 0

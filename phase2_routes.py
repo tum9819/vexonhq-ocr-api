@@ -613,6 +613,47 @@ SELECT
 """
 
 
+# Sales waterfall (Executive display-only): FoodStory gross POS net_total for the
+# month, plus delivery gross/net so the owner page can show the gross->net story:
+#   ยอดขายรวม FoodStory  −  ค่าคอม Grab/Lineman  (+ ปรับปรุง)  =  เงินรับสุทธิจริง
+# Month+branch filter MIRRORS _summarize_month (same period, same branch).
+# DISPLAY ONLY — the commission is NOT a P&L expense: v_daybook's pos_sale already
+# = net_total − rider_gross, so the commission is ALREADY netted out of sales. It must
+# NEVER be added to expense_total / gross_profit (that double-counts). The profit/cost
+# cards are untouched; only the sales card gains a `waterfall` breakdown.
+_SALES_WATERFALL_SQL = """
+SELECT
+    (SELECT COALESCE(SUM(net_total), 0)::numeric FROM public.pos_sales_daily
+        WHERE branch_code = %s AND sales_date >= %s AND sales_date < %s)        AS foodstory_gross,
+    (SELECT COALESCE(SUM(gross_sales), 0)::numeric FROM public.rider_deliveries
+        WHERE branch_code = %s AND delivery_date >= %s AND delivery_date < %s)   AS delivery_gross,
+    (SELECT COALESCE(SUM(net_payout), 0)::numeric FROM public.rider_deliveries
+        WHERE branch_code = %s AND delivery_date >= %s AND delivery_date < %s)   AS delivery_net
+"""
+
+
+def _sales_waterfall(foodstory_gross: float, delivery_gross: float,
+                     delivery_net: float, net_received: float) -> dict:
+    """Pure: assemble the Executive sales waterfall (DISPLAY ONLY, gross -> net).
+
+    gross FoodStory − delivery commission (+ balancing adjustment) = net_received.
+    `other_adjustment` absorbs any month where net_received != gross − commission —
+    e.g. pos_cashflow / manual / AR income that isn't in FoodStory net_total, or a
+    GREATEST(0) floor day in v_daybook's pos_sale — so the bottom line ALWAYS equals
+    net_received (== /dashboard headline sales_net), keeping the two pages identical.
+    Rounded to 2dp; the frontend hides the adjustment row when |value| < 0.005."""
+    gross = round(float(foodstory_gross), 2)
+    commission = round(float(delivery_gross) - float(delivery_net), 2)
+    net = round(float(net_received), 2)
+    other_adjustment = round(net - (gross - commission), 2)
+    return {
+        "foodstory_gross": gross,
+        "delivery_commission": commission,
+        "other_adjustment": other_adjustment,
+        "net_received": net,
+    }
+
+
 def _card_freshness(as_of: Optional[date], today: date, max_age_days: int) -> bool:
     """Pure: True when as_of is within max_age_days of today (inclusive).
     None (no data) -> False (never claim fresh). DB-free for unit tests."""
@@ -675,10 +716,13 @@ def _stock_status(neg: int):
     return "critical", "negative_stock"
 
 
-def _build_executive_cards(summ: dict, m: dict, today: date) -> list[dict]:
+def _build_executive_cards(summ: dict, m: dict, today: date,
+                           waterfall: Optional[dict] = None) -> list[dict]:
     """Pure card assembly (no DB) so freshness + reconciliation are unit-testable.
     `summ` = _summarize_month output (sales/cost reconcile with /dashboard/overview);
-    `m` = the _EXEC_METRICS_SQL row as a dict."""
+    `m` = the _EXEC_METRICS_SQL row as a dict;
+    `waterfall` = optional _sales_waterfall() output, attached to the sales card as a
+    DISPLAY-ONLY gross->net breakdown (does not change any KPI value)."""
     sales_as_of = m["sales_as_of"]
     daybook_as_of = m["daybook_as_of"]
     profit_as_of = _min_date(sales_as_of, daybook_as_of)
@@ -723,6 +767,11 @@ def _build_executive_cards(summ: dict, m: dict, today: date) -> list[dict]:
             "negative_stock_count": int(m.get("negative_stock_count") or 0),
         },
     ]
+    # Sales waterfall (display-only gross->net) — additive on sales_mtd. cards[0]["value"]
+    # stays = summ["sales_net"] (unchanged), so every consumer (AI insight, etc.) is safe.
+    if waterfall is not None:
+        cards[0]["waterfall"] = waterfall
+
     # P2: latest-day vs prior-day sales (honest under POS lag). Additive on sales_mtd.
     if sales_as_of is not None:
         daily = {
@@ -756,6 +805,7 @@ def dashboard_executive(
     """Executive (owner) glance — ADMIN-ONLY. Six cards, each with as_of + fresh.
     Sales/cost reuse _summarize_month (reconcile with /dashboard/overview)."""
     month_start = _month_start(month)
+    pe = _next_month(month_start)
     today = datetime.now(_BKK).date()
 
     conn = get_db_conn()
@@ -764,8 +814,18 @@ def dashboard_executive(
             summ = _summarize_month(cur, month_start, branch)
             cur.execute(_EXEC_METRICS_SQL, (branch,) * 8)
             row = cur.fetchone()
+            # Sales waterfall (display-only): month+branch matches _summarize_month above.
+            cur.execute(_SALES_WATERFALL_SQL, (branch, month_start, pe) * 3)
+            wf_row = cur.fetchone()
     finally:
         conn.close()
+
+    waterfall = _sales_waterfall(
+        foodstory_gross=float(wf_row[0] or 0),
+        delivery_gross=float(wf_row[1] or 0),
+        delivery_net=float(wf_row[2] or 0),
+        net_received=summ["sales_net"],
+    )
 
     m = {
         "sales_as_of": row[0],
@@ -789,7 +849,7 @@ def dashboard_executive(
         "currency": "THB",
         "month": month_start.strftime("%Y-%m"),
         "branch": branch,
-        "cards": _build_executive_cards(summ, m, today),
+        "cards": _build_executive_cards(summ, m, today, waterfall),
     }
 
 

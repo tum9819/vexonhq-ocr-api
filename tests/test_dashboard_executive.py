@@ -6,7 +6,7 @@ card assembly + reconciliation. No DB / network / key needed.
 
 from datetime import date
 
-from phase2_routes import _card_freshness, _build_executive_cards, _min_date
+from phase2_routes import _card_freshness, _build_executive_cards, _min_date, _sales_waterfall
 
 TODAY = date(2026, 6, 9)
 
@@ -201,3 +201,65 @@ def test_bills_and_stock_status():
     assert sw["status"] == "warning" and sw["status_reason"] == "negative_stock"
     assert sw["negative_stock_count"] == 5
     assert _cards_by_key(_build_executive_cards(SUMM, _ms(negative_stock_count=6), TODAY))["stock"]["status"] == "critical"
+
+
+# ── Sales waterfall (Executive display-only, gross -> net) ──────────────
+def test_waterfall_june_reconciles_no_adjustment():
+    # Real June 2026 figures: gross 186,788.03 − commission 16,765.65 = net 170,022.38.
+    wf = _sales_waterfall(foodstory_gross=186788.03, delivery_gross=46376.03,
+                          delivery_net=29610.38, net_received=170022.38)
+    assert wf["foodstory_gross"] == 186788.03
+    assert wf["delivery_commission"] == 16765.65   # 46,376.03 − 29,610.38
+    assert wf["net_received"] == 170022.38
+    assert wf["other_adjustment"] == 0.0           # clean month -> row hidden by frontend
+    # waterfall identity always holds
+    assert round(wf["foodstory_gross"] - wf["delivery_commission"] + wf["other_adjustment"], 2) == wf["net_received"]
+
+
+def test_waterfall_may_adjustment_other_income():
+    # Real May 2026: pos_cashflow income (165) not in FoodStory net_total makes
+    # net_received 165 higher than gross − commission. Adjustment row carries it so
+    # the bottom line still equals sales_net (the /dashboard headline). 0 floor days.
+    wf = _sales_waterfall(foodstory_gross=348430.79, delivery_gross=67087.59,
+                          delivery_net=44187.31, net_received=325695.51)
+    assert wf["delivery_commission"] == 22900.28   # gross − commission = 325,530.51
+    assert wf["other_adjustment"] == 165.0
+    assert round(wf["foodstory_gross"] - wf["delivery_commission"] + wf["other_adjustment"], 2) == wf["net_received"]
+
+
+def test_waterfall_april_floor_day_positive_adjustment():
+    # Real April 2026: 1 GREATEST(0) floor day (rider_gross > net_total that day)
+    # RAISES pos_sale, so net_received is HIGHER than gross − commission ->
+    # positive adjustment (+1,610.00). Still reconciles to net_received.
+    wf = _sales_waterfall(foodstory_gross=279862.07, delivery_gross=46419.57,
+                          delivery_net=30488.02, net_received=265540.52)
+    assert wf["delivery_commission"] == 15931.55   # gross − commission = 263,930.52
+    assert wf["other_adjustment"] == 1610.0
+    assert round(wf["foodstory_gross"] - wf["delivery_commission"] + wf["other_adjustment"], 2) == wf["net_received"]
+
+
+def test_waterfall_handles_negative_adjustment():
+    # Defensive: the formula must reconcile even if an adjustment is ever negative
+    # (e.g. a negative manual income row). Pure-math guard, not tied to a real month.
+    wf = _sales_waterfall(foodstory_gross=150000.0, delivery_gross=40000.0,
+                          delivery_net=25000.0, net_received=134800.0)
+    assert wf["delivery_commission"] == 15000.0    # gross − commission = 135,000
+    assert wf["other_adjustment"] == -200.0
+    assert round(wf["foodstory_gross"] - wf["delivery_commission"] + wf["other_adjustment"], 2) == wf["net_received"]
+
+
+def test_waterfall_attached_to_sales_card_only():
+    wf = _sales_waterfall(186788.03, 46376.03, 29610.38, 170022.38)
+    cards = _cards_by_key(_build_executive_cards(SUMM, METRICS, TODAY, wf))
+    assert cards["sales_mtd"]["waterfall"]["net_received"] == 170022.38
+    # sales headline value is UNCHANGED (== sales_net) -> no consumer breaks
+    assert cards["sales_mtd"]["value"] == SUMM["sales_net"]
+    # NO double-count: profit/cost cards keep the exact cash-basis numbers
+    assert cards["profit_est"]["value"] == SUMM["gross_profit"]
+    assert cards["cost_mtd"]["value"] == SUMM["expense_total"]
+
+
+def test_waterfall_absent_when_not_passed():
+    # Backward-compatible: omitting the waterfall leaves the card exactly as before.
+    cards = _cards_by_key(_build_executive_cards(SUMM, METRICS, TODAY))
+    assert "waterfall" not in cards["sales_mtd"]
