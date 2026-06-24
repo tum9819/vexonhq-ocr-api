@@ -1262,6 +1262,7 @@ def _process_import_background(
                     conn.rollback()
             except Exception:
                 pass
+            conn2 = None
             try:
                 conn2 = get_db_conn()
                 file_hash2 = hashlib.sha256(content).hexdigest()
@@ -1272,9 +1273,36 @@ def _process_import_background(
                         "ORDER BY uploaded_at DESC LIMIT 1",
                         (file_hash2,))
                     orig = cur2.fetchone()
-                conn2.close()
             except Exception:
                 orig = None
+            finally:
+                if conn2:
+                    try:
+                        conn2.close()
+                    except Exception:
+                        pass
+
+            # Mark the duplicate attempt as failed to avoid leaving orphan 'parsing' rows
+            if import_id:
+                conn3 = None
+                try:
+                    conn3 = get_db_conn()
+                    with conn3.cursor() as cur3:
+                        orig_import_id = orig[0] if orig else None
+                        cur3.execute(
+                            "UPDATE public.pos_imports SET status=%s, error_message=%s, finished_at=now() WHERE id=%s",
+                            ("failed", f"Duplicate file — same content already imported (import_id={orig_import_id})", import_id)
+                        )
+                        conn3.commit()
+                except Exception as e:
+                    logger.warning("Failed to mark duplicate import id=%s as failed: %s", import_id, e)
+                finally:
+                    if conn3:
+                        try:
+                            conn3.close()
+                        except Exception:
+                            pass
+
             _set({
                 "status": "already_imported",
                 "result": {
@@ -1292,6 +1320,7 @@ def _process_import_background(
         logger.exception("POS import background task failed")
         # Try to mark DB record as error
         if import_id:
+            conn2 = None
             try:
                 conn2 = get_db_conn()
                 with conn2.cursor() as cur2:
@@ -1300,9 +1329,14 @@ def _process_import_background(
                         "error_message=%s WHERE id=%s",
                         (err_str[:2000], import_id))
                     conn2.commit()
-                conn2.close()
             except Exception:
                 pass
+            finally:
+                if conn2:
+                    try:
+                        conn2.close()
+                    except Exception:
+                        pass
         _set({"status": "error", "error": err_str})
 
     finally:
