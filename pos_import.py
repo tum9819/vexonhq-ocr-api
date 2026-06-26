@@ -30,8 +30,11 @@ from typing import Any, Optional
 
 import asyncio
 import threading
+import time
+import zlib
 
 import pandas as pd
+from psycopg2.extras import execute_values
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -1054,6 +1057,191 @@ WRITER_CONFIG = {
 
 
 # ============================================================
+# 4b. Concurrency guard + duplicate short-circuit + bulk writers
+# ============================================================
+# The 2026-06-26 bill_detail incident had TWO coupled causes (confirmed from
+# pos_imports timing data), not one:
+#   1. DOMINANT — slow re-imports (durations up to ~10 min): every re-upload of
+#      the same file re-ran the ENTIRE heavy write and only discovered it was a
+#      duplicate at the final `UPDATE status='success'` (uq_pos_imports_hash is a
+#      PARTIAL unique index WHERE status='success', so the 'parsing' INSERT never
+#      conflicts early). That heavy write contained an O(N) per-line-item
+#      `SELECT id FROM pos_bills` loop (~4178 sequential round-trips for one
+#      month). A lone re-import (5ab280fe) took 626 s with NO concurrent
+#      bill_detail import — i.e. ~150 ms/round-trip under pooler/VPS latency
+#      pressure, not lock contention. A warm single import does the same work in
+#      ~1.2 s. The per-item loop makes duration scale with N × round-trip
+#      latency, so any latency spike explodes it.
+#   2. SECONDARY — the "canceling statement due to statement timeout / while
+#      inserting index tuple in pos_bills" error: genuine lock contention on the
+#      uq_pos_bills unique index, but only on the last attempts that overlapped a
+#      still-running slow re-import (912eebff/87b01be1 started while baac724e was
+#      still going), tripping the 2-min statement_timeout.
+# Fixes (each targets a real driver):
+#   (A) short-circuit a re-upload whose content already imported successfully
+#       (the common case) BEFORE any work — kills the wasted 10-min re-runs and
+#       the failed-row noise in the upload history.
+#   (C) write bills + items in a few bulk statements; RETURNING resolves bill_id
+#       in-memory instead of one SELECT per line item — removes the O(N)
+#       round-trip loop so import time no longer scales with pooler latency, and
+#       scales to large files.
+#   (B) serialise same-scope imports with a SESSION advisory lock so two imports
+#       never block each other on uq_pos_bills — defense-in-depth that removes
+#       the residual concurrency which trips the timeout.
+
+_ADVISORY_NS = 0x504F53  # "POS" — arbitrary namespace for pg_advisory locks
+
+
+def _scope_lock_key(branch_code: str, rtype: str) -> int:
+    """Stable positive int4 advisory-lock key for (branch, report_type)."""
+    return zlib.crc32(f"{branch_code}:{rtype}".encode("utf-8")) & 0x7FFFFFFF
+
+
+def _try_acquire_import_lock(conn, branch_code: str, rtype: str,
+                             *, attempts: int = 10, delay: float = 0.5) -> bool:
+    """Acquire a session advisory lock serialising same-scope imports.
+
+    Non-blocking pg_try_advisory_lock in a short retry loop (~5 s total). A normal
+    import finishes in ~1 s, so a competing import frees the lock quickly; and
+    same-file re-uploads never reach here (the duplicate short-circuit catches
+    them first), so genuine contention is rare. The window is deliberately short
+    so a loser never ties up a Starlette threadpool worker for long. Returns
+    False only if the scope stays busy for the whole window (a stuck import) —
+    the caller then skips gracefully instead of piling on more lock contention.
+    Session locks auto-release if the connection drops, so a crashed task can
+    never wedge the scope permanently.
+    """
+    key = _scope_lock_key(branch_code, rtype)
+    for _ in range(attempts):
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s, %s)", (_ADVISORY_NS, key))
+            if cur.fetchone()[0]:
+                return True
+        # Failed attempt opened a transaction; roll it back so we don't sit
+        # idle-in-transaction (holding a snapshot / vacuum horizon) while sleeping.
+        conn.rollback()
+        time.sleep(delay)
+    return False
+
+
+def _release_import_lock(conn, branch_code: str, rtype: str) -> None:
+    key = _scope_lock_key(branch_code, rtype)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_unlock(%s, %s)", (_ADVISORY_NS, key))
+    except Exception:
+        pass  # closing the connection releases it anyway
+
+
+def _find_successful_import(cur, file_hash: str):
+    """Most recent successful import row for this file hash, or None."""
+    cur.execute(
+        "SELECT id, report_type, row_count, period_start, period_end "
+        "FROM public.pos_imports WHERE file_hash=%s AND status='success' "
+        "ORDER BY uploaded_at DESC LIMIT 1",
+        (file_hash,))
+    return cur.fetchone()
+
+
+def _already_imported_result(orig) -> dict:
+    """Standard already_imported result payload from a pos_imports row tuple."""
+    return {
+        "import_id":     orig[0] if orig else "duplicate",
+        "report_type":   orig[1] if orig else "unknown",
+        "status":        "already_imported",
+        "rows_imported": orig[2] if orig else 0,
+        "period_start":  str(orig[3]) if orig and orig[3] else None,
+        "period_end":    str(orig[4]) if orig and orig[4] else None,
+        "detail":        {"message": "ไฟล์นี้นำเข้าไปแล้ว ข้ามซ้ำโดยอัตโนมัติ"},
+    }
+
+
+def _bulk_upsert_pos_bills(cur, rows: list[dict]) -> dict:
+    """Upsert pos_bills in one bulk statement; return {(branch,receipt,date): id}.
+
+    Replaces the per-row executemany upsert AND the per-line-item
+    `SELECT id FROM pos_bills ...` loop: RETURNING hands back the id for every
+    inserted or updated bill so line items resolve their bill_id from memory.
+    parse_bill_detail dedups bills by (branch, receipt, date), so no key appears
+    twice in one batch (ON CONFLICT cannot touch the same row twice).
+
+    INVARIANT: the RETURNING columns (branch_code, receipt_code, sales_date) are
+    the ON CONFLICT key and are NOT in update_cols, so RETURNING echoes the
+    INCOMING values for both inserted and updated rows — that is exactly what
+    makes the returned map key equal the parser's _bill_key on a re-import. Do
+    not add any of those three to update_cols or change the RETURNING list
+    without revisiting the line-item linkage below.
+    """
+    if not rows:
+        return {}
+    cfg = WRITER_CONFIG["pos_bills"]
+    cols = list(rows[0].keys())
+    template = "(" + ", ".join(f"%({c})s" for c in cols) + ")"
+    sql = (
+        f"INSERT INTO public.pos_bills ({', '.join(cols)}) VALUES %s "
+        f"ON CONFLICT ({', '.join(cfg['conflict_cols'])}) DO UPDATE SET "
+        + ", ".join(f"{c} = EXCLUDED.{c}" for c in cfg["update_cols"])
+        + " RETURNING id, branch_code, receipt_code, sales_date"
+    )
+    returned = execute_values(cur, sql, rows, template=template,
+                              page_size=1000, fetch=True)
+    return {(r[1], r[2], r[3]): r[0] for r in returned}
+
+
+def _bulk_insert_sales_items(cur, items: list[dict], bill_id_map: dict) -> int:
+    """Resolve bill_id and bulk-insert line items (order-independent).
+
+    bill_id comes from the in-memory map returned by _bulk_upsert_pos_bills; for
+    any bill_key NOT in that map we fall back to ONE batch SELECT against
+    pos_bills. This keeps the writer bulk (never a per-item round-trip) while
+    removing any hard dependency on table-processing order: pos_bills must be
+    written before items for the FK regardless, but this function self-heals if
+    the in-memory map is incomplete rather than silently importing zero items or
+    raising. Idempotent re-import: clears prior line items for the affected bills
+    first (no UNIQUE(bill_id,line_no)); delete+insert share the caller's
+    transaction so a mid-failure rolls both back — a bill never ends up with
+    zero items.
+    """
+    if not items:
+        return 0
+    # Fall back to a single batch lookup for any bill not already in the map.
+    missing = {it.get("_bill_key") for it in items} - set(bill_id_map)
+    missing.discard(None)
+    if missing:
+        keys = list(missing)
+        cur.execute(
+            "SELECT branch_code, receipt_code, sales_date, id FROM public.pos_bills "
+            "WHERE (branch_code, receipt_code, sales_date) IN %s",
+            (tuple(keys),))
+        bill_id_map = {**bill_id_map,
+                       **{(r[0], r[1], r[2]): r[3] for r in cur.fetchall()}}
+    resolved = []
+    for it in items:
+        bid = bill_id_map.get(it.get("_bill_key"))
+        if bid is None:
+            continue
+        row = {k: v for k, v in it.items() if k != "_bill_key"}
+        row["bill_id"] = bid
+        resolved.append(row)
+    if not resolved:
+        logger.warning("pos import: %d line items but none matched a bill in "
+                       "pos_bills — inserted 0 items", len(items))
+        return 0
+    if len(resolved) < len(items):
+        logger.warning("pos import: %d/%d line items had no matching bill — skipped",
+                       len(items) - len(resolved), len(items))
+    bill_ids = list({r["bill_id"] for r in resolved})
+    delete_pos_sales_items_by_bill_ids(cur, bill_ids)
+    cols = list(resolved[0].keys())
+    template = "(" + ", ".join(f"%({c})s" for c in cols) + ")"
+    execute_values(
+        cur,
+        f"INSERT INTO public.pos_sales_items ({', '.join(cols)}) VALUES %s",
+        resolved, template=template, page_size=1000)
+    return len(resolved)
+
+
+# ============================================================
 # 5. Endpoint: POST /pos/import
 # ============================================================
 
@@ -1103,6 +1291,8 @@ def _process_import_background(
     """Heavy lifting: parse → DB write.  Called by BackgroundTasks."""
     import_id: str = ""
     conn = None
+    got_lock = False
+    rtype = ""
 
     def _set(update: dict) -> None:
         with _job_lock:
@@ -1117,7 +1307,41 @@ def _process_import_background(
         df, rtype = read_and_detect(content, filename)
 
         conn = get_db_conn()
+
+        # (A) Fast duplicate short-circuit — if this exact file already imported
+        # successfully, skip before inserting a row or racing on the unique
+        # index. This is the common re-upload case and the source of both the
+        # failed-row noise in the upload history and the lock-contention storms.
         with conn.cursor() as cur:
+            dup = _find_successful_import(cur, file_hash)
+        if dup:
+            logger.info("pos import: already imported, skipped — file=%s rtype=%s orig_id=%s",
+                        filename, rtype, dup[0])
+            _set({"status": "already_imported", "result": _already_imported_result(dup)})
+            return
+
+        # (B) Serialise same-scope imports so two uploads never block each other
+        # on the uq_pos_bills unique index (the statement-timeout trigger).
+        got_lock = _try_acquire_import_lock(conn, branch_code, rtype)
+        if not got_lock:
+            logger.warning("pos import: scope busy (another import running), skipped — "
+                           "branch=%s rtype=%s file=%s", branch_code, rtype, filename)
+            _set({"status": "error",
+                  "error": "การนำเข้าก่อนหน้าของรายงานนี้ยังทำงานอยู่ — ข้ามรอบนี้ กรุณาลองใหม่ภายหลัง"})
+            return
+
+        # Re-check under the lock: a concurrent import of the same file may have
+        # finished successfully while we were waiting to acquire the lock.
+        with conn.cursor() as cur:
+            dup = _find_successful_import(cur, file_hash)
+        if dup:
+            logger.info("pos import: already imported (under lock), skipped — file=%s rtype=%s orig_id=%s",
+                        filename, rtype, dup[0])
+            _set({"status": "already_imported", "result": _already_imported_result(dup)})
+            return
+
+        with conn.cursor() as cur:
+            cur.execute("SET lock_timeout = '10s'")  # backstop; serialisation already avoids waits
             import_id = str(uuid.uuid4())
 
             # stock_in_refill uses a staged import flow (not the write-through parser path)
@@ -1160,10 +1384,19 @@ def _process_import_background(
 
             ps, pe = result["period_start"], result["period_end"]
             total_rows = 0
+            bill_id_map: dict = {}
 
             # Write each table (same logic as original sync endpoint)
             for table, rows in result["tables"].items():
                 if not rows:
+                    continue
+                if table == "pos_bills":
+                    # (C) Bulk upsert in one statement; RETURNING gives every
+                    # bill's id so line items resolve bill_id from memory below.
+                    for r in rows:
+                        r["source_import_id"] = import_id
+                    bill_id_map = _bulk_upsert_pos_bills(cur, rows)
+                    total_rows += len(rows)
                     continue
                 if table == "pos_inventory_snapshots":
                     snap = rows[0]
@@ -1196,30 +1429,9 @@ def _process_import_background(
                     continue
 
                 if table == "_sales_items":
-                    for it in rows:
-                        bk = it.pop("_bill_key")
-                        cur.execute("""SELECT id FROM pos_bills
-                                       WHERE branch_code=%s AND receipt_code=%s
-                                         AND sales_date=%s""", bk)
-                        bid = cur.fetchone()
-                        if bid:
-                            it["bill_id"] = bid[0]
-                    rows = [r for r in rows if "bill_id" in r]
-                    if rows:
-                        # Idempotent re-import: clear prior line items for these bills
-                        # before inserting. There is NO UNIQUE(bill_id,line_no), so a
-                        # re-exported file (new hash, same bills) would otherwise insert a
-                        # 2nd copy of every line and inflate menu analytics. Delete+insert
-                        # share this transaction (commit below) so a mid-failure rolls both
-                        # back — the bill never ends up with zero items.
-                        bill_ids = list({r["bill_id"] for r in rows})
-                        delete_pos_sales_items_by_bill_ids(cur, bill_ids)
-                        cols = list(rows[0].keys())
-                        cur.executemany(
-                            "INSERT INTO public.pos_sales_items ({}) VALUES ({})".format(
-                                ",".join(cols), _values_clause(rows, cols)),
-                            rows)
-                        total_rows += len(rows)
+                    # bill_id resolved from the RETURNING map of the pos_bills
+                    # bulk upsert above — no per-line-item SELECT round-trips.
+                    total_rows += _bulk_insert_sales_items(cur, rows, bill_id_map)
                     continue
 
                 cfg = WRITER_CONFIG.get(table)
@@ -1239,6 +1451,8 @@ def _process_import_background(
                 (ps, pe, total_rows, import_id))
             conn.commit()
 
+        logger.info("pos import: success — id=%s rtype=%s rows=%s file=%s",
+                    import_id, rtype, total_rows, filename)
         _set({
             "status": "success",
             "result": {
@@ -1318,6 +1532,14 @@ def _process_import_background(
             return
 
         logger.exception("POS import background task failed")
+        # Clear the aborted transaction on the main conn so the finally block's
+        # explicit pg_advisory_unlock actually runs (an aborted txn would make it
+        # raise + no-op, leaving lock release to rely solely on conn.close()).
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
         # Try to mark DB record as error
         if import_id:
             conn2 = None
@@ -1341,6 +1563,8 @@ def _process_import_background(
 
     finally:
         if conn:
+            if got_lock:
+                _release_import_lock(conn, branch_code, rtype)
             try:
                 conn.close()
             except Exception:
@@ -1460,8 +1684,45 @@ def import_pos_excel_sync(
     df, rtype = read_and_detect(content, file.filename or "")
 
     conn = get_db_conn()
+    got_lock = False
+    import_id = ""
     try:
+        # Fast duplicate short-circuit (mirrors the background path) — avoid
+        # re-running a full import for a file whose content already imported.
         with conn.cursor() as cur:
+            dup = _find_successful_import(cur, file_hash)
+        if dup:
+            return ImportResponse(
+                import_id=dup[0],
+                report_type=dup[1] or rtype,
+                status="already_imported",
+                rows_imported=dup[2] or 0,
+                period_start=dup[3],
+                period_end=dup[4],
+                detail={"message": "ไฟล์นี้นำเข้าไปแล้ว ข้ามซ้ำโดยอัตโนมัติ"},
+            )
+
+        # Serialise same-scope imports (parity with the background path) so two
+        # concurrent uploads never block each other on uq_pos_bills.
+        got_lock = _try_acquire_import_lock(conn, branch_code, rtype)
+        if not got_lock:
+            raise HTTPException(
+                409, "การนำเข้าก่อนหน้าของรายงานนี้ยังทำงานอยู่ — กรุณาลองใหม่ภายหลัง")
+        with conn.cursor() as cur:
+            dup = _find_successful_import(cur, file_hash)
+        if dup:
+            return ImportResponse(
+                import_id=dup[0],
+                report_type=dup[1] or rtype,
+                status="already_imported",
+                rows_imported=dup[2] or 0,
+                period_start=dup[3],
+                period_end=dup[4],
+                detail={"message": "ไฟล์นี้นำเข้าไปแล้ว ข้ามซ้ำโดยอัตโนมัติ"},
+            )
+
+        with conn.cursor() as cur:
+            cur.execute("SET lock_timeout = '10s'")
             import_id = str(uuid.uuid4())
             cur.execute("""
                 INSERT INTO public.pos_imports
@@ -1481,9 +1742,16 @@ def import_pos_excel_sync(
 
             ps, pe = result["period_start"], result["period_end"]
             total_rows = 0
+            bill_id_map: dict = {}
 
             for table, rows in result["tables"].items():
                 if not rows:
+                    continue
+                if table == "pos_bills":
+                    for r in rows:
+                        r["source_import_id"] = import_id
+                    bill_id_map = _bulk_upsert_pos_bills(cur, rows)
+                    total_rows += len(rows)
                     continue
                 if table == "pos_inventory_snapshots":
                     snap = rows[0]
@@ -1516,30 +1784,9 @@ def import_pos_excel_sync(
                     continue
 
                 if table == "_sales_items":
-                    for it in rows:
-                        bk = it.pop("_bill_key")
-                        cur.execute("""SELECT id FROM pos_bills
-                                       WHERE branch_code=%s AND receipt_code=%s
-                                         AND sales_date=%s""", bk)
-                        bid = cur.fetchone()
-                        if bid:
-                            it["bill_id"] = bid[0]
-                    rows = [r for r in rows if "bill_id" in r]
-                    if rows:
-                        # Idempotent re-import: clear prior line items for these bills
-                        # before inserting. There is NO UNIQUE(bill_id,line_no), so a
-                        # re-exported file (new hash, same bills) would otherwise insert a
-                        # 2nd copy of every line and inflate menu analytics. Delete+insert
-                        # share this transaction (commit below) so a mid-failure rolls both
-                        # back — the bill never ends up with zero items.
-                        bill_ids = list({r["bill_id"] for r in rows})
-                        delete_pos_sales_items_by_bill_ids(cur, bill_ids)
-                        cols = list(rows[0].keys())
-                        cur.executemany(
-                            "INSERT INTO public.pos_sales_items ({}) VALUES ({})".format(
-                                ",".join(cols), _values_clause(rows, cols)),
-                            rows)
-                        total_rows += len(rows)
+                    # bill_id resolved from the RETURNING map of the pos_bills
+                    # bulk upsert above — no per-line-item SELECT round-trips.
+                    total_rows += _bulk_insert_sales_items(cur, rows, bill_id_map)
                     continue
 
                 cfg = WRITER_CONFIG.get(table)
@@ -1618,6 +1865,8 @@ def import_pos_excel_sync(
             pass
         raise HTTPException(500, f"Import failed: {e}")
     finally:
+        if got_lock:
+            _release_import_lock(conn, branch_code, rtype)
         conn.close()
 
 
