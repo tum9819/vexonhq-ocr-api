@@ -20,10 +20,12 @@ os.environ.setdefault("JWT_SECRET", "testsecret")
 os.environ.setdefault("OPENAI_API_KEY", "x")
 
 import pytest
+from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 
 import main
 import auth_routes
+import stock_in_routes
 
 # Endpoint function names that MUST be admin-gated (one per money-mutation route).
 # `slip_match` intentionally appears in two modules (slip_routes + bill_payment_routes) —
@@ -37,7 +39,7 @@ GATED_NAMES = {
     "slip_match", "slip_manual_match", "slip_reject", "slip_override_category",
     "update_bill_payment",
     # OCR invoice review mutations must also be admin-only.
-    "invoice_confirm", "invoice_reject",
+    "invoice_confirm", "invoice_reject", "invoice_reconciliation_edit",
     # AR/AP financial-record mutations (phase3_arap_routes)
     "create_counterparty", "patch_counterparty", "soft_delete_counterparty",
     "patch_entry", "cancel_entry", "create_payment", "delete_payment",
@@ -50,8 +52,8 @@ GATED_NAMES = {
     "get_stock_in_verification",
 }
 # create_entry and slip_match each map to TWO gated routes, so 27 names -> 29 routes.
-# M1 adds 5 stock-in routes: diff, approve, cancel, recover, verification → 29 + 5 = 34.
-EXPECTED_ROUTE_COUNT = 34
+# M1 adds 5 stock-in routes; OCR verification adds reconciliation edit.
+EXPECTED_ROUTE_COUNT = 35
 
 
 def _fake_verify(token):
@@ -111,7 +113,23 @@ def client(monkeypatch):
     monkeypatch.setattr(main, "_revalidate_bill", lambda *args, **kwargs: [])
     monkeypatch.setattr(main, "_match_invoice_against_statement", lambda *args, **kwargs: {"status": "matched"})
     monkeypatch.setattr(main, "_auto_sync_ingredient_prices", lambda: {"status": "ok"})
-    return TestClient(main.app, raise_server_exceptions=False)
+
+    def _fake_admin_dependency(request: Request):
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            raise HTTPException(401, "Not authenticated")
+        payload = _fake_verify(auth_header[7:])
+        if not payload:
+            raise HTTPException(401, "Token expired or invalid")
+        if payload.get("_role") != "admin":
+            raise HTTPException(403, "Admin access required")
+        return payload
+
+    main.app.dependency_overrides[stock_in_routes._require_admin_role] = _fake_admin_dependency
+    try:
+        yield TestClient(main.app, raise_server_exceptions=False)
+    finally:
+        main.app.dependency_overrides.pop(stock_in_routes._require_admin_role, None)
 
 
 def test_all_eighteen_routes_present():

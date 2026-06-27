@@ -78,6 +78,15 @@ from store_context_routes import router as store_context_router
 from ai_monitor_routes import router as ai_monitor_router
 from auth_routes import router as auth_router, verify_token
 from alerts_webhook_routes import router as alerts_router
+from invoice_verification import (
+    MockInvoiceVerifier,
+    build_approval_blockers,
+    build_force_confirm_warning,
+    calculate_reconciliation,
+    decide_review_status,
+    normalize_ocr_extraction,
+    run_invoice_verification,
+)
 from discord_routes import router as discord_router
 from do_snapshot_routes import router as do_snapshot_router
 from auto_diagnose import try_diagnose
@@ -634,6 +643,12 @@ class InvoiceItemPayload(BaseModel):
     unit: Optional[str] = None
     unit_price: Optional[float] = None
     amount: Optional[float] = None
+    gross_amount: Optional[float] = None
+    line_discount_amount: Optional[float] = None
+    line_discount_rate: Optional[float] = None
+    net_amount: Optional[float] = None
+    field_confidence: Optional[dict[str, Any]] = None
+    verifier_flags: Optional[dict[str, Any]] = None
     # Canonical SKU + AI confidence (Session 25/26 hybrid classifier).
     # `canonical_sku` references public.products.sku; `canonical_confidence`
     # is the model's self-reported score in [0, 1]. Both optional so older
@@ -665,6 +680,26 @@ class ConfirmRequest(BaseModel):
     # OCR-1: when True, bypass the error-severity confirm gate (user chose to
     # confirm despite validation errors like a missing total).
     force: bool = False
+    force_reason: Optional[str] = None
+
+
+class InvoiceReconciliationItemEdit(BaseModel):
+    id: Optional[str] = None
+    line_no: Optional[int] = None
+    gross_amount: Optional[float] = None
+    line_discount_amount: Optional[float] = None
+    line_discount_rate: Optional[float] = None
+    net_amount: Optional[float] = None
+
+
+class InvoiceReconciliationEdit(BaseModel):
+    bill_discount_total: Optional[float] = None
+    voucher_discount_total: Optional[float] = None
+    promotion_discount_total: Optional[float] = None
+    service_charge: Optional[float] = None
+    rounding_adjustment: Optional[float] = None
+    tolerance: Optional[float] = None
+    items: Optional[list[InvoiceReconciliationItemEdit]] = None
 
 
 class RejectRequest(BaseModel):
@@ -967,6 +1002,27 @@ def _persist_invoice_page(
         final_warnings = warnings
         if warnings:
             _save_warnings(invoice_id, warnings)
+
+    # 7) Best-effort mock/testable verifier + discount reconciliation.
+    # This must never fail the upload and must never confirm a bill.
+    try:
+        review = _run_invoice_review_enrichment(
+            invoice_id,
+            raw_ocr_text=ocr_text,
+            structured_ocr=parsed,
+            pages=[{
+                "file_url": file_url,
+                "file_name": file_name,
+                "page_no": page_no,
+            }],
+        )
+        final_warnings = final_warnings + (
+            review.get("verification", {}).get("warnings") or []
+        ) + (
+            review.get("reconciliation", {}).get("warnings") or []
+        )
+    except Exception:
+        log.exception("invoice verification/reconciliation failed (non-fatal) for %s", invoice_id)
 
     return {
         "success": True,
@@ -1564,6 +1620,343 @@ def invoice_detail(invoice_id: str):
     }
 
 
+def _latest_invoice_aux_row(sb: Any, table_name: str, invoice_id: str) -> dict[str, Any]:
+    try:
+        res = (
+            sb.table(table_name)
+            .select("*")
+            .eq("vendor_bill_id", invoice_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        return (res.data or [{}])[0] if res.data else {}
+    except Exception:
+        log.warning("invoice aux lookup failed table=%s invoice_id=%s", table_name, invoice_id, exc_info=True)
+        return {}
+
+
+def _load_latest_invoice_review_state(invoice_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load latest verifier/reconciliation state; old invoices return empty state."""
+    sb = get_supabase()
+    verification = _latest_invoice_aux_row(sb, "invoice_ai_verifications", invoice_id)
+    reconciliation = _latest_invoice_aux_row(sb, "invoice_reconciliation_results", invoice_id)
+    if not verification or not reconciliation:
+        try:
+            bill = sb.table("vendor_bills").select("*").eq("id", invoice_id).limit(1).execute()
+            if bill.data:
+                row = bill.data[0]
+                if not verification and row.get("verification_status"):
+                    verification = {
+                        "status": row.get("verification_status"),
+                        "confidence": row.get("verification_confidence"),
+                    }
+                if not reconciliation and row.get("reconciliation_status"):
+                    reconciliation = {
+                        "status": row.get("reconciliation_status"),
+                        "difference": row.get("reconciliation_difference"),
+                        "tolerance": row.get("reconciliation_tolerance"),
+                    }
+        except Exception:
+            log.warning("vendor_bills verification fallback failed invoice_id=%s", invoice_id, exc_info=True)
+    return verification or {}, reconciliation or {}
+
+
+@app.get("/invoice/{invoice_id}/verification")
+def invoice_verification_detail(invoice_id: str):
+    """Read-only verification + reconciliation view for an invoice."""
+    _validate_uuid_param("invoice_id", invoice_id)
+    sb = get_supabase()
+    bill = sb.table("vendor_bills").select("id, verification_status, reconciliation_status").eq(
+        "id", invoice_id
+    ).limit(1).execute()
+    if not bill.data:
+        raise HTTPException(404, "invoice not found")
+    verification, reconciliation = _load_latest_invoice_review_state(invoice_id)
+    return {
+        "success": True,
+        "invoice_id": invoice_id,
+        "verification": verification,
+        "reconciliation": reconciliation,
+        "approval_blockers": build_approval_blockers(verification, reconciliation),
+    }
+
+
+def _invoice_verifier_from_env() -> MockInvoiceVerifier:
+    provider = (os.getenv("AI_VERIFIER_PROVIDER") or "mock").strip().lower()
+    mode = (os.getenv("AI_VERIFIER_MOCK_MODE") or "not_configured").strip().lower()
+    if provider not in ("", "mock", "not_configured"):
+        log.warning("AI_VERIFIER_PROVIDER=%s is not wired in this environment; using mock not_configured", provider)
+        mode = "not_configured"
+    return MockInvoiceVerifier(mode=mode)
+
+
+def _insert_ai_verification(invoice_id: str, verification: dict[str, Any]) -> Optional[str]:
+    sb = get_supabase()
+    row = {
+        "vendor_bill_id": invoice_id,
+        "provider": verification.get("provider") or "mock",
+        "model": verification.get("model"),
+        "status": verification.get("status") or "not_run",
+        "confidence": verification.get("confidence"),
+        "is_real_ai": bool(verification.get("is_real_ai")),
+        "result_json": {
+            "field_results": verification.get("field_results") or [],
+            "warnings": verification.get("warnings") or [],
+        },
+        "mismatches_json": verification.get("mismatches") or [],
+        "error_code": verification.get("error_code"),
+        "error_message": verification.get("error_message"),
+        "latency_ms": verification.get("latency_ms"),
+    }
+    res = sb.table("invoice_ai_verifications").insert(row).execute()
+    return (res.data or [{}])[0].get("id") if res.data else None
+
+
+def _reconciliation_insert_row(invoice_id: str, reconciliation: dict[str, Any]) -> dict[str, Any]:
+    c = reconciliation.get("components") or {}
+    return {
+        "vendor_bill_id": invoice_id,
+        "status": reconciliation.get("status") or "not_run",
+        "gross_item_total": c.get("gross_item_total"),
+        "line_discount_total": c.get("line_discount_total"),
+        "net_item_total": c.get("net_item_total"),
+        "bill_discount_total": c.get("bill_discount_total"),
+        "voucher_discount_total": c.get("voucher_discount_total"),
+        "promotion_discount_total": c.get("promotion_discount_total"),
+        "service_charge": c.get("service_charge"),
+        "vat": c.get("vat"),
+        "rounding_adjustment": c.get("rounding_adjustment"),
+        "calculated_total": reconciliation.get("calculated_total"),
+        "stated_total": reconciliation.get("stated_total"),
+        "difference": reconciliation.get("difference"),
+        "tolerance": reconciliation.get("tolerance"),
+        "breakdown_json": c,
+        "warnings_json": reconciliation.get("warnings") or [],
+        "blocking": bool(reconciliation.get("blocking")),
+    }
+
+
+def _insert_reconciliation_result(invoice_id: str, reconciliation: dict[str, Any]) -> Optional[str]:
+    sb = get_supabase()
+    res = sb.table("invoice_reconciliation_results").insert(
+        _reconciliation_insert_row(invoice_id, reconciliation)
+    ).execute()
+    return (res.data or [{}])[0].get("id") if res.data else None
+
+
+def _fetch_invoice_for_reconciliation(invoice_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    sb = get_supabase()
+    bill = sb.table("vendor_bills").select("*").eq("id", invoice_id).limit(1).execute()
+    if not bill.data:
+        raise HTTPException(404, "invoice not found")
+    items = (
+        sb.table("invoice_items")
+        .select("*")
+        .eq("vendor_bill_id", invoice_id)
+        .order("line_no")
+        .execute()
+    )
+    invoice = dict(bill.data[0])
+    breakdown = invoice.get("discount_breakdown_json")
+    if isinstance(breakdown, dict):
+        invoice.update({k: v for k, v in breakdown.items() if v is not None})
+    return invoice, items.data or []
+
+
+def _run_reconciliation_for_invoice(invoice_id: str, tolerance: Any = None) -> dict[str, Any]:
+    invoice, items = _fetch_invoice_for_reconciliation(invoice_id)
+    kwargs = {"tolerance": tolerance} if tolerance is not None else {}
+    return calculate_reconciliation(invoice, items, **kwargs)
+
+
+def _update_invoice_review_summary(
+    invoice_id: str,
+    verification: dict[str, Any],
+    reconciliation: dict[str, Any],
+    *,
+    raw_ocr_text: Optional[str] = None,
+    ai_verification_id: Optional[str] = None,
+    reconciliation_id: Optional[str] = None,
+) -> None:
+    sb = get_supabase()
+    bill_res = sb.table("vendor_bills").select("review_status").eq("id", invoice_id).limit(1).execute()
+    existing_review_status = (bill_res.data or [{}])[0].get("review_status") or "pending"
+    decision = decide_review_status(
+        verification,
+        reconciliation,
+        existing_review_status=existing_review_status,
+    )
+    update_payload = {
+        "verification_status": decision["verification_status"],
+        "verification_confidence": verification.get("confidence"),
+        "last_ai_verification_id": ai_verification_id,
+        "reconciliation_status": reconciliation.get("status"),
+        "reconciliation_difference": reconciliation.get("difference"),
+        "reconciliation_tolerance": reconciliation.get("tolerance"),
+        "last_reconciliation_id": reconciliation_id,
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    if raw_ocr_text is not None:
+        update_payload["ocr_raw_text"] = raw_ocr_text
+    if decision["review_status"] != existing_review_status:
+        update_payload["review_status"] = decision["review_status"]
+    sb.table("vendor_bills").update(update_payload).eq("id", invoice_id).execute()
+
+
+def _record_invoice_review_warnings(invoice_id: str, *groups: dict[str, Any]) -> None:
+    warnings: list[dict[str, str]] = []
+    for group in groups:
+        for warning in group.get("warnings") or []:
+            if isinstance(warning, dict):
+                warnings.append({
+                    "severity": str(warning.get("severity") or "warn"),
+                    "code": str(warning.get("code") or "UNKNOWN"),
+                    "message": str(warning.get("message") or ""),
+                    "field": warning.get("field"),
+                })
+    if warnings:
+        _save_warnings(invoice_id, warnings)
+
+
+def _run_invoice_review_enrichment(
+    invoice_id: str,
+    *,
+    raw_ocr_text: str,
+    structured_ocr: dict[str, Any],
+    pages: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Run mock/testable verification + reconciliation. Failures are caller-safe."""
+    normalized = normalize_ocr_extraction(structured_ocr or {})
+    verification = run_invoice_verification(
+        _invoice_verifier_from_env(),
+        pages=pages,
+        raw_ocr_text=raw_ocr_text or "",
+        structured_ocr=normalized,
+    )
+    reconciliation = _run_reconciliation_for_invoice(invoice_id)
+    ai_id = _insert_ai_verification(invoice_id, verification)
+    rec_id = _insert_reconciliation_result(invoice_id, reconciliation)
+    _update_invoice_review_summary(
+        invoice_id,
+        verification,
+        reconciliation,
+        raw_ocr_text=raw_ocr_text,
+        ai_verification_id=ai_id,
+        reconciliation_id=rec_id,
+    )
+    _record_invoice_review_warnings(invoice_id, verification, reconciliation)
+    return {"verification": verification, "reconciliation": reconciliation}
+
+
+@app.patch("/invoice/{invoice_id}/reconciliation")
+def invoice_reconciliation_edit(invoice_id: str, update: InvoiceReconciliationEdit, request: Request):
+    """Human-edit discount breakdown and re-run reconciliation."""
+    _validate_uuid_param("invoice_id", invoice_id)
+    _require_admin_request(request)
+    username = _current_username(request)
+    update_dict = update.dict()
+    items_payload = update_dict.pop("items", None)
+    tolerance = update_dict.pop("tolerance", None)
+    breakdown = {k: v for k, v in update_dict.items() if v is not None}
+    if not breakdown and items_payload is None and tolerance is None:
+        raise HTTPException(400, "no reconciliation fields to update")
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            if breakdown:
+                cur.execute(
+                    """
+                    UPDATE public.vendor_bills
+                    SET discount_breakdown_json = COALESCE(discount_breakdown_json, '{}'::jsonb) || %s::jsonb,
+                        updated_by = COALESCE(%s, updated_by),
+                        updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (json.dumps(breakdown), username, invoice_id),
+                )
+                if cur.rowcount == 0:
+                    raise HTTPException(404, "invoice not found")
+            if items_payload is not None:
+                for item in items_payload:
+                    row = item.dict()
+                    item_id = row.pop("id", None)
+                    line_no = row.pop("line_no", None)
+                    fields = {k: v for k, v in row.items() if v is not None}
+                    if not fields:
+                        continue
+                    if item_id:
+                        cur.execute(
+                            """
+                            UPDATE public.invoice_items
+                            SET gross_amount = COALESCE(%s, gross_amount),
+                                line_discount_amount = COALESCE(%s, line_discount_amount),
+                                line_discount_rate = COALESCE(%s, line_discount_rate),
+                                net_amount = COALESCE(%s, net_amount),
+                                updated_at = now(),
+                                updated_by = COALESCE(%s, updated_by)
+                            WHERE id = %s AND vendor_bill_id = %s
+                            """,
+                            (
+                                fields.get("gross_amount"),
+                                fields.get("line_discount_amount"),
+                                fields.get("line_discount_rate"),
+                                fields.get("net_amount"),
+                                username,
+                                item_id,
+                                invoice_id,
+                            ),
+                        )
+                    elif line_no is not None:
+                        cur.execute(
+                            """
+                            UPDATE public.invoice_items
+                            SET gross_amount = COALESCE(%s, gross_amount),
+                                line_discount_amount = COALESCE(%s, line_discount_amount),
+                                line_discount_rate = COALESCE(%s, line_discount_rate),
+                                net_amount = COALESCE(%s, net_amount),
+                                updated_at = now(),
+                                updated_by = COALESCE(%s, updated_by)
+                            WHERE vendor_bill_id = %s AND line_no = %s
+                            """,
+                            (
+                                fields.get("gross_amount"),
+                                fields.get("line_discount_amount"),
+                                fields.get("line_discount_rate"),
+                                fields.get("net_amount"),
+                                username,
+                                invoice_id,
+                                line_no,
+                            ),
+                        )
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    reconciliation = _run_reconciliation_for_invoice(invoice_id, tolerance=tolerance)
+    rec_id = _insert_reconciliation_result(invoice_id, reconciliation)
+    verification, _old_reconciliation = _load_latest_invoice_review_state(invoice_id)
+    _update_invoice_review_summary(
+        invoice_id,
+        verification,
+        reconciliation,
+        reconciliation_id=rec_id,
+    )
+    _record_invoice_review_warnings(invoice_id, reconciliation)
+    return {
+        "success": True,
+        "reconciliation": reconciliation,
+        "approval_blockers": build_approval_blockers(verification, reconciliation),
+    }
+
+
 def _current_username(request: Request) -> Optional[str]:
     """
     Pull the JWT-verified username off `request.state`.
@@ -1697,6 +2090,12 @@ def invoice_edit(invoice_id: str, update: InvoiceUpdate, request: Request):
                             it.get("unit"),
                             it.get("unit_price"),
                             it.get("amount"),
+                            it.get("gross_amount"),
+                            it.get("line_discount_amount"),
+                            it.get("line_discount_rate"),
+                            it.get("net_amount"),
+                            json.dumps(it.get("field_confidence")) if it.get("field_confidence") is not None else None,
+                            json.dumps(it.get("verifier_flags")) if it.get("verifier_flags") is not None else None,
                             it.get("canonical_sku"),
                             it.get("canonical_confidence"),
                         ))
@@ -1705,8 +2104,11 @@ def invoice_edit(invoice_id: str, update: InvoiceUpdate, request: Request):
                         INSERT INTO public.invoice_items
                             (vendor_bill_id, line_no, sku, product_name,
                              quantity, unit, unit_price, amount,
+                             gross_amount, line_discount_amount, line_discount_rate,
+                             net_amount, field_confidence, verifier_flags,
                              canonical_sku, canonical_confidence)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s)
                         """,
                         rows_to_insert,
                     )
@@ -1744,6 +2146,27 @@ def invoice_confirm(
     # (consistent with the upload path treating revalidate failure as non-fatal).
     # OCR-1: skip the gate (and its warnings re-write) entirely when forcing.
     _force_confirm = bool(body.force) if body else False
+    reviewer = _current_username(request) or (body.reviewed_by if body else None)
+    verification_state, reconciliation_state = _load_latest_invoice_review_state(invoice_id)
+    _verification_blockers = build_approval_blockers(verification_state, reconciliation_state)
+    if _verification_blockers and not _force_confirm:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "CONFIRM_BLOCKED",
+                "message": "บิลนี้มี mismatch หรือ confidence ต่ำ ต้องแก้ไขก่อนยืนยัน หรือใช้ force-confirm พร้อมเหตุผล",
+                "warnings": _verification_blockers,
+            },
+        )
+    if _force_confirm and not (body and (body.force_reason or "").strip()):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "FORCE_REASON_REQUIRED",
+                "message": "force-confirm ต้องระบุเหตุผลเพื่อ audit trail",
+            },
+        )
+
     if not _force_confirm:
         try:
             _fresh_warnings = _revalidate_bill(invoice_id)
@@ -1760,11 +2183,23 @@ def invoice_confirm(
                     "warnings": _blocking,
                 },
             )
+    else:
+        try:
+            audit_warning = build_force_confirm_warning(
+                actor=reviewer,
+                reason=(body.force_reason if body else "") or "",
+                blockers=_verification_blockers,
+            )
+            _save_warnings(invoice_id, [audit_warning])
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "FORCE_REASON_REQUIRED", "message": str(exc)},
+            )
 
     # `reviewed_by` (legacy + tamperable). Falls back to client value
     # only when middleware didn't populate state.username (shouldn't
     # happen for protected routes).
-    reviewer = _current_username(request) or (body.reviewed_by if body else None)
     sb = get_supabase()
     now_iso = datetime.utcnow().isoformat()
     resp = (
@@ -2936,6 +3371,12 @@ def _insert_items(invoice_id: str, items: list[dict[str, Any]], source_page: int
             "unit": it.get("unit"),
             "unit_price": it.get("unit_price"),
             "amount": it.get("amount"),
+            "gross_amount": it.get("gross_amount"),
+            "line_discount_amount": it.get("line_discount_amount"),
+            "line_discount_rate": it.get("line_discount_rate"),
+            "net_amount": it.get("net_amount"),
+            "field_confidence": it.get("field_confidence"),
+            "verifier_flags": it.get("verifier_flags"),
             "source_page": source_page,
         })
     if dropped:
