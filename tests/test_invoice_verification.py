@@ -192,6 +192,25 @@ def test_review_status_decision_never_auto_confirms_from_mock_verifier():
     assert decision["review_status"] != "confirmed"
 
 
+def test_not_configured_verifier_never_auto_approves_invoice():
+    clean_recon = calculate_reconciliation(
+        {"amount": "107.00", "vat": "7.00"},
+        [{"quantity": "1", "unit_price": "100.00", "amount": "100.00"}],
+    )
+    verifier = run_invoice_verification(
+        MockInvoiceVerifier(mode="not_configured"),
+        pages=[],
+        raw_ocr_text="",
+        structured_ocr={"amount": "107.00"},
+    )
+
+    decision = decide_review_status(verifier, clean_recon, existing_review_status="pending")
+
+    assert decision["verification_status"] == "not_configured"
+    assert decision["review_status"] == "needs_attention"
+    assert decision["review_status"] != "confirmed"
+
+
 def test_review_status_decision_sends_mismatch_to_needs_attention():
     mismatch = calculate_reconciliation(
         {"amount": "120.00", "vat": "7.00"},

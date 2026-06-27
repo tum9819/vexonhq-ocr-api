@@ -24,6 +24,8 @@ INVOICE_ID = "00000000-0000-0000-0000-000000000000"
 def _fake_verify(token):
     if token == "ADMIN":
         return {"sub": "admin@example.com", "_role": "admin"}
+    if token == "STAFF":
+        return {"sub": "staff@example.com", "_role": "staff"}
     return None
 
 
@@ -120,6 +122,49 @@ def test_get_invoice_verification_returns_latest_rows(monkeypatch):
     assert body["approval_blockers"][0]["code"] == "AI_VERIFIER_MISMATCH"
 
 
+def test_get_invoice_verification_without_new_rows_returns_frontend_safe_shape(monkeypatch):
+    fixture = {
+        "vendor_bills": [{
+            "id": INVOICE_ID,
+            "review_status": "pending",
+            "verification_status": None,
+            "reconciliation_status": None,
+        }],
+        "invoice_ai_verifications": [],
+        "invoice_reconciliation_results": [],
+    }
+    client = _client(monkeypatch, fixture)
+
+    resp = client.get(
+        f"/invoice/{INVOICE_ID}/verification",
+        headers={"Authorization": "Bearer ADMIN"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["verification"] == {}
+    assert body["reconciliation"] == {}
+    assert body["approval_blockers"] == []
+
+
+def test_old_invoice_without_verification_rows_confirms_with_legacy_flow(monkeypatch):
+    fixture = {"vendor_bills": [{"id": INVOICE_ID, "review_status": "pending"}]}
+    client = _client(monkeypatch, fixture)
+    monkeypatch.setattr(main, "_load_latest_invoice_review_state", lambda invoice_id: ({}, {}))
+
+    resp = client.post(
+        f"/invoice/{INVOICE_ID}/confirm",
+        headers={"Authorization": "Bearer ADMIN"},
+        json={},
+    )
+
+    assert resp.status_code == 200
+    assert any(
+        table == "vendor_bills" and payload.get("review_status") == "confirmed"
+        for table, payload in fixture["_updates"]
+    )
+
+
 def test_confirm_blocks_verification_mismatch_without_force(monkeypatch):
     fixture = {}
     client = _client(monkeypatch, fixture)
@@ -140,6 +185,30 @@ def test_confirm_blocks_verification_mismatch_without_force(monkeypatch):
 
     assert resp.status_code == 422
     assert resp.json()["detail"]["code"] == "CONFIRM_BLOCKED"
+
+
+def test_confirm_blocks_low_confidence_without_force(monkeypatch):
+    fixture = {}
+    client = _client(monkeypatch, fixture)
+    monkeypatch.setattr(
+        main,
+        "_load_latest_invoice_review_state",
+        lambda invoice_id: (
+            {"status": "verified", "confidence": "0.40"},
+            {"status": "matched", "blocking": False},
+        ),
+    )
+
+    resp = client.post(
+        f"/invoice/{INVOICE_ID}/confirm",
+        headers={"Authorization": "Bearer ADMIN"},
+        json={},
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["code"] == "CONFIRM_BLOCKED"
+    assert detail["warnings"][0]["code"] == "LOW_CONFIDENCE"
 
 
 def test_force_confirm_requires_reason_and_writes_audit_warning(monkeypatch):
@@ -175,3 +244,16 @@ def test_force_confirm_requires_reason_and_writes_audit_warning(monkeypatch):
         and row["code"] == "FORCE_CONFIRMED_VERIFICATION_BLOCK"
         for table, row in inserted
     )
+
+
+def test_force_confirm_with_reason_is_rejected_for_non_admin(monkeypatch):
+    fixture = {"vendor_bills": [{"id": INVOICE_ID}]}
+    client = _client(monkeypatch, fixture)
+
+    resp = client.post(
+        f"/invoice/{INVOICE_ID}/confirm",
+        headers={"Authorization": "Bearer STAFF"},
+        json={"force": True, "force_reason": "checked original receipt"},
+    )
+
+    assert resp.status_code == 403
