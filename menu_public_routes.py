@@ -11,7 +11,7 @@ cost / GP / ingredient / supplier information.
 
 WHITELIST (the only fields returned)
 ------------------------------------
-    id, name, selling_price, category, description, image_url
+    id, name, selling_price, category, description, image_url, badge
 
 EXPLICITLY NOT RETURNED (and must never be added without re-review):
     notes              — internal cost / supplier notes
@@ -75,7 +75,8 @@ def get_public_menu():
                     "selling_price": 89.0,
                     "category": "ไม้ปิ้ง",
                     "description": "เนื้อหมูสามชั้นย่างเตาถ่าน..." | null,
-                    "image_url": "https://...supabase.co/.../somu.jpg" | null
+                    "image_url": "https://...supabase.co/.../somu.jpg" | null,
+                    "badge": "best_seller" | "recommended" | null
                 },
                 ...
             ],
@@ -92,7 +93,7 @@ def get_public_menu():
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, name, selling_price, category, description, image_url
+                SELECT id, name, selling_price, category, description, image_url, badge
                 FROM public.recipes
                 WHERE selling_price > 0
                 ORDER BY category NULLS LAST, name
@@ -107,6 +108,7 @@ def get_public_menu():
                     "category":      r[3],
                     "description":   r[4],
                     "image_url":     r[5],
+                    "badge":         r[6],
                 }
                 for r in rows
             ]

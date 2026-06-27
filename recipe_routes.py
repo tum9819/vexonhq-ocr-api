@@ -50,6 +50,12 @@ ingredient_router = APIRouter(prefix="/ingredients", tags=["ingredients"])
 
 # Selling Price Calculator (RestoSheet gap #15) — map logical channel -> recipes column
 _CH_PRICE_COL = {"dine_in": "selling_price", "takeaway": "price_takeaway", "delivery": "price_delivery"}
+_ALLOWED_RECIPE_BADGES = {"best_seller", "recommended"}
+
+
+def _validate_recipe_badge(value: Optional[str]) -> None:
+    if value is not None and value not in _ALLOWED_RECIPE_BADGES:
+        raise HTTPException(400, "Invalid badge; expected best_seller, recommended, or null")
 
 
 class ChannelPriceUpdate(BaseModel):
@@ -104,6 +110,7 @@ class RecipeCreate(BaseModel):
     # NULL ↔ admin UI left blank → public site shows placeholder/empty.
     description: Optional[str] = None
     image_url: Optional[str] = None
+    badge: Optional[str] = None
 
 class RecipeUpdate(BaseModel):
     name: Optional[str] = None
@@ -112,6 +119,7 @@ class RecipeUpdate(BaseModel):
     notes: Optional[str] = None
     description: Optional[str] = None
     image_url: Optional[str] = None
+    badge: Optional[str] = None
 
 class RecipeIngredientAdd(BaseModel):
     ingredient_id: str
@@ -828,7 +836,7 @@ def list_recipes():
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT id, name, selling_price, category, notes,
-                       description, image_url, created_at
+                       description, image_url, badge, created_at
                 FROM public.recipes
                 ORDER BY category NULLS LAST, name
             """)
@@ -861,17 +869,18 @@ def list_recipes():
 
 @router.post("")
 def create_recipe(body: RecipeCreate):
+    _validate_recipe_badge(body.badge)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO public.recipes
-                    (name, selling_price, category, notes, description, image_url)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                    (name, selling_price, category, notes, description, image_url, badge)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (
                 body.name, body.selling_price, body.category, body.notes,
-                body.description, body.image_url,
+                body.description, body.image_url, body.badge,
             ))
             new_id = cur.fetchone()[0]
         conn.commit()
@@ -882,7 +891,14 @@ def create_recipe(body: RecipeCreate):
 
 @router.put("/{recipe_id}")
 def update_recipe(recipe_id: str, body: RecipeUpdate):
-    updates = {k: v for k, v in body.dict().items() if v is not None}
+    raw_updates = body.model_dump(exclude_unset=True)
+    updates = {}
+    for key, value in raw_updates.items():
+        if key == "badge":
+            _validate_recipe_badge(value)
+            updates[key] = value
+        elif value is not None:
+            updates[key] = value
     if not updates:
         raise HTTPException(400, "No fields to update")
     conn = get_db_conn()
@@ -1051,7 +1067,7 @@ def get_recipe(recipe_id: str):
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT id, name, selling_price, category, notes,
-                       description, image_url, created_at
+                       description, image_url, badge, created_at
                 FROM public.recipes WHERE id = %s
             """, (recipe_id,))
             row = cur.fetchone()
