@@ -257,3 +257,72 @@ def test_force_confirm_with_reason_is_rejected_for_non_admin(monkeypatch):
     )
 
     assert resp.status_code == 403
+
+
+def test_patch_reconciliation_accepts_item_payload_dicts(monkeypatch):
+    fixture = {
+        "vendor_bills": [{
+            "id": INVOICE_ID,
+            "review_status": "pending",
+            "amount": "96.30",
+            "vat": "6.30",
+        }],
+        "invoice_items": [{
+            "id": "item-1",
+            "vendor_bill_id": INVOICE_ID,
+            "line_no": 1,
+            "quantity": "1",
+            "unit_price": "100.00",
+            "amount": "90.00",
+        }],
+        "invoice_ai_verifications": [],
+        "invoice_reconciliation_results": [],
+    }
+    client = _client(monkeypatch, fixture)
+
+    class _Cursor:
+        rowcount = 1
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, *args, **kwargs):
+            self.rowcount = 1
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(main, "get_db_conn", lambda: _Conn())
+
+    resp = client.patch(
+        f"/invoice/{INVOICE_ID}/reconciliation",
+        headers={"Authorization": "Bearer ADMIN"},
+        json={
+            "items": [{
+                "line_no": 1,
+                "gross_amount": 100.0,
+                "line_discount_amount": 10.0,
+                "net_amount": 90.0,
+            }],
+            "tolerance": 0.05,
+        },
+    )
+
+    assert resp.status_code == 200
+    assert any(
+        table == "invoice_reconciliation_results"
+        for table, _row in fixture["_inserts"]
+    )

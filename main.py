@@ -1880,7 +1880,7 @@ def invoice_reconciliation_edit(invoice_id: str, update: InvoiceReconciliationEd
                     raise HTTPException(404, "invoice not found")
             if items_payload is not None:
                 for item in items_payload:
-                    row = item.dict()
+                    row = item.dict() if hasattr(item, "dict") else dict(item)
                     item_id = row.pop("id", None)
                     line_no = row.pop("line_no", None)
                     fields = {k: v for k, v in row.items() if v is not None}
