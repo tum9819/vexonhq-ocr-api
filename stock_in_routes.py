@@ -37,7 +37,8 @@ try:
     from auth_routes import _require_admin_role  # type: ignore[import]
 except ImportError:
     def _require_admin_role(request: Request) -> dict:  # type: ignore[misc]
-        raise HTTPException(500, "auth not available")
+        from auth_routes import _require_admin_role as real_require_admin_role
+        return real_require_admin_role(request)
 
 from stock_in_import import parse_stock_in_file, reconcile_diff, normalize_branch_code
 
