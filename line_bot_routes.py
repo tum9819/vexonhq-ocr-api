@@ -1124,15 +1124,19 @@ _scheduler.add_job(
     replace_existing=True,
 )
 
-_scheduler.start()
-log.info("LINE digest scheduler started — fires daily at 06:00 Asia/Bangkok")
-log.info("AP due reminder scheduler started — fires daily at 09:00 Asia/Bangkok")
-log.info("Weekly summary scheduler started — fires every Monday 08:00 Asia/Bangkok")
-log.info("Budget alert scheduler started — fires daily at 20:00 Asia/Bangkok")
-log.info("AI drift check scheduler started — fires daily at 08:30 Asia/Bangkok")
-log.info("DR backup scheduler registered — fires daily at 02:00 Asia/Bangkok")
-log.info("Weekly breakeven scheduler started — fires every Wednesday 09:30 Asia/Bangkok")
-log.info("Monthly breakeven close scheduler started — fires on 1st of month 08:00 Asia/Bangkok")
+_enable_scheduler = os.environ.get("ENABLE_SCHEDULER", "false").strip().lower()
+if _enable_scheduler in ("true", "1", "yes"):
+    _scheduler.start()
+    log.info("LINE digest scheduler started — fires daily at 06:00 Asia/Bangkok")
+    log.info("AP due reminder scheduler started — fires daily at 09:00 Asia/Bangkok")
+    log.info("Weekly summary scheduler started — fires every Monday 08:00 Asia/Bangkok")
+    log.info("Budget alert scheduler started — fires daily at 20:00 Asia/Bangkok")
+    log.info("AI drift check scheduler started — fires daily at 08:30 Asia/Bangkok")
+    log.info("DR backup scheduler registered — fires daily at 02:00 Asia/Bangkok")
+    log.info("Weekly breakeven scheduler started — fires every Wednesday 09:30 Asia/Bangkok")
+    log.info("Monthly breakeven close scheduler started — fires on 1st of month 08:00 Asia/Bangkok")
+else:
+    log.warning("ENABLE_SCHEDULER is not true. Background scheduler is DISABLED.")
 
 
 # ─────────────────────────────────────────────

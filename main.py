@@ -400,9 +400,12 @@ class JWTAuthMiddleware(BaseHTTPMiddleware):
 # Add JWT first (inner), then CORS last (outermost) —
 # this way CORS headers are applied to ALL responses including auth errors
 app.add_middleware(JWTAuthMiddleware)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
+
+_cors_env = os.environ.get("CORS_ALLOW_ORIGINS", "").strip()
+if _cors_env:
+    _allow_origins = [o.strip() for o in _cors_env.split(",") if o.strip() and o.strip() != "*"]
+else:
+    _allow_origins = [
         "http://localhost:3000",
         "https://vexonhq-ocr.vercel.app",
         # Coolify self-host frontend (Session 16 migration)
@@ -412,7 +415,11 @@ app.add_middleware(
         "https://app.marastation.com",
         "https://marastation.com",
         "https://www.marastation.com",
-    ],
+    ]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -3569,3 +3576,4 @@ def _revalidate_bill(invoice_id: str) -> list[dict[str, str]]:
         _save_warnings(invoice_id, fresh_warnings)
 
     return fresh_warnings
+
