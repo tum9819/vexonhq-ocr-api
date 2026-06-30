@@ -1,4 +1,7 @@
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 os.environ.setdefault("DATABASE_URL", "postgresql://u:p@localhost:5432/d")
 os.environ.setdefault("JWT_SECRET", "testsecret")
