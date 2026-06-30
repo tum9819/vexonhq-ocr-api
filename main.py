@@ -2311,6 +2311,10 @@ def _extract_makro_totals_from_text(ocr_text: str) -> dict[str, float | None]:
 
     Looks for English labels (TOTAL, DISCOUNT, AMOUNT) and VAT breakdown "รวม" row.
     Returns dict with keys: subtotal, discount_amount, amount, vat.
+
+    CRITICAL: Extract from Payment Section (English labels) with priority.
+    Payment TOTAL = subtotal BEFORE discount (use this, not VAT table's รวม row).
+    VAT table's รวม row = net subtotal AFTER per-item discounts (lower priority).
     """
     import re
     result = {"subtotal": None, "discount_amount": None, "amount": None, "vat": None}
@@ -2318,8 +2322,9 @@ def _extract_makro_totals_from_text(ocr_text: str) -> dict[str, float | None]:
     if not ocr_text:
         return result
 
-    # Extract TOTAL (subtotal before discount)
-    m = re.search(r'TOTAL\s+(?:[\|\s]+)?([0-9,]+\.[0-9]{2})', ocr_text, re.IGNORECASE)
+    # PRIORITY 1: Extract TOTAL from PAYMENT SECTION (English label, most reliable)
+    # Pattern: TOTAL followed by amount (with optional pipes, spaces)
+    m = re.search(r'(?:TOTAL\s+AMOUNT|TOTAL)\s+(?:[\|\s]+)?([0-9,]+\.[0-9]{2})', ocr_text, re.IGNORECASE)
     if m:
         try:
             result["subtotal"] = float(m.group(1).replace(",", ""))
@@ -2327,29 +2332,39 @@ def _extract_makro_totals_from_text(ocr_text: str) -> dict[str, float | None]:
             pass
 
     # Extract DISCOUNT
-    m = re.search(r'DISCOUNT\s+(?:[\|\s]+)?([0-9,]+\.[0-9]{2})', ocr_text, re.IGNORECASE)
+    m = re.search(r'(?:ส่วนลด|DISCOUNT)\s+(?:[\|\s]+)?([0-9,]+\.[0-9]{2})', ocr_text, re.IGNORECASE)
     if m:
         try:
             result["discount_amount"] = float(m.group(1).replace(",", ""))
         except ValueError:
             pass
 
-    # Extract AMOUNT (final amount after discount)
-    m = re.search(r'(?:NET\s+)?AMOUNT\s+(?:[\|\s]+)?([0-9,]+\.[0-9]{2})', ocr_text, re.IGNORECASE)
+    # Extract AMOUNT (final amount after discount) - usually same as NET AMOUNT
+    m = re.search(r'(?:NET\s+AMOUNT|จำนวนเงิน|AMOUNT)\s+(?:[\|\s]+)?([0-9,]+\.[0-9]{2})', ocr_text, re.IGNORECASE)
     if m:
         try:
             result["amount"] = float(m.group(1).replace(",", ""))
         except ValueError:
             pass
 
-    # Extract VAT from "รวม" row in VAT breakdown table
+    # PRIORITY 2: Extract VAT from "รวม" row in VAT breakdown table (if not found above)
     # Pattern: รวม | (empty) | (subtotal) | (vat) | (amount)
-    m = re.search(r'รวม\s+\|\s+\|\s+[0-9,]+\.[0-9]{2}\s+\|\s+([0-9,]+\.[0-9]{2})', ocr_text)
-    if m:
-        try:
-            result["vat"] = float(m.group(1).replace(",", ""))
-        except ValueError:
-            pass
+    # Only use this if subtotal wasn't extracted from Payment section
+    if result["subtotal"] is None:
+        m = re.search(r'รวม\s+\|\s+\|\s+[0-9,]+\.[0-9]{2}\s+\|\s+([0-9,]+\.[0-9]{2})', ocr_text)
+        if m:
+            try:
+                result["vat"] = float(m.group(1).replace(",", ""))
+            except ValueError:
+                pass
+    else:
+        # If we have subtotal from Payment section, extract VAT from VAT table
+        m = re.search(r'รวม\s+\|\s+\|\s+[0-9,]+\.[0-9]{2}\s+\|\s+([0-9,]+\.[0-9]{2})', ocr_text)
+        if m:
+            try:
+                result["vat"] = float(m.group(1).replace(",", ""))
+            except ValueError:
+                pass
 
     return result
 
