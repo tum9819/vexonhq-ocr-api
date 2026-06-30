@@ -588,6 +588,107 @@ def _build_pnd3(month: str) -> openpyxl.Workbook:
     return wb
 
 
+def _build_commission_breakdown(month: str) -> openpyxl.Workbook:
+    """Commission Breakdown — ยอดขาย Grab/Lineman + Commission หัก"""
+    first, last = _month_range(month)
+    label = _month_label_th(month)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Commission Breakdown"
+
+    # Title
+    ws.merge_cells("A1:H1")
+    t = ws.cell(row=1, column=1, value="รายงานการหักค่าคอมมิชชัน")
+    t.font = Font(name="TH Sarabun New", bold=True, size=15)
+    t.alignment = CENTER
+    ws.row_dimensions[1].height = 30
+
+    ws.merge_cells("A2:H2")
+    ws.cell(row=2, column=1, value=f"เดือน: {label}   |   ร้านสถานีหม่าล่า")
+    ws.cell(row=2, column=1).font = FONT_BODY
+    ws.cell(row=2, column=1).alignment = CENTER
+
+    # Riders Summary Table
+    _header_row(ws, [
+        "Platform", "ยอดขาย Gross", "ค่าคอมมิชชัน", "ส่วนลดร้าน", "อัตรา %", "Net Payout", "Orders"
+    ], row=4)
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT
+                     platform,
+                     SUM(gross_sales)::numeric AS gross,
+                     SUM(net_payout)::numeric AS net,
+                     SUM(ABS(gp_amount))::numeric AS commission,
+                     SUM(ABS(promo_store))::numeric AS promo,
+                     SUM(order_count)::int AS total_orders,
+                     COUNT(*) AS delivery_days
+                   FROM public.rider_deliveries
+                   WHERE delivery_date BETWEEN %s AND %s
+                   GROUP BY platform
+                   ORDER BY platform""",
+                (first, last),
+            )
+            rider_rows = _rows_to_dicts(cur)
+    finally:
+        conn.close()
+
+    row = 5
+    grand_gross = 0.0
+    grand_commission = 0.0
+    grand_promo = 0.0
+    grand_net = 0.0
+
+    for r in rider_rows:
+        gross = float(r["gross"] or 0)
+        commission = float(r["commission"] or 0)
+        promo = float(r["promo"] or 0)
+        net = float(r["net"] or 0)
+        orders = int(r["total_orders"] or 0)
+        rate = (commission / gross * 100) if gross > 0 else 0.0
+
+        platform_label = "Grab" if r["platform"] == "grab" else "Lineman"
+
+        _data_cell(ws, row, 1, platform_label, bold=True)
+        _data_cell(ws, row, 2, gross, align=RIGHT, num_format='#,##0.00')
+        _data_cell(ws, row, 3, commission, align=RIGHT, num_format='#,##0.00', fill=FILL_AMBER)
+        _data_cell(ws, row, 4, promo, align=RIGHT, num_format='#,##0.00')
+        _data_cell(ws, row, 5, f"{rate:.2f}%", align=CENTER)
+        _data_cell(ws, row, 6, net, align=RIGHT, num_format='#,##0.00')
+        _data_cell(ws, row, 7, orders, align=CENTER)
+
+        grand_gross += gross
+        grand_commission += commission
+        grand_promo += promo
+        grand_net += net
+        row += 1
+
+    # Totals
+    row += 1
+    ws.merge_cells(f"A{row}:A{row}")
+    tl = ws.cell(row=row, column=1, value="รวม")
+    tl.font = FONT_BOLD
+    tl.fill = FILL_GREEN
+    tl.alignment = CENTER
+
+    _data_cell(ws, row, 2, grand_gross, align=RIGHT, num_format='#,##0.00', bold=True, fill=FILL_GREEN)
+    _data_cell(ws, row, 3, grand_commission, align=RIGHT, num_format='#,##0.00', bold=True, fill=FILL_GREEN)
+    _data_cell(ws, row, 4, grand_promo, align=RIGHT, num_format='#,##0.00', bold=True, fill=FILL_GREEN)
+
+    grand_rate = (grand_commission / grand_gross * 100) if grand_gross > 0 else 0.0
+    _data_cell(ws, row, 5, f"{grand_rate:.2f}%", align=CENTER, bold=True, fill=FILL_GREEN)
+    _data_cell(ws, row, 6, grand_net, align=RIGHT, num_format='#,##0.00', bold=True, fill=FILL_GREEN)
+
+    ws.row_dimensions[row].height = 22
+
+    _set_col_widths(ws, [16, 18, 18, 18, 12, 18, 12])
+
+    return wb
+
+
 # ─── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.get("/category-summary")
@@ -622,6 +723,19 @@ def export_pnd3(month: str = Query(..., description="YYYY-MM")):
     wb = _build_pnd3(month)
     data = _excel_bytes(wb)
     fname = f"pnd3_{month}.xlsx"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@router.get("/commission-breakdown")
+def export_commission_breakdown(month: str = Query(..., description="YYYY-MM")):
+    """ดาวน์โหลด Excel รายงานการหักค่าคอมมิชชัน Grab/Lineman"""
+    wb = _build_commission_breakdown(month)
+    data = _excel_bytes(wb)
+    fname = f"commission_breakdown_{month}.xlsx"
     return Response(
         content=data,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -708,6 +822,17 @@ def export_summary(month: str = Query(..., description="YYYY-MM")):
             r3 = cur.fetchone()
             cat_count, total_spend = int(r3[0]), float(r3[1])
 
+            # commission breakdown stats
+            cur.execute(
+                """SELECT COUNT(DISTINCT platform) AS plat_count,
+                          COALESCE(SUM(ABS(gp_amount)), 0) AS total_comm
+                   FROM public.rider_deliveries
+                   WHERE delivery_date BETWEEN %s AND %s""",
+                (first, last),
+            )
+            r4 = cur.fetchone()
+            plat_count, total_comm = int(r4[0]), float(r4[1])
+
     finally:
         conn.close()
 
@@ -729,6 +854,10 @@ def export_summary(month: str = Query(..., description="YYYY-MM")):
             "categories": cat_count,
             "total_spend": round(total_spend, 2),
         },
+        "commission_breakdown": {
+            "platforms": plat_count,
+            "total_commission": round(total_comm, 2),
+        },
         "zip_bundle": {
             "files": 3,
             "size_bytes_est": zip_est,
@@ -744,5 +873,6 @@ def export_health():
         "/export/category-summary?month=YYYY-MM",
         "/export/daybook?month=YYYY-MM",
         "/export/pnd3?month=YYYY-MM",
+        "/export/commission-breakdown?month=YYYY-MM",
         "/export/zip-bundle?month=YYYY-MM",
     ]}
