@@ -2105,29 +2105,47 @@ CRITICAL RULES — read carefully, these errors are common:
      "08/04/2569" → "2026-04-08"
      "12/05/2566" → "2023-05-12" (different year, double-check)
 
-3. MULTI-PAGE INVOICES — TOTALS VISIBLE = EXTRACT THEM
+3. MULTI-PAGE INVOICES — STRUCTURE-BASED TOTALS DETECTION
    Multi-page invoices (เช่น Makro 3-4 หน้า) show totals on the last page.
 
-   **KEY RULE: If you see large decimal numbers (e.g., 1,125.50, 78.75) at the BOTTOM of the page → these are TOTALS, extract them.**
-   Do NOT return null just because you can't see a "2/2" page indicator or "รวมเงิน" label.
+   **KEY DISTINCTION: Summary rows have DIFFERENT STRUCTURE than item rows.**
 
-   Detection strategy (visual, not label-based):
-   1. After extracting all items, look at the BOTTOM section of the page
-   2. You will see rows with LARGE NUMBERS (usually ฿ formatted, with 2 decimal places)
-   3. These rows come AFTER the items table ends
-   4. They represent: subtotal (sum of items), vat (usually smaller, % of subtotal), amount (largest, subtotal+vat)
+   Items table structure (6-7 columns):
+     ลำดับ | รหัส | รายการ | จำนวน | หน่วย | ราคา | ยอดรวม
+     (line# | sku | name | qty | unit | price | amount)
 
-   **Makro-specific pattern:**
-   - Items section has 6-20 product rows with qty/unit/price/amount columns
-   - AFTER items, you'll see 3-5 summary rows with just numbers and labels
-   - First large number = subtotal, middle = vat, last = total amount
-   - DO NOT confuse these rows as items — they have no product names
+   Summary section structure (2-3 columns ONLY):
+     รวมเงิน | 3,000.00        [or just: label (฿) amount]
+     ภาษีมูลค่าเพิ่ม | 210.00
+     จำนวนเงิน | 3,210.00
 
-   If you genuinely see ONLY item rows with NO summary numbers at bottom:
+   **Detection rules:**
+   1. POSITION: Summary rows appear AFTER the last item row ends. There is a visual gap or a break line between items and summary.
+   2. COLUMN COUNT: Summary rows have ONLY 2-3 columns (label + amount ± currency). Item rows have 6+ columns. **Count the columns visually.**
+   3. LABEL PATTERN: Look for Thai text keywords in the label column:
+      - "รวม" (subtotal) → extract the amount as subtotal
+      - "ภาษี" or "ภาษีมูลค่าเพิ่ม" (VAT) → extract as vat
+      - "จำนวนเงิน" or "รวมทั้งสิ้น" or "TOTAL AMOUNT" → extract as amount
+   4. FORMAT: Summary amounts usually have ฿ symbol and 2 decimal places (e.g., "1,234.56" or "1,234.56 บาท")
+
+   **Makro-specific example:**
+   Items (7 columns): ลำดับ | รหัส | รายการ | จำนวน | หน่วย | ราคา | ยอดรวม
+     1 | 411671 | บล็อคโคลี่ | 1.358 | KG | 69.0 | 93.75
+     2 | 429637 | มันฝรั่ง | 1.024 | KG | 37.0 | 38.00
+     ... (more items) ...
+
+   Then AFTER last item:
+   Summary (2 columns): รวมเงิน | 1,148.50
+                        ภาษีมูลค่าเพิ่ม | 80.40
+                        จำนวนเงิน | 1,228.90
+
+   Extract: subtotal=1148.50, vat=80.40, amount=1228.90
+
+   **If you see ONLY items with NO summary section:**
      → Return subtotal, vat, amount as **null**
      → Still extract all items from that page
 
-   Example: After 6 items, you see rows like "1,125.50" (subtotal) "78.75" (vat) "1,204.25" (amount) → EXTRACT these
+   ⚠️ **CRITICAL:** Do NOT confuse "last item row with many columns" as a summary row. Summary rows have visibly FEWER columns (2-3, not 6-7).
 
 4. ❌ NEVER CAPTURE COLUMN HEADERS AS ITEMS
    Item tables have a header row at the TOP. These are LABELS, not products.
