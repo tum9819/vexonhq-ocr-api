@@ -2105,18 +2105,22 @@ CRITICAL RULES — read carefully, these errors are common:
      "08/04/2569" → "2026-04-08"
      "12/05/2566" → "2023-05-12" (different year, double-check)
 
-3. MULTI-PAGE INVOICES — TOTALS ONLY ON LAST PAGE
-   Multi-page invoices (เช่น Makro 3-4 หน้า) show totals (subtotal/vat/amount)
-   ONLY on the last page. Earlier pages show item lines but NO total summary.
+3. MULTI-PAGE INVOICES — TOTALS VISIBLE = EXTRACT THEM
+   Multi-page invoices (เช่น Makro 3-4 หน้า) may show totals on the last page.
 
-   When processing an intermediate page (e.g. you see "1/3" or "2/3" indicator,
-   or you see only item rows without "รวมเงิน"/"AMOUNT" summary box):
+   **KEY RULE: If you see a "รวมเงิน" / "SUBTOTAL" / "TOTAL" summary box with numbers → EXTRACT the values.**
+   Do NOT return null just because you can't see a page indicator like "2/2".
+
+   Detection strategy:
+   - Look for summary section at the BOTTOM of the page
+   - Find rows labeled: "รวมเงิน" (subtotal), "ภาษีมูลค่าเพิ่ม" (VAT), "จำนวนเงิน" (amount/total)
+   - If you see these labels with numeric values → EXTRACT them
+
+   If you see ONLY item rows with NO summary box at bottom:
      → Return subtotal, vat, amount as **null**
      → Still extract all items from that page
-     → DO NOT invent totals based on items shown
 
-   When you see the last page (totals are visible):
-     → Extract subtotal, vat, amount from the summary box at bottom
+   Example: Page 2 may have NO items but ONLY the summary box → extract totals only, items = []
 
 4. ❌ NEVER CAPTURE COLUMN HEADERS AS ITEMS
    Item tables have a header row at the TOP. These are LABELS, not products.
@@ -2214,7 +2218,10 @@ CRITICAL RULES — read carefully, these errors are common:
    Numbers in JSON must be JSON numbers, not strings.
    1,234.56 → 1234.56 (no comma, no quotes)
 
-10. DISCOUNT EXTRACTION — TWO LEVELS (Makro/wholesale invoices)
+10. DISCOUNT EXTRACTION — TWO LEVELS (Makro/wholesale invoices) — **ALWAYS RETURN DISCOUNT OBJECT**
+    CRITICAL: You MUST always return the discount object structure, even if all fields are null.
+    Never omit the discount object.
+
     Extract discount info; there are typically TWO levels:
 
     Level 1 — Per-item discount (% on individual rows):
@@ -2223,11 +2230,11 @@ CRITICAL RULES — read carefully, these errors are common:
       If NO per-item discount → report as null
 
     Level 2 — Whole-bill discount (AFTER items subtotal):
-      Look for: "ส่วนลดทั้งหมด" / "Total Discount" / "Promotional Discount"
-      Usually appears in summary section, AFTER all items are listed
+      Look for: "ส่วนลดทั้งหมด" / "Total Discount" / "Promotional Discount" / "โปรโมชั่น"
+      Usually appears in summary section, AFTER subtotal, BEFORE VAT
       Type A: Fixed amount → whole_bill_discount_amount (e.g., 500 บาท → 500)
       Type B: Percentage → whole_bill_discount_pct (e.g., 2% → 2)
-      Type C: Both → report both fields, report the one you see clearly
+      Type C: Both → report both fields if both are clearly visible
 
     Example (Makro invoice):
       Items subtotal: 3,000 บาท (with 10% per-item discount already included in item amounts)
@@ -2236,6 +2243,9 @@ CRITICAL RULES — read carefully, these errors are common:
       VAT 7%: 199.50 บาท
       Total: 3,049.50 บาท
       → Extract: line_items_discount_pct: 10, whole_bill_discount_amount: 150, whole_bill_discount_pct: null, note: "โปรโมชั่น"
+
+    If NO discounts are visible → return:
+      discount: { line_items_discount_pct: null, whole_bill_discount_amount: null, whole_bill_discount_pct: null, note: null }
 
     ⚠️ IMPORTANT: The per-item discount may already be included in item amounts (not shown separately).
     Look at the math: if (sum of item amounts) < (items count × unit_price), then discount was applied.
