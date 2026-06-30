@@ -2106,21 +2106,28 @@ CRITICAL RULES — read carefully, these errors are common:
      "12/05/2566" → "2023-05-12" (different year, double-check)
 
 3. MULTI-PAGE INVOICES — TOTALS VISIBLE = EXTRACT THEM
-   Multi-page invoices (เช่น Makro 3-4 หน้า) may show totals on the last page.
+   Multi-page invoices (เช่น Makro 3-4 หน้า) show totals on the last page.
 
-   **KEY RULE: If you see a "รวมเงิน" / "SUBTOTAL" / "TOTAL" summary box with numbers → EXTRACT the values.**
-   Do NOT return null just because you can't see a page indicator like "2/2".
+   **KEY RULE: If you see large decimal numbers (e.g., 1,125.50, 78.75) at the BOTTOM of the page → these are TOTALS, extract them.**
+   Do NOT return null just because you can't see a "2/2" page indicator or "รวมเงิน" label.
 
-   Detection strategy:
-   - Look for summary section at the BOTTOM of the page
-   - Find rows labeled: "รวมเงิน" (subtotal), "ภาษีมูลค่าเพิ่ม" (VAT), "จำนวนเงิน" (amount/total)
-   - If you see these labels with numeric values → EXTRACT them
+   Detection strategy (visual, not label-based):
+   1. After extracting all items, look at the BOTTOM section of the page
+   2. You will see rows with LARGE NUMBERS (usually ฿ formatted, with 2 decimal places)
+   3. These rows come AFTER the items table ends
+   4. They represent: subtotal (sum of items), vat (usually smaller, % of subtotal), amount (largest, subtotal+vat)
 
-   If you see ONLY item rows with NO summary box at bottom:
+   **Makro-specific pattern:**
+   - Items section has 6-20 product rows with qty/unit/price/amount columns
+   - AFTER items, you'll see 3-5 summary rows with just numbers and labels
+   - First large number = subtotal, middle = vat, last = total amount
+   - DO NOT confuse these rows as items — they have no product names
+
+   If you genuinely see ONLY item rows with NO summary numbers at bottom:
      → Return subtotal, vat, amount as **null**
      → Still extract all items from that page
 
-   Example: Page 2 may have NO items but ONLY the summary box → extract totals only, items = []
+   Example: After 6 items, you see rows like "1,125.50" (subtotal) "78.75" (vat) "1,204.25" (amount) → EXTRACT these
 
 4. ❌ NEVER CAPTURE COLUMN HEADERS AS ITEMS
    Item tables have a header row at the TOP. These are LABELS, not products.
