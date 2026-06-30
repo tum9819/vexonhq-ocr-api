@@ -2055,6 +2055,12 @@ Return ONLY valid JSON matching this exact schema (no markdown, no commentary):
       "amount": number_or_null
     }}
   ],
+  "discount": {{
+    "line_items_discount_pct": number_or_null,
+    "whole_bill_discount_amount": number_or_null,
+    "whole_bill_discount_pct": number_or_null,
+    "note": "string or null"
+  }},
   "notes": "string or null"
 }}
 
@@ -2208,7 +2214,33 @@ CRITICAL RULES — read carefully, these errors are common:
    Numbers in JSON must be JSON numbers, not strings.
    1,234.56 → 1234.56 (no comma, no quotes)
 
-10. CONFIDENCE + IMAGE QUALITY (audit F6)
+10. DISCOUNT EXTRACTION — TWO LEVELS (Makro/wholesale invoices)
+    Extract discount info; there are typically TWO levels:
+
+    Level 1 — Per-item discount (% on individual rows):
+      Look for: ส่วนลด %, discount %, each item line may have a discount %
+      Report: line_items_discount_pct (e.g., 10 for 10%)
+      If NO per-item discount → report as null
+
+    Level 2 — Whole-bill discount (AFTER items subtotal):
+      Look for: "ส่วนลดทั้งหมด" / "Total Discount" / "Promotional Discount"
+      Usually appears in summary section, AFTER all items are listed
+      Type A: Fixed amount → whole_bill_discount_amount (e.g., 500 บาท → 500)
+      Type B: Percentage → whole_bill_discount_pct (e.g., 2% → 2)
+      Type C: Both → report both fields, report the one you see clearly
+
+    Example (Makro invoice):
+      Items subtotal: 3,000 บาท (with 10% per-item discount already included in item amounts)
+      Promotional discount: 150 บาท (whole-bill)
+      Net Before VAT: 2,850 บาท
+      VAT 7%: 199.50 บาท
+      Total: 3,049.50 บาท
+      → Extract: line_items_discount_pct: 10, whole_bill_discount_amount: 150, whole_bill_discount_pct: null, note: "โปรโมชั่น"
+
+    ⚠️ IMPORTANT: The per-item discount may already be included in item amounts (not shown separately).
+    Look at the math: if (sum of item amounts) < (items count × unit_price), then discount was applied.
+
+11. CONFIDENCE + IMAGE QUALITY (audit F6)
     Also return two extra top-level keys so a human reviewer knows what to double-check:
       "field_confidence": an object mapping each of these fields to your confidence
         0.0-1.0 that YOU read it correctly: vendor_name, invoice_no, merchant_tax_id,
@@ -2218,7 +2250,7 @@ CRITICAL RULES — read carefully, these errors are common:
         — "poor" if blurry / skewed / dark / cut off so fields are hard to read.
     These describe your READING CONFIDENCE; they must NOT change the extracted values above.
 
-11. OUTPUT
+12. OUTPUT
     Pure JSON only. NO markdown fences. NO explanation. NO preamble.
 """
 
@@ -2364,6 +2396,59 @@ def _validate_invoice(parsed: dict[str, Any]) -> list[dict[str, str]]:
                 })
         except (TypeError, ValueError):
             pass
+
+    # Discount validation (Makro + wholesale invoices)
+    try:
+        discount = parsed.get("discount") or {}
+        if isinstance(discount, dict):
+            line_disc_pct = discount.get("line_items_discount_pct")
+            whole_disc_amt = discount.get("whole_bill_discount_amount")
+            whole_disc_pct = discount.get("whole_bill_discount_pct")
+
+            # If discount is reported, validate that total calculation makes sense
+            if (line_disc_pct is not None or whole_disc_amt is not None or whole_disc_pct is not None) \
+               and subtotal is not None and vat is not None and total is not None:
+                try:
+                    # Calculate expected total with discount
+                    subtotal_f = float(subtotal)
+                    vat_f = float(vat)
+                    total_f = float(total)
+
+                    # Step 1: Apply per-item discount if present
+                    if line_disc_pct is not None:
+                        net_after_line = subtotal_f * (1.0 - float(line_disc_pct) / 100.0)
+                    else:
+                        net_after_line = subtotal_f
+
+                    # Step 2: Apply whole-bill discount
+                    if whole_disc_amt is not None:
+                        net_after_bill = net_after_line - float(whole_disc_amt)
+                    elif whole_disc_pct is not None:
+                        net_after_bill = net_after_line * (1.0 - float(whole_disc_pct) / 100.0)
+                    else:
+                        net_after_bill = net_after_line
+
+                    # Step 3: Expected final total
+                    expected_final = net_after_bill + vat_f
+                    expected_rounded = round(expected_final, 2)
+                    actual_rounded = round(total_f, 2)
+
+                    # Tolerance: 1 baht (rounding errors in multi-stage discount)
+                    if abs(expected_rounded - actual_rounded) > 1.0:
+                        warnings.append({
+                            "severity": "warn",
+                            "code": "DISCOUNT_CALCULATION_MISMATCH",
+                            "message": (
+                                f"ยอดรวมไม่ตรง (เมื่อคำนวณส่วนลด): "
+                                f"คาดหวัง {expected_rounded:,.2f} แต่เอกสาร {actual_rounded:,.2f} "
+                                f"— ตรวจสอบ ส่วนลด {line_disc_pct or whole_disc_amt or whole_disc_pct}"
+                            ),
+                            "field": "discount",
+                        })
+                except (TypeError, ValueError):
+                    pass
+    except Exception:
+        pass
 
     warnings.extend(_confidence_warnings(parsed))
     return warnings

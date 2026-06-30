@@ -81,6 +81,18 @@ def invoice_json_schema() -> dict:
         "required": ["level", "reason"],
     }
 
+    discount_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "line_items_discount_pct": _num_or_null(),
+            "whole_bill_discount_amount": _num_or_null(),
+            "whole_bill_discount_pct": _num_or_null(),
+            "note": _str_or_null(),
+        },
+        "required": ["line_items_discount_pct", "whole_bill_discount_amount", "whole_bill_discount_pct", "note"],
+    }
+
     props = {
         "vendor_name": _str_or_null(),
         "merchant_tax_id": _str_or_null(),
@@ -93,6 +105,7 @@ def invoice_json_schema() -> dict:
         "payment_type": {"type": ["string", "null"], "enum": PAYMENT_TYPES + [None]},
         "currency": {"type": "string"},
         "items": {"type": "array", "items": item_schema},
+        "discount": discount_schema,
         "notes": _str_or_null(),
         "field_confidence": field_confidence_schema,
         "image_quality": image_quality_schema,
@@ -110,6 +123,7 @@ _CONSUMER_SCALARS = [
     "vendor_name", "merchant_tax_id", "invoice_no", "bill_date", "due_date",
     "subtotal", "vat", "amount", "payment_type", "currency", "notes",
 ]
+_DISCOUNT_KEYS = ["line_items_discount_pct", "whole_bill_discount_amount", "whole_bill_discount_pct", "note"]
 _ITEM_KEYS = ["line_no", "sku", "product_name", "quantity", "unit", "unit_price", "amount"]
 
 
@@ -119,7 +133,7 @@ def normalize_structured(parsed: Any) -> dict:
     Strict output already matches the contract, so this is mostly identity — but it
     is the seam a future production promotion plugs into, and it defends against a
     malformed/partial object (returns a dict with the known keys, never raises).
-    `field_confidence` / `image_quality` are passed through untouched for F6."""
+    `field_confidence` / `image_quality` / `discount` are passed through untouched."""
     if not isinstance(parsed, dict):
         return {"items": []}
     out: dict[str, Any] = {}
@@ -132,6 +146,9 @@ def normalize_structured(parsed: Any) -> dict:
             if isinstance(it, dict):
                 items_out.append({k: it.get(k) for k in _ITEM_KEYS})
     out["items"] = items_out
+    # Discount object — pass through if present
+    if "discount" in parsed and isinstance(parsed["discount"], dict):
+        out["discount"] = {k: parsed["discount"].get(k) for k in _DISCOUNT_KEYS}
     # F6 blocks pass through verbatim if present (validator tolerates absence).
     if "field_confidence" in parsed:
         out["field_confidence"] = parsed["field_confidence"]
