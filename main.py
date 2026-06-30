@@ -2306,6 +2306,54 @@ CRITICAL RULES — read carefully, these errors are common:
 _OCR_STRUCTURED = os.environ.get("OCR_STRUCTURED", "1") != "0"
 
 
+def _extract_makro_totals_from_text(ocr_text: str) -> dict[str, float | None]:
+    """Fallback: extract Makro payment section totals from OCR text using regex.
+
+    Looks for English labels (TOTAL, DISCOUNT, AMOUNT) and VAT breakdown "รวม" row.
+    Returns dict with keys: subtotal, discount_amount, amount, vat.
+    """
+    import re
+    result = {"subtotal": None, "discount_amount": None, "amount": None, "vat": None}
+
+    if not ocr_text:
+        return result
+
+    # Extract TOTAL (subtotal before discount)
+    m = re.search(r'TOTAL\s+(?:[\|\s]+)?([0-9,]+\.[0-9]{2})', ocr_text, re.IGNORECASE)
+    if m:
+        try:
+            result["subtotal"] = float(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+
+    # Extract DISCOUNT
+    m = re.search(r'DISCOUNT\s+(?:[\|\s]+)?([0-9,]+\.[0-9]{2})', ocr_text, re.IGNORECASE)
+    if m:
+        try:
+            result["discount_amount"] = float(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+
+    # Extract AMOUNT (final amount after discount)
+    m = re.search(r'(?:NET\s+)?AMOUNT\s+(?:[\|\s]+)?([0-9,]+\.[0-9]{2})', ocr_text, re.IGNORECASE)
+    if m:
+        try:
+            result["amount"] = float(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+
+    # Extract VAT from "รวม" row in VAT breakdown table
+    # Pattern: รวม | (empty) | (subtotal) | (vat) | (amount)
+    m = re.search(r'รวม\s+\|\s+\|\s+[0-9,]+\.[0-9]{2}\s+\|\s+([0-9,]+\.[0-9]{2})', ocr_text)
+    if m:
+        try:
+            result["vat"] = float(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+
+    return result
+
+
 def _run_gpt_vision(image_bytes: bytes, mime_type: str, ocr_hint: str) -> dict[str, Any]:
     """Send image to GPT-4 Vision and return parsed JSON.
 
@@ -2313,7 +2361,10 @@ def _run_gpt_vision(image_bytes: bytes, mime_type: str, ocr_hint: str) -> dict[s
     json_object mode when OCR_STRUCTURED=0. Both routes go through llm.* so token
     usage/latency/errors land in ai_call_log. The returned dict shape is identical
     either way (normalize_structured maps the strict result onto the same keys the
-    downstream consumers — _validate_invoice / _insert_items — already expect)."""
+    downstream consumers — _validate_invoice / _insert_items — already expect).
+
+    Fallback: if GPT-4o returns null for subtotal/vat/amount, try regex extraction
+    from tesseract OCR text (Makro invoices have structured format)."""
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:{mime_type or 'image/jpeg'};base64,{b64}"
     prompt = VISION_PROMPT.format(ocr_hint=(ocr_hint or "(empty)")[:3000])
@@ -2340,24 +2391,42 @@ def _run_gpt_vision(image_bytes: bytes, mime_type: str, ocr_hint: str) -> dict[s
             max_tokens=6000,  # multi-page Makro: items + VAT breakdown + payment summary
         )
         raw = (resp.choices[0].message.content or "{}").strip()
-        return normalize_structured(json.loads(raw))
+        parsed = normalize_structured(json.loads(raw))
+    else:
+        resp = openai_chat(
+            "vision_ocr",
+            model=OPENAI_VISION_MODEL,
+            messages=messages,
+            response_format={"type": "json_object"},
+            temperature=0.7,
+            max_tokens=6000,  # multi-page Makro: items + VAT breakdown + payment summary
+        )
+        raw = (resp.choices[0].message.content or "{}").strip()
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            # strip markdown fences if model wrapped output despite instructions
+            cleaned = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            parsed = json.loads(cleaned)
 
-    resp = openai_chat(
-        "vision_ocr",
-        model=OPENAI_VISION_MODEL,
-        messages=messages,
-        response_format={"type": "json_object"},
-        temperature=0.7,
-        max_tokens=6000,  # multi-page Makro: items + VAT breakdown + payment summary
-    )
+    # FALLBACK: if GPT-4o returned null for totals, try regex on tesseract text
+    if (parsed.get("subtotal") is None or parsed.get("vat") is None or
+        parsed.get("amount") is None) and ocr_hint:
+        makro_totals = _extract_makro_totals_from_text(ocr_hint)
+        if makro_totals["subtotal"] is not None:
+            parsed["subtotal"] = makro_totals["subtotal"]
+        if makro_totals["vat"] is not None:
+            parsed["vat"] = makro_totals["vat"]
+        if makro_totals["amount"] is not None:
+            parsed["amount"] = makro_totals["amount"]
+        if makro_totals["discount_amount"] is not None:
+            # merge into existing discount object
+            if parsed.get("discount") is None:
+                parsed["discount"] = {}
+            if isinstance(parsed["discount"], dict):
+                parsed["discount"]["whole_bill_discount_amount"] = makro_totals["discount_amount"]
 
-    raw = (resp.choices[0].message.content or "{}").strip()
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        # strip markdown fences if model wrapped output despite instructions
-        cleaned = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        return json.loads(cleaned)
+    return parsed
 
 
 # ============================================================
