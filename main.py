@@ -2245,7 +2245,7 @@ CRITICAL RULES — read carefully, these errors are common:
       → Extract: line_items_discount_pct: 10, whole_bill_discount_amount: 150, whole_bill_discount_pct: null, note: "โปรโมชั่น"
 
     If NO discounts are visible → return:
-      discount: { line_items_discount_pct: null, whole_bill_discount_amount: null, whole_bill_discount_pct: null, note: null }
+      discount: {{ line_items_discount_pct: null, whole_bill_discount_amount: null, whole_bill_discount_pct: null, note: null }}
 
     ⚠️ IMPORTANT: The per-item discount may already be included in item amounts (not shown separately).
     Look at the math: if (sum of item amounts) < (items count × unit_price), then discount was applied.
