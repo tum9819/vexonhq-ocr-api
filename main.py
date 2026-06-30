@@ -2105,47 +2105,44 @@ CRITICAL RULES — read carefully, these errors are common:
      "08/04/2569" → "2026-04-08"
      "12/05/2566" → "2023-05-12" (different year, double-check)
 
-3. MULTI-PAGE INVOICES — STRUCTURE-BASED TOTALS DETECTION
+3. MULTI-PAGE INVOICES — ENGLISH LABEL-BASED TOTALS DETECTION
    Multi-page invoices (เช่น Makro 3-4 หน้า) show totals on the last page.
 
-   **KEY DISTINCTION: Summary rows have DIFFERENT STRUCTURE than item rows.**
+   **KEY SIGNAL: English bilingual labels** (Makro invoices are bilingual Thai/English).
 
-   Items table structure (6-7 columns):
-     ลำดับ | รหัส | รายการ | จำนวน | หน่วย | ราคา | ยอดรวม
-     (line# | sku | name | qty | unit | price | amount)
+   **Detection strategy — look for PAYMENT SECTION:**
+   On the LAST PAGE of a multi-page invoice, after all items and VAT breakdowns,
+   you'll find a PAYMENT SECTION with English labels:
+     - "TOTAL" (or "TOTAL AMOUNT") → subtotal before discount
+     - "DISCOUNT" → discount amount
+     - "AMOUNT" (or "NET AMOUNT") → final amount after discount/VAT
 
-   Summary section structure (2-3 columns ONLY):
-     รวมเงิน | 3,000.00        [or just: label (฿) amount]
-     ภาษีมูลค่าเพิ่ม | 210.00
-     จำนวนเงิน | 3,210.00
+   **Makro-specific layout:**
+   Page 1–N: Items table (6–7 columns: line#, SKU, description, qty, unit, price, amount)
+   Page N:
+     → Items + VAT category breakdown table
+     → Then PAYMENT SECTION (2 columns):
+        TOTAL            | 1,125.25  ← extract as subtotal
+        DISCOUNT         |    2.00   ← extract (for discount validation)
+        AMOUNT           | 1,104.25  ← extract as amount
 
-   **Detection rules:**
-   1. POSITION: Summary rows appear AFTER the last item row ends. There is a visual gap or a break line between items and summary.
-   2. COLUMN COUNT: Summary rows have ONLY 2-3 columns (label + amount ± currency). Item rows have 6+ columns. **Count the columns visually.**
-   3. LABEL PATTERN: Look for Thai text keywords in the label column:
-      - "รวม" (subtotal) → extract the amount as subtotal
-      - "ภาษี" or "ภาษีมูลค่าเพิ่ม" (VAT) → extract as vat
-      - "จำนวนเงิน" or "รวมทั้งสิ้น" or "TOTAL AMOUNT" → extract as amount
-   4. FORMAT: Summary amounts usually have ฿ symbol and 2 decimal places (e.g., "1,234.56" or "1,234.56 บาท")
+   **Extraction mapping:**
+   - subtotal = amount shown next to "TOTAL" label
+   - discount_amount = amount shown next to "DISCOUNT" label (if present)
+   - vat = can derive from (subtotal − discount − amount) if needed; or if there's a separate
+           "TAX" / "ภาษี" label before AMOUNT, extract that as vat
+   - amount = amount shown next to final "AMOUNT" or "NET AMOUNT" label
 
-   **Makro-specific example:**
-   Items (7 columns): ลำดับ | รหัส | รายการ | จำนวน | หน่วย | ราคา | ยอดรวม
-     1 | 411671 | บล็อคโคลี่ | 1.358 | KG | 69.0 | 93.75
-     2 | 429637 | มันฝรั่ง | 1.024 | KG | 37.0 | 38.00
-     ... (more items) ...
+   **Alternative (older Makro format):**
+   Some older Makro invoices may show:
+     รวมเงิน / Subtotal    | 1,076.77
+     ภาษี / VAT            |    27.48
+     รวมทั้งสิ้น / TOTAL   | 1,104.25
+   If you see this Thai-only layout, extract the last row as amount, second-to-last as vat, etc.
 
-   Then AFTER last item:
-   Summary (2 columns): รวมเงิน | 1,148.50
-                        ภาษีมูลค่าเพิ่ม | 80.40
-                        จำนวนเงิน | 1,228.90
-
-   Extract: subtotal=1148.50, vat=80.40, amount=1228.90
-
-   **If you see ONLY items with NO summary section:**
+   **If you see ONLY items with NO payment section:**
      → Return subtotal, vat, amount as **null**
      → Still extract all items from that page
-
-   ⚠️ **CRITICAL:** Do NOT confuse "last item row with many columns" as a summary row. Summary rows have visibly FEWER columns (2-3, not 6-7).
 
 4. ❌ NEVER CAPTURE COLUMN HEADERS AS ITEMS
    Item tables have a header row at the TOP. These are LABELS, not products.
