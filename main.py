@@ -2415,18 +2415,35 @@ def _validate_invoice(parsed: dict[str, Any]) -> list[dict[str, str]]:
                     total_f = float(total)
 
                     # Step 1: Apply per-item discount if present
-                    if line_disc_pct is not None:
+                    # Check if subtotal is already net of line discounts (sum(item.amount) == subtotal)
+                    is_subtotal_net = False
+                    try:
+                        items_list = parsed.get("items") or []
+                        amounts = [float(it["amount"]) for it in items_list if isinstance(it, dict) and it.get("amount") is not None]
+                        if amounts and abs(sum(amounts) - subtotal_f) <= 1.0:
+                            is_subtotal_net = True
+                    except (TypeError, ValueError):
+                        pass
+
+                    if line_disc_pct is not None and not is_subtotal_net:
                         net_after_line = subtotal_f * (1.0 - float(line_disc_pct) / 100.0)
                     else:
                         net_after_line = subtotal_f
 
                     # Step 2: Apply whole-bill discount
-                    if whole_disc_amt is not None:
+                    # Precedence: If both amt and pct are provided, check if they represent the same value.
+                    # If they match, we use amt to avoid double-counting. If they differ, we apply both (additive).
+                    net_after_bill = net_after_line
+                    if whole_disc_amt is not None and whole_disc_pct is not None:
+                        pct_amt = net_after_line * (float(whole_disc_pct) / 100.0)
+                        if abs(float(whole_disc_amt) - pct_amt) <= 1.0:
+                            net_after_bill = net_after_line - float(whole_disc_amt)
+                        else:
+                            net_after_bill = net_after_line - float(whole_disc_amt) - pct_amt
+                    elif whole_disc_amt is not None:
                         net_after_bill = net_after_line - float(whole_disc_amt)
                     elif whole_disc_pct is not None:
                         net_after_bill = net_after_line * (1.0 - float(whole_disc_pct) / 100.0)
-                    else:
-                        net_after_bill = net_after_line
 
                     # Step 3: Expected final total
                     expected_final = net_after_bill + vat_f
