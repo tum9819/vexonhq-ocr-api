@@ -79,6 +79,7 @@ def pnl_yearly(
     Full-year P&L: monthly breakdown + totals + best/worst month.
     Used by /yearly frontend page.
     """
+    commission_map = {}  # Will be populated from rider_deliveries
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -135,6 +136,36 @@ def pnl_yearly(
             )
             exp_bills_map = {r[0]: int(r[1] or 0) for r in cur.fetchall()}
 
+            # ── Commission breakdown (Grab vs Lineman) ────────────────────────
+            cur.execute(
+                """SELECT EXTRACT(MONTH FROM delivery_date)::int AS m,
+                          platform,
+                          COALESCE(SUM(gross_sales), 0)::numeric AS gross,
+                          COALESCE(SUM(ABS(gp_amount)), 0)::numeric AS commission,
+                          COALESCE(SUM(ABS(promo_store)), 0)::numeric AS promo,
+                          COALESCE(SUM(net_payout), 0)::numeric AS net,
+                          COALESCE(SUM(order_count), 0)::int AS orders
+                   FROM public.rider_deliveries
+                   WHERE EXTRACT(YEAR FROM delivery_date) = %s
+                   GROUP BY 1, 2
+                   ORDER BY 1, 2""",
+                (year,),
+            )
+            commission_rows = cur.fetchall()
+            commission_map = {}
+            for r in commission_rows:
+                m, platform = r[0], r[1]
+                if m not in commission_map:
+                    commission_map[m] = {}
+                platform_key = (platform or "unknown").lower()
+                commission_map[m][platform_key] = {
+                    "gross": float(r[2] or 0),
+                    "commission": float(r[3] or 0),
+                    "promo": float(r[4] or 0),
+                    "net": float(r[5] or 0),
+                    "orders": int(r[6] or 0),
+                }
+
     finally:
         conn.close()
 
@@ -189,6 +220,7 @@ def pnl_yearly(
         "best_month": best_month,
         "worst_month": worst_month,
         "data_months": len(data_rows),
+        "commission": commission_map,
     }
 
 
@@ -294,6 +326,92 @@ def export_yearly(
     # Column widths
     for c_idx, w in enumerate([12, 16, 14, 16, 16, 16, 12, 12], 1):
         ws.column_dimensions[openpyxl.utils.get_column_letter(c_idx)].width = w
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Sheet 2: Commission Breakdown (Grab vs Lineman)
+    # ──────────────────────────────────────────────────────────────────────
+    ws_comm = wb.create_sheet("Commission Breakdown")
+
+    def cell_comm(row, col, val, font=None, align=None, fill=None, num_fmt=None):
+        c = ws_comm.cell(row=row, column=col, value=val)
+        if font:   c.font      = font
+        if align:  c.alignment = align
+        if fill:   c.fill      = fill
+        if num_fmt: c.number_format = num_fmt
+        return c
+
+    # Title
+    ws_comm.merge_cells("A1:I1")
+    cell_comm(1, 1, f"รายงานการหักค่าคอมมิชชัน ประจำปี {year}", FONT_TITLE, CENTER)
+    ws_comm.row_dimensions[1].height = 32
+
+    # Header row
+    comm_headers = ["เดือน", "ยอดขาย Gross",
+                    "ค่าคอม Grab", "ส่วนลด Grab",
+                    "ค่าคอม Lineman", "ส่วนลด Lineman",
+                    "รวมค่าคอม", "รวมส่วนลด", "ยอดขาย Net"]
+    for c_idx, h in enumerate(comm_headers, 1):
+        cell_comm(3, c_idx, h, FONT_HDR, CENTER, FILL_HDR)
+    ws_comm.row_dimensions[3].height = 22
+
+    # Commission data rows
+    comm_map = data.get("commission", {})
+    comm_totals = {
+        "gross": 0.0, "comm_grab": 0.0, "promo_grab": 0.0,
+        "comm_lineman": 0.0, "promo_lineman": 0.0, "net": 0.0
+    }
+
+    for i, m in enumerate(range(1, 13), 1):
+        r = 3 + i
+        month_data = comm_map.get(m, {})
+        fill = FILL_ALT if i % 2 == 0 else None
+
+        grab_data = month_data.get("grab", {})
+        lineman_data = month_data.get("lineman", {})
+
+        gross_m = (grab_data.get("gross", 0) or 0) + (lineman_data.get("gross", 0) or 0)
+        comm_grab = grab_data.get("commission", 0) or 0
+        promo_grab = grab_data.get("promo", 0) or 0
+        comm_lineman = lineman_data.get("commission", 0) or 0
+        promo_lineman = lineman_data.get("promo", 0) or 0
+        net_m = (grab_data.get("net", 0) or 0) + (lineman_data.get("net", 0) or 0)
+        total_comm = comm_grab + comm_lineman
+        total_promo = promo_grab + promo_lineman
+
+        cell_comm(r, 1, TH_MONTHS[m], FONT_BODY, CENTER, fill)
+        cell_comm(r, 2, gross_m if gross_m > 0 else None, FONT_BODY, RIGHT, fill, NUM_FMT)
+        cell_comm(r, 3, comm_grab if comm_grab > 0 else None, FONT_BODY, RIGHT, fill, NUM_FMT)
+        cell_comm(r, 4, promo_grab if promo_grab > 0 else None, FONT_BODY, RIGHT, fill, NUM_FMT)
+        cell_comm(r, 5, comm_lineman if comm_lineman > 0 else None, FONT_BODY, RIGHT, fill, NUM_FMT)
+        cell_comm(r, 6, promo_lineman if promo_lineman > 0 else None, FONT_BODY, RIGHT, fill, NUM_FMT)
+        cell_comm(r, 7, total_comm if total_comm > 0 else None, FONT_BODY, RIGHT, fill, NUM_FMT)
+        cell_comm(r, 8, total_promo if total_promo > 0 else None, FONT_BODY, RIGHT, fill, NUM_FMT)
+        cell_comm(r, 9, net_m if net_m > 0 else None, FONT_BODY, RIGHT, fill, NUM_FMT)
+        ws_comm.row_dimensions[r].height = 20
+
+        comm_totals["gross"] += gross_m
+        comm_totals["comm_grab"] += comm_grab
+        comm_totals["promo_grab"] += promo_grab
+        comm_totals["comm_lineman"] += comm_lineman
+        comm_totals["promo_lineman"] += promo_lineman
+        comm_totals["net"] += net_m
+
+    # Total row
+    tr_comm = 3 + 13
+    cell_comm(tr_comm, 1, "รวมทั้งปี", FONT_TOTAL, CENTER, FILL_TOTAL)
+    cell_comm(tr_comm, 2, comm_totals["gross"], FONT_TOTAL, RIGHT, FILL_TOTAL, NUM_FMT)
+    cell_comm(tr_comm, 3, comm_totals["comm_grab"], FONT_TOTAL, RIGHT, FILL_TOTAL, NUM_FMT)
+    cell_comm(tr_comm, 4, comm_totals["promo_grab"], FONT_TOTAL, RIGHT, FILL_TOTAL, NUM_FMT)
+    cell_comm(tr_comm, 5, comm_totals["comm_lineman"], FONT_TOTAL, RIGHT, FILL_TOTAL, NUM_FMT)
+    cell_comm(tr_comm, 6, comm_totals["promo_lineman"], FONT_TOTAL, RIGHT, FILL_TOTAL, NUM_FMT)
+    cell_comm(tr_comm, 7, comm_totals["comm_grab"] + comm_totals["comm_lineman"], FONT_TOTAL, RIGHT, FILL_TOTAL, NUM_FMT)
+    cell_comm(tr_comm, 8, comm_totals["promo_grab"] + comm_totals["promo_lineman"], FONT_TOTAL, RIGHT, FILL_TOTAL, NUM_FMT)
+    cell_comm(tr_comm, 9, comm_totals["net"], FONT_TOTAL, RIGHT, FILL_TOTAL, NUM_FMT)
+    ws_comm.row_dimensions[tr_comm].height = 24
+
+    # Column widths
+    for c_idx, w in enumerate([12, 16, 14, 14, 14, 14, 14, 14, 14], 1):
+        ws_comm.column_dimensions[openpyxl.utils.get_column_letter(c_idx)].width = w
 
     buf = io.BytesIO()
     wb.save(buf)
