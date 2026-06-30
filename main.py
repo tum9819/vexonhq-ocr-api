@@ -2105,40 +2105,50 @@ CRITICAL RULES — read carefully, these errors are common:
      "08/04/2569" → "2026-04-08"
      "12/05/2566" → "2023-05-12" (different year, double-check)
 
-3. MULTI-PAGE INVOICES — ENGLISH LABEL-BASED TOTALS DETECTION
-   Multi-page invoices (เช่น Makro 3-4 หน้า) show totals on the last page.
+3. MULTI-PAGE INVOICES — LOCATION-SPECIFIC TOTALS DETECTION (Makro pattern)
+   Multi-page invoices (เช่น Makro 2–3 หน้า) show totals on the LAST PAGE.
 
-   **KEY SIGNAL: English bilingual labels** (Makro invoices are bilingual Thai/English).
+   **Makro page layout (last page):**
+   1. Items table (top)
+   2. VAT category breakdown table (middle) ← contains "รวม" (total) row
+   3. Payment section (bottom) ← English/bilingual labels
 
-   **Detection strategy — look for PAYMENT SECTION:**
-   On the LAST PAGE of a multi-page invoice, after all items and VAT breakdowns,
-   you'll find a PAYMENT SECTION with English labels:
-     - "TOTAL" (or "TOTAL AMOUNT") → subtotal before discount
-     - "DISCOUNT" → discount amount
-     - "AMOUNT" (or "NET AMOUNT") → final amount after discount/VAT
+   **EXTRACTION RULES — TWO LOCATIONS:**
 
-   **Makro-specific layout:**
-   Page 1–N: Items table (6–7 columns: line#, SKU, description, qty, unit, price, amount)
-   Page N:
-     → Items + VAT category breakdown table
-     → Then PAYMENT SECTION (2 columns):
-        TOTAL            | 1,125.25  ← extract as subtotal
-        DISCOUNT         |    2.00   ← extract (for discount validation)
-        AMOUNT           | 1,104.25  ← extract as amount
+   **LOCATION 1: Payment Section** (find English labels, 2-column layout, bottom of page)
+   ```
+   TOTAL           | 2,648.50
+   DISCOUNT        | 16.00
+   AMOUNT          | 2,632.50
+   DEPOSIT         | 0.00
+   NET AMOUNT      | 2,632.50
+   ```
+   Extract:
+   - subtotal = amount next to "TOTAL" or "TOTAL AMOUNT" label
+   - discount_amount = amount next to "DISCOUNT" or "ส่วนลด" label (if present)
+   - amount = amount next to final "AMOUNT" or "NET AMOUNT" label (prefer "NET AMOUNT" if both exist)
 
-   **Extraction mapping:**
-   - subtotal = amount shown next to "TOTAL" label
-   - discount_amount = amount shown next to "DISCOUNT" label (if present)
-   - vat = can derive from (subtotal − discount − amount) if needed; or if there's a separate
-           "TAX" / "ภาษี" label before AMOUNT, extract that as vat
-   - amount = amount shown next to final "AMOUNT" or "NET AMOUNT" label
+   **LOCATION 2: VAT Category Breakdown Table** (middle section, 5 columns)
+   ```
+   จำนวนรวม | รหัส ภ.พ. | ราคาสินค้า | ภาษี | รวม
+   20.59    | 1        | 2,125.00  | 0.00 | 2,125.00
+   7        | 2        | 474.30    | 33.20| 507.50
+   รวม      |          | 2,599.30  | 33.20| 2,632.50  ← EXTRACT THIS ROW
+   ```
+   Find the row with "รวม" (total) in the leftmost column.
+   Extract:
+   - vat = amount in the "ภาษี" (tax) column of the "รวม" row
 
-   **Alternative (older Makro format):**
-   Some older Makro invoices may show:
-     รวมเงิน / Subtotal    | 1,076.77
-     ภาษี / VAT            |    27.48
-     รวมทั้งสิ้น / TOTAL   | 1,104.25
-   If you see this Thai-only layout, extract the last row as amount, second-to-last as vat, etc.
+   **Summary of extraction:**
+   1. Find Payment Section → extract subtotal, discount, amount
+   2. Find VAT Breakdown "รวม" row → extract vat (ภาษี column)
+   3. If either section missing → return null for those fields
+
+   **Critical notes:**
+   - Payment section uses ENGLISH labels → VERY RELIABLE signal
+   - VAT Breakdown "รวม" row is the TOTAL row of that table (not a single item)
+   - These two sections may show slightly different subtotal values; use Payment Section's TOTAL
+   - If invoice has only 1 page with no breakdown table → return vat as null
 
    **If you see ONLY items with NO payment section:**
      → Return subtotal, vat, amount as **null**
