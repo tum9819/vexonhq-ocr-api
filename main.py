@@ -2336,8 +2336,8 @@ def _run_gpt_vision(image_bytes: bytes, mime_type: str, ocr_hint: str) -> dict[s
             messages=messages,
             schema=invoice_json_schema(),
             schema_name="invoice",
-            temperature=0.1,
-            max_tokens=4000,  # high-item-count invoices (Makro 20-30 items/page)
+            temperature=0.7,
+            max_tokens=4500,  # high-item-count invoices (Makro 20-30 items/page) + longer explanations
         )
         raw = (resp.choices[0].message.content or "{}").strip()
         return normalize_structured(json.loads(raw))
@@ -2347,8 +2347,8 @@ def _run_gpt_vision(image_bytes: bytes, mime_type: str, ocr_hint: str) -> dict[s
         model=OPENAI_VISION_MODEL,
         messages=messages,
         response_format={"type": "json_object"},
-        temperature=0.1,
-        max_tokens=4000,  # increased for high-item-count invoices (Makro 20-30 items/page)
+        temperature=0.7,
+        max_tokens=4500,  # increased for high-item-count invoices (Makro 20-30 items/page)
     )
 
     raw = (resp.choices[0].message.content or "{}").strip()
