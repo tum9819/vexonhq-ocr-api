@@ -2513,6 +2513,12 @@ def _validate_invoice(parsed: dict[str, Any]) -> list[dict[str, str]]:
                 doc_subtotal = round(float(subtotal), 2)
                 discount = parsed.get("discount") or {}
                 discount_explains_total = False
+                items_match_total = False
+                if total is not None:
+                    try:
+                        items_match_total = abs(items_total - float(total)) <= 1.0
+                    except (TypeError, ValueError):
+                        pass
                 if isinstance(discount, dict) and total is not None:
                     try:
                         whole_disc_amt = discount.get("whole_bill_discount_amount")
@@ -2528,7 +2534,7 @@ def _validate_invoice(parsed: dict[str, Any]) -> list[dict[str, str]]:
                             discount_explains_total = True
                     except (TypeError, ValueError):
                         pass
-                if not discount_explains_total and abs(items_total - doc_subtotal) > 1.0:
+                if not (discount_explains_total or items_match_total) and abs(items_total - doc_subtotal) > 1.0:
                     warnings.append({
                         "severity": "warn",
                         "code": "ITEMS_SUBTOTAL_MISMATCH",

@@ -136,6 +136,35 @@ def test_makro_items_discount_explains_vat_inclusive_item_sum():
     assert "DISCOUNT_CALCULATION_MISMATCH" not in _codes(w)
 
 
+def test_makro_vat_inclusive_items_can_match_amount_without_discount():
+    # Makro item lines can already be VAT-inclusive. When there is no bill-level
+    # discount, items_total matching amount is valid even though subtotal is lower.
+    w = main._validate_invoice({
+        "vendor_name": "Makro", "invoice_no": "068901195415",
+        "subtotal": 4768.60, "vat": 92.90, "amount": 4861.50,
+        "items": [
+            {"amount": 56.00}, {"amount": 45.00}, {"amount": 55.00},
+            {"amount": 88.25}, {"amount": 60.25}, {"amount": 25.00},
+            {"amount": 145.00}, {"amount": 33.00}, {"amount": 57.00},
+            {"amount": 39.00}, {"amount": 29.00}, {"amount": 277.75},
+            {"amount": 186.25}, {"amount": 190.00}, {"amount": 412.00},
+            {"amount": 756.00}, {"amount": 327.00}, {"amount": 131.00},
+            {"amount": 205.00}, {"amount": 99.00}, {"amount": 177.00},
+            {"amount": 330.00}, {"amount": 252.00}, {"amount": 135.00},
+            {"amount": 130.00}, {"amount": 142.00}, {"amount": 229.00},
+            {"amount": 84.00}, {"amount": 87.00}, {"amount": 79.00},
+        ],
+        "discount": {
+            "line_items_discount_pct": None,
+            "whole_bill_discount_amount": None,
+            "whole_bill_discount_pct": None,
+            "note": None,
+        },
+    })
+
+    assert "ITEMS_SUBTOTAL_MISMATCH" not in _codes(w)
+
+
 def test_items_mismatch_no_subtotal_no_crash():
     # subtotal=None → skip check entirely
     w = main._validate_invoice({
