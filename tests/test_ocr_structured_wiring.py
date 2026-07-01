@@ -82,3 +82,25 @@ def test_run_gpt_vision_falls_back_to_json_object_when_disabled(monkeypatch):
     assert out["vendor_name"] == "fallback"
     assert captured["response_format"] == {"type": "json_object"}
     assert captured["has_image"] is True
+
+
+def test_run_gpt_vision_regex_fills_missing_discount_when_totals_present(monkeypatch):
+    def fake_structured(task, *, messages, schema, schema_name="result", model=None, **kw):
+        return _Resp(
+            '{"vendor_name": "Makro", "subtotal": 1076.77, "vat": 27.48, '
+            '"amount": 1104.25, "items": [], '
+            '"discount": {"line_items_discount_pct": null, '
+            '"whole_bill_discount_amount": null, '
+            '"whole_bill_discount_pct": null, "note": null}}'
+        )
+
+    monkeypatch.setattr(main, "openai_chat_structured", fake_structured, raising=False)
+    monkeypatch.setattr(main, "_OCR_STRUCTURED", True, raising=False)
+
+    out = main._run_gpt_vision(
+        b"fakeimagebytes",
+        "image/png",
+        "รวม | | 1,076.77 | 27.48 | 1,104.25\nDISCOUNT 21.00\nNET AMOUNT 1,104.25",
+    )
+
+    assert out["discount"]["whole_bill_discount_amount"] == 21.00

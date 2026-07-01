@@ -114,6 +114,28 @@ def test_items_within_1_baht_tolerance():
     assert "ITEMS_SUBTOTAL_MISMATCH" not in _codes(w)
 
 
+def test_makro_items_discount_explains_vat_inclusive_item_sum():
+    # Makro item lines are VAT-inclusive before the bill discount. The document
+    # subtotal is net goods after discount, so compare items-discount to amount.
+    w = main._validate_invoice({
+        "vendor_name": "Makro", "invoice_no": "068901200049",
+        "subtotal": 1076.77, "vat": 27.48, "amount": 1104.25,
+        "items": [
+            {"amount": 60.25}, {"amount": 39.00}, {"amount": 380.00},
+            {"amount": 205.00}, {"amount": 196.00}, {"amount": 245.00},
+        ],
+        "discount": {
+            "line_items_discount_pct": None,
+            "whole_bill_discount_amount": 21.00,
+            "whole_bill_discount_pct": None,
+            "note": None,
+        },
+    })
+
+    assert "ITEMS_SUBTOTAL_MISMATCH" not in _codes(w)
+    assert "DISCOUNT_CALCULATION_MISMATCH" not in _codes(w)
+
+
 def test_items_mismatch_no_subtotal_no_crash():
     # subtotal=None → skip check entirely
     w = main._validate_invoice({

@@ -2124,7 +2124,7 @@ CRITICAL RULES — read carefully, these errors are common:
    NET AMOUNT      | 2,632.50
    ```
    Extract:
-   - subtotal = amount next to "TOTAL" or "TOTAL AMOUNT" label
+   - payment_total = amount next to "TOTAL" or "TOTAL AMOUNT" label (VAT-inclusive before discount; use for cross-checking, NOT as JSON subtotal when VAT breakdown exists)
    - discount_amount = amount next to "DISCOUNT" or "ส่วนลด" label (if present)
    - amount = amount next to final "AMOUNT" or "NET AMOUNT" label (prefer "NET AMOUNT" if both exist)
 
@@ -2137,17 +2137,18 @@ CRITICAL RULES — read carefully, these errors are common:
    ```
    Find the row with "รวม" (total) in the leftmost column.
    Extract:
+   - subtotal = amount in the "ราคาสินค้า" (goods value, before VAT) column of the "รวม" row
    - vat = amount in the "ภาษี" (tax) column of the "รวม" row
 
    **Summary of extraction:**
-   1. Find Payment Section → extract subtotal, discount, amount
-   2. Find VAT Breakdown "รวม" row → extract vat (ภาษี column)
+   1. Find VAT Breakdown "รวม" row → extract subtotal (ราคาสินค้า) and vat (ภาษี)
+   2. Find Payment Section → extract discount and final amount
    3. If either section missing → return null for those fields
 
    **Critical notes:**
    - Payment section uses ENGLISH labels → VERY RELIABLE signal
    - VAT Breakdown "รวม" row is the TOTAL row of that table (not a single item)
-   - These two sections may show slightly different subtotal values; use Payment Section's TOTAL
+   - Payment TOTAL may be VAT-inclusive before bill discount; do NOT use it as JSON subtotal when VAT breakdown exists
    - If invoice has only 1 page with no breakdown table → return vat as null
 
    **If you see ONLY items with NO payment section:**
@@ -2312,9 +2313,9 @@ def _extract_makro_totals_from_text(ocr_text: str) -> dict[str, float | None]:
     Looks for English labels (TOTAL, DISCOUNT, AMOUNT) and VAT breakdown "รวม" row.
     Returns dict with keys: subtotal, discount_amount, amount, vat.
 
-    CRITICAL: Extract from Payment Section (English labels) with priority.
-    Payment TOTAL = subtotal BEFORE discount (use this, not VAT table's รวม row).
-    VAT table's รวม row = net subtotal AFTER per-item discounts (lower priority).
+    CRITICAL: JSON subtotal follows the app's existing accounting semantics:
+    subtotal + vat = amount. For Makro, that means the VAT table's รวม row
+    goods value, not Payment TOTAL (which is VAT-inclusive before bill discount).
     """
     import re
     result = {"subtotal": None, "discount_amount": None, "amount": None, "vat": None}
@@ -2322,12 +2323,16 @@ def _extract_makro_totals_from_text(ocr_text: str) -> dict[str, float | None]:
     if not ocr_text:
         return result
 
-    # PRIORITY 1: Extract TOTAL from PAYMENT SECTION (English label, most reliable)
-    # Pattern: TOTAL followed by amount (with optional pipes, spaces)
-    m = re.search(r'(?:TOTAL\s+AMOUNT|TOTAL)\s+(?:[\|\s]+)?([0-9,]+\.[0-9]{2})', ocr_text, re.IGNORECASE)
-    if m:
+    # VAT breakdown รวม row: goods subtotal, VAT, final amount.
+    vat_row = re.search(
+        r'รวม\s+\|\s+\|\s+([0-9,]+\.[0-9]{2})\s+\|\s+([0-9,]+\.[0-9]{2})\s+\|\s+([0-9,]+\.[0-9]{2})',
+        ocr_text,
+    )
+    if vat_row:
         try:
-            result["subtotal"] = float(m.group(1).replace(",", ""))
+            result["subtotal"] = float(vat_row.group(1).replace(",", ""))
+            result["vat"] = float(vat_row.group(2).replace(",", ""))
+            result["amount"] = float(vat_row.group(3).replace(",", ""))
         except ValueError:
             pass
 
@@ -2339,7 +2344,8 @@ def _extract_makro_totals_from_text(ocr_text: str) -> dict[str, float | None]:
         except ValueError:
             pass
 
-    # Extract AMOUNT (final amount after discount) - usually same as NET AMOUNT
+    # Extract AMOUNT (final amount after discount) - usually same as NET AMOUNT.
+    # This fills amount when the VAT row was unreadable, or confirms the same value.
     m = re.search(r'(?:NET\s+AMOUNT|จำนวนเงิน|AMOUNT)\s+(?:[\|\s]+)?([0-9,]+\.[0-9]{2})', ocr_text, re.IGNORECASE)
     if m:
         try:
@@ -2347,22 +2353,12 @@ def _extract_makro_totals_from_text(ocr_text: str) -> dict[str, float | None]:
         except ValueError:
             pass
 
-    # PRIORITY 2: Extract VAT from "รวม" row in VAT breakdown table (if not found above)
-    # Pattern: รวม | (empty) | (subtotal) | (vat) | (amount)
-    # Only use this if subtotal wasn't extracted from Payment section
+    # Fallback only: if there is no VAT row, use Payment TOTAL as subtotal.
     if result["subtotal"] is None:
-        m = re.search(r'รวม\s+\|\s+\|\s+[0-9,]+\.[0-9]{2}\s+\|\s+([0-9,]+\.[0-9]{2})', ocr_text)
+        m = re.search(r'(?:TOTAL\s+AMOUNT|TOTAL)\s+(?:[\|\s]+)?([0-9,]+\.[0-9]{2})', ocr_text, re.IGNORECASE)
         if m:
             try:
-                result["vat"] = float(m.group(1).replace(",", ""))
-            except ValueError:
-                pass
-    else:
-        # If we have subtotal from Payment section, extract VAT from VAT table
-        m = re.search(r'รวม\s+\|\s+\|\s+[0-9,]+\.[0-9]{2}\s+\|\s+([0-9,]+\.[0-9]{2})', ocr_text)
-        if m:
-            try:
-                result["vat"] = float(m.group(1).replace(",", ""))
+                result["subtotal"] = float(m.group(1).replace(",", ""))
             except ValueError:
                 pass
 
@@ -2424,17 +2420,35 @@ def _run_gpt_vision(image_bytes: bytes, mime_type: str, ocr_hint: str) -> dict[s
             cleaned = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
             parsed = json.loads(cleaned)
 
-    # FALLBACK: if GPT-4o returned null for totals, try regex on tesseract text
-    if (parsed.get("subtotal") is None or parsed.get("vat") is None or
-        parsed.get("amount") is None) and ocr_hint:
+    # FALLBACK: if GPT-4o returned null/wrong Makro totals or missed bill-level
+    # discount, try regex on tesseract text.
+    discount = parsed.get("discount") or {}
+    missing_bill_discount = (
+        not isinstance(discount, dict)
+        or (
+            discount.get("whole_bill_discount_amount") is None
+            and discount.get("whole_bill_discount_pct") is None
+        )
+    )
+    missing_totals = (
+        parsed.get("subtotal") is None
+        or parsed.get("vat") is None
+        or parsed.get("amount") is None
+    )
+    if (missing_totals or missing_bill_discount) and ocr_hint:
         makro_totals = _extract_makro_totals_from_text(ocr_hint)
-        if makro_totals["subtotal"] is not None:
+        has_vat_breakdown = (
+            makro_totals["subtotal"] is not None
+            and makro_totals["vat"] is not None
+            and makro_totals["amount"] is not None
+        )
+        if (missing_totals or has_vat_breakdown) and makro_totals["subtotal"] is not None:
             parsed["subtotal"] = makro_totals["subtotal"]
-        if makro_totals["vat"] is not None:
+        if (missing_totals or has_vat_breakdown) and makro_totals["vat"] is not None:
             parsed["vat"] = makro_totals["vat"]
-        if makro_totals["amount"] is not None:
+        if (missing_totals or has_vat_breakdown) and makro_totals["amount"] is not None:
             parsed["amount"] = makro_totals["amount"]
-        if makro_totals["discount_amount"] is not None:
+        if missing_bill_discount and makro_totals["discount_amount"] is not None:
             # merge into existing discount object
             if parsed.get("discount") is None:
                 parsed["discount"] = {}
@@ -2497,7 +2511,24 @@ def _validate_invoice(parsed: dict[str, Any]) -> list[dict[str, str]]:
             if amounts:
                 items_total = round(sum(amounts), 2)
                 doc_subtotal = round(float(subtotal), 2)
-                if abs(items_total - doc_subtotal) > 1.0:
+                discount = parsed.get("discount") or {}
+                discount_explains_total = False
+                if isinstance(discount, dict) and total is not None:
+                    try:
+                        whole_disc_amt = discount.get("whole_bill_discount_amount")
+                        whole_disc_pct = discount.get("whole_bill_discount_pct")
+                        discount_amount = 0.0
+                        if whole_disc_amt is not None:
+                            discount_amount += float(whole_disc_amt)
+                        if whole_disc_pct is not None:
+                            pct_amount = items_total * (float(whole_disc_pct) / 100.0)
+                            if whole_disc_amt is None or abs(pct_amount - float(whole_disc_amt)) > 1.0:
+                                discount_amount += pct_amount
+                        if discount_amount and abs((items_total - discount_amount) - float(total)) <= 1.0:
+                            discount_explains_total = True
+                    except (TypeError, ValueError):
+                        pass
+                if not discount_explains_total and abs(items_total - doc_subtotal) > 1.0:
                     warnings.append({
                         "severity": "warn",
                         "code": "ITEMS_SUBTOTAL_MISMATCH",
@@ -2539,55 +2570,74 @@ def _validate_invoice(parsed: dict[str, Any]) -> list[dict[str, str]]:
                     subtotal_f = float(subtotal)
                     vat_f = float(vat)
                     total_f = float(total)
+                    subtotal_plus_vat_matches = abs((subtotal_f + vat_f) - total_f) <= 0.05
 
-                    # Step 1: Apply per-item discount if present
-                    # Check if subtotal is already net of line discounts (sum(item.amount) == subtotal)
-                    is_subtotal_net = False
+                    items_discount_matches_total = False
                     try:
                         items_list = parsed.get("items") or []
                         amounts = [float(it["amount"]) for it in items_list if isinstance(it, dict) and it.get("amount") is not None]
-                        if amounts and abs(sum(amounts) - subtotal_f) <= 1.0:
-                            is_subtotal_net = True
+                        items_total = sum(amounts)
+                        discount_amount = 0.0
+                        if whole_disc_amt is not None:
+                            discount_amount += float(whole_disc_amt)
+                        if whole_disc_pct is not None:
+                            pct_amount = items_total * (float(whole_disc_pct) / 100.0)
+                            if whole_disc_amt is None or abs(pct_amount - float(whole_disc_amt)) > 1.0:
+                                discount_amount += pct_amount
+                        if amounts and discount_amount and abs((items_total - discount_amount) - total_f) <= 1.0:
+                            items_discount_matches_total = True
                     except (TypeError, ValueError):
                         pass
 
-                    if line_disc_pct is not None and not is_subtotal_net:
-                        net_after_line = subtotal_f * (1.0 - float(line_disc_pct) / 100.0)
-                    else:
-                        net_after_line = subtotal_f
+                    if not (subtotal_plus_vat_matches and items_discount_matches_total):
+                        # Step 1: Apply per-item discount if present
+                        # Check if subtotal is already net of line discounts (sum(item.amount) == subtotal)
+                        is_subtotal_net = False
+                        try:
+                            items_list = parsed.get("items") or []
+                            amounts = [float(it["amount"]) for it in items_list if isinstance(it, dict) and it.get("amount") is not None]
+                            if amounts and abs(sum(amounts) - subtotal_f) <= 1.0:
+                                is_subtotal_net = True
+                        except (TypeError, ValueError):
+                            pass
 
-                    # Step 2: Apply whole-bill discount
-                    # Precedence: If both amt and pct are provided, check if they represent the same value.
-                    # If they match, we use amt to avoid double-counting. If they differ, we apply both (additive).
-                    net_after_bill = net_after_line
-                    if whole_disc_amt is not None and whole_disc_pct is not None:
-                        pct_amt = net_after_line * (float(whole_disc_pct) / 100.0)
-                        if abs(float(whole_disc_amt) - pct_amt) <= 1.0:
-                            net_after_bill = net_after_line - float(whole_disc_amt)
+                        if line_disc_pct is not None and not is_subtotal_net:
+                            net_after_line = subtotal_f * (1.0 - float(line_disc_pct) / 100.0)
                         else:
-                            net_after_bill = net_after_line - float(whole_disc_amt) - pct_amt
-                    elif whole_disc_amt is not None:
-                        net_after_bill = net_after_line - float(whole_disc_amt)
-                    elif whole_disc_pct is not None:
-                        net_after_bill = net_after_line * (1.0 - float(whole_disc_pct) / 100.0)
+                            net_after_line = subtotal_f
 
-                    # Step 3: Expected final total
-                    expected_final = net_after_bill + vat_f
-                    expected_rounded = round(expected_final, 2)
-                    actual_rounded = round(total_f, 2)
+                        # Step 2: Apply whole-bill discount
+                        # Precedence: If both amt and pct are provided, check if they represent the same value.
+                        # If they match, we use amt to avoid double-counting. If they differ, we apply both (additive).
+                        net_after_bill = net_after_line
+                        if whole_disc_amt is not None and whole_disc_pct is not None:
+                            pct_amt = net_after_line * (float(whole_disc_pct) / 100.0)
+                            if abs(float(whole_disc_amt) - pct_amt) <= 1.0:
+                                net_after_bill = net_after_line - float(whole_disc_amt)
+                            else:
+                                net_after_bill = net_after_line - float(whole_disc_amt) - pct_amt
+                        elif whole_disc_amt is not None:
+                            net_after_bill = net_after_line - float(whole_disc_amt)
+                        elif whole_disc_pct is not None:
+                            net_after_bill = net_after_line * (1.0 - float(whole_disc_pct) / 100.0)
 
-                    # Tolerance: 1 baht (rounding errors in multi-stage discount)
-                    if abs(expected_rounded - actual_rounded) > 1.0:
-                        warnings.append({
-                            "severity": "warn",
-                            "code": "DISCOUNT_CALCULATION_MISMATCH",
-                            "message": (
-                                f"ยอดรวมไม่ตรง (เมื่อคำนวณส่วนลด): "
-                                f"คาดหวัง {expected_rounded:,.2f} แต่เอกสาร {actual_rounded:,.2f} "
-                                f"— ตรวจสอบ ส่วนลด {line_disc_pct or whole_disc_amt or whole_disc_pct}"
-                            ),
-                            "field": "discount",
-                        })
+                        # Step 3: Expected final total
+                        expected_final = net_after_bill + vat_f
+                        expected_rounded = round(expected_final, 2)
+                        actual_rounded = round(total_f, 2)
+
+                        # Tolerance: 1 baht (rounding errors in multi-stage discount)
+                        if abs(expected_rounded - actual_rounded) > 1.0:
+                            warnings.append({
+                                "severity": "warn",
+                                "code": "DISCOUNT_CALCULATION_MISMATCH",
+                                "message": (
+                                    f"ยอดรวมไม่ตรง (เมื่อคำนวณส่วนลด): "
+                                    f"คาดหวัง {expected_rounded:,.2f} แต่เอกสาร {actual_rounded:,.2f} "
+                                    f"— ตรวจสอบ ส่วนลด {line_disc_pct or whole_disc_amt or whole_disc_pct}"
+                                ),
+                                "field": "discount",
+                            })
                 except (TypeError, ValueError):
                     pass
     except Exception:
@@ -2827,6 +2877,35 @@ def _compute_backfill(existing: dict[str, Any], parsed: dict[str, Any]) -> dict[
     return out
 
 
+def _merge_ocr_json(existing_ocr: Any, parsed: dict[str, Any]) -> dict[str, Any]:
+    """Merge summary-page OCR fields into stored ocr_json without replacing items.
+
+    Multi-page Makro invoices often have real items on page 1 and totals/discounts
+    on page 2. Keep page-1 items as the canonical review payload, but backfill
+    scalar totals and discount fields from the summary page for validation/UI.
+    """
+    out = dict(existing_ocr) if isinstance(existing_ocr, dict) else {}
+    for field in ("merchant_tax_id", "bill_date", "due_date",
+                  "subtotal", "vat", "amount", "payment_type", "notes"):
+        if out.get(field) in (None, "") and parsed.get(field) not in (None, ""):
+            out[field] = parsed.get(field)
+
+    parsed_discount = parsed.get("discount")
+    if isinstance(parsed_discount, dict):
+        existing_discount = out.get("discount")
+        merged_discount = dict(existing_discount) if isinstance(existing_discount, dict) else {}
+        for key in ("line_items_discount_pct", "whole_bill_discount_amount",
+                    "whole_bill_discount_pct", "note"):
+            if merged_discount.get(key) in (None, "") and parsed_discount.get(key) not in (None, ""):
+                merged_discount[key] = parsed_discount.get(key)
+        if merged_discount:
+            out["discount"] = merged_discount
+
+    if "items" not in out and isinstance(parsed.get("items"), list):
+        out["items"] = parsed.get("items")
+    return out
+
+
 def _save_invoice(
     parsed: dict[str, Any],
     ocr_text: str,
@@ -3001,6 +3080,7 @@ def _save_invoice(
         if not existing.get("batch_id"):
             backfill["batch_id"] = batch_id
         backfill.update(_compute_backfill(existing, parsed))
+        backfill["ocr_json"] = _merge_ocr_json(existing.get("ocr_json"), parsed)
 
         if backfill:
             sb.table("vendor_bills").update(backfill).eq("id", invoice_id).execute()
@@ -3105,6 +3185,8 @@ _PLACEHOLDER_NAMES = {
     "n/a", "na", "none", "null",
     "unspecified", "unknown", "blank",
     "รหัส ภ.พ.", "ภ.พ.", "vat code", "tax code", "vat", "tax",
+    "จำนวนชิ้น", "ราคาสินค้า", "ภาษีมูลค่าเพิ่ม", "รวม",
+    "quantity", "goods value", "amount", "total",
     "-", "—", "_",
 }
 
@@ -3337,6 +3419,9 @@ def _revalidate_bill(invoice_id: str) -> list[dict[str, str]]:
         "amount": bill.get("amount"),
         "items": items_res.data or [],
     }
+    ocr_json = bill.get("ocr_json") if isinstance(bill.get("ocr_json"), dict) else {}
+    if isinstance(ocr_json.get("discount"), dict):
+        parsed_like["discount"] = ocr_json["discount"]
 
     # Re-run validation against merged bill state
     fresh_warnings = _validate_invoice(parsed_like)
