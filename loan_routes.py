@@ -57,8 +57,9 @@ def loan_detail(lender: str):
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT id::text, txn_date, direction, amount, source_type,
-                       description
+                SELECT id::text, txn_date, direction,
+                       COALESCE(loan_amount_override, amount) AS amount,
+                       source_type, description
                 FROM public.bank_statement_entries
                 WHERE COALESCE(NULLIF(btrim(notes), ''), 'ไม่ระบุผู้ให้ยืม') = %s
                   AND source_type IN ('loan_in', 'loan_repayment')
