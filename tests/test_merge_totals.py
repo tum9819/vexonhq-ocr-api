@@ -46,6 +46,15 @@ def test_is_real_item_filters_makro_vat_summary_label():
     }) is False
 
 
+def test_is_real_item_filters_makro_amount_summary_label():
+    assert main._is_real_item({
+        "product_name": "จำนวนเงิน",
+        "quantity": 41.45,
+        "unit_price": 4023.25,
+        "amount": 4023.25,
+    }) is False
+
+
 def test_extract_makro_totals_prefers_vat_row_subtotal_semantics():
     text = """
     รวม | | 1,076.77 | 27.48 | 1,104.25

@@ -3185,7 +3185,7 @@ _PLACEHOLDER_NAMES = {
     "n/a", "na", "none", "null",
     "unspecified", "unknown", "blank",
     "รหัส ภ.พ.", "ภ.พ.", "vat code", "tax code", "vat", "tax",
-    "จำนวนชิ้น", "ราคาสินค้า", "ภาษีมูลค่าเพิ่ม", "รวม",
+    "จำนวนชิ้น", "จำนวนเงิน", "ราคาสินค้า", "ภาษีมูลค่าเพิ่ม", "รวม",
     "quantity", "goods value", "amount", "total",
     "-", "—", "_",
 }
