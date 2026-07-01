@@ -2469,7 +2469,7 @@ def _validate_invoice(parsed: dict[str, Any]) -> list[dict[str, str]]:
         warnings.append({"severity": "warn", "code": "MISSING_VENDOR",
                          "message": "ไม่พบชื่อผู้ขาย", "field": "vendor_name"})
 
-    if not parsed.get("invoice_no"):
+    if not parsed.get("invoice_no") and not parsed.get("invoice_no_absent"):
         warnings.append({"severity": "warn", "code": "MISSING_INVOICE_NO",
                          "message": "ไม่พบเลขที่ใบกำกับ", "field": "invoice_no"})
 
@@ -3428,6 +3428,8 @@ def _revalidate_bill(invoice_id: str) -> list[dict[str, str]]:
     ocr_json = bill.get("ocr_json") if isinstance(bill.get("ocr_json"), dict) else {}
     if isinstance(ocr_json.get("discount"), dict):
         parsed_like["discount"] = ocr_json["discount"]
+    if ocr_json.get("invoice_no_absent") is True:
+        parsed_like["invoice_no_absent"] = True
 
     # Re-run validation against merged bill state
     fresh_warnings = _validate_invoice(parsed_like)

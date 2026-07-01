@@ -57,6 +57,17 @@ def test_missing_vendor_and_invoice_are_warn():
     assert "MISSING_INVOICE_NO" in _codes(w)
 
 
+def test_explicitly_absent_invoice_no_does_not_warn():
+    w = main._validate_invoice({
+        "vendor_name": "ร้านแก๊ส",
+        "invoice_no": None,
+        "invoice_no_absent": True,
+        "amount": 900,
+    })
+
+    assert "MISSING_INVOICE_NO" not in _codes(w)
+
+
 def test_nonnumeric_amounts_do_not_crash():
     w = main._validate_invoice({"vendor_name": "V", "invoice_no": "INV-1",
                                 "subtotal": "abc", "vat": "x", "amount": 100})
