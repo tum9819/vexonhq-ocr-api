@@ -24,6 +24,8 @@ from uuid import UUID
 import psycopg2
 from fastapi import APIRouter, Query
 
+from bkk import bkk_today
+
 try:
     from main import get_db_conn  # type: ignore
 except ImportError:
@@ -104,7 +106,7 @@ def inventory_forecast(
     3. Predict: next_order_date = last_purchase + avg_interval
     4. Flag urgency: overdue / urgent / soon / ok
     """
-    today = date.today()
+    today = bkk_today()
     cutoff = today - timedelta(days=lookback_months * 30)
 
     conn = get_db_conn()
@@ -397,7 +399,7 @@ def ai_order_advice(
     """
     from datetime import timedelta as _td
 
-    today = date.today()
+    today = bkk_today()
     cutoff = today - _td(weeks=lookback_weeks)
 
     conn = get_db_conn()
@@ -618,7 +620,7 @@ def ai_order_advice_backtest(
     """F8 — measure how trustworthy /inventory/ai-order-advice is: train the
     day-of-week sales pattern on the older `train_weeks`, then score it against
     the held-out newer `test_weeks` (MAPE + best-day hit). Read-only/advisory."""
-    today = date.today()
+    today = bkk_today()
     test_start = today - timedelta(weeks=test_weeks)
     train_start = test_start - timedelta(weeks=train_weeks)
 

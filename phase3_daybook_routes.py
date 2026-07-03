@@ -19,6 +19,8 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query
 
+from bkk import bkk_today
+
 try:
     from main import get_db_conn  # type: ignore
 except ImportError:
@@ -68,7 +70,7 @@ def _rows_to_dicts(cur) -> list[dict]:
 
 def _default_range() -> tuple[date, date]:
     """Default: this month from day 1 to today."""
-    today = date.today()
+    today = bkk_today()
     return today.replace(day=1), today
 
 

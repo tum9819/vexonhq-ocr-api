@@ -23,6 +23,8 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
+from bkk import bkk_today
+
 import psycopg2
 import psycopg2.extras
 
@@ -69,7 +71,7 @@ MONTH_NAMES_TH = [
 def _month_bounds(month: Optional[str]):
     """Return (start_date, end_date) for a YYYY-MM string."""
     if not month:
-        today = date.today()
+        today = bkk_today()
         month = f"{today.year}-{today.month:02d}"
     try:
         y, m = int(month[:4]), int(month[5:7])

@@ -29,6 +29,8 @@ import psycopg2
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
+from bkk import bkk_today
+
 from auth_routes import _require_admin_role  # admin-only gate for money-mutation endpoints (audit AUD-TAX-02)
 
 try:
@@ -78,7 +80,7 @@ def _rows_to_dicts(cur) -> list[dict]:
 def _month_bounds(month: Optional[str]):
     """Return (start, end) date for a YYYY-MM string."""
     if not month:
-        today = date.today()
+        today = bkk_today()
         start = today.replace(day=1)
     else:
         try:
@@ -191,7 +193,7 @@ def update_bill_payment(bill_id: str, body: BillPaymentPatch, _admin: dict = Dep
     # Auto-set paid_date to today when marking paid/credit_card
     paid_date = body.paid_date
     if paid_date is None and body.payment_status in ("paid", "credit_card"):
-        paid_date = date.today()
+        paid_date = bkk_today()
     # Clear paid_date when marking unpaid
     if body.payment_status == "unpaid":
         paid_date = None
@@ -279,7 +281,7 @@ def bills_payment_line_alert():
     """
     from line_bot_routes import _push_text  # noqa: PLC0415
 
-    today = date.today()
+    today = bkk_today()
     cutoff = today - timedelta(days=7)
 
     conn = get_db_conn()

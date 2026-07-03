@@ -52,6 +52,7 @@ from pydantic import BaseModel
 from auth_routes import _require_admin_role  # admin-only gate for money-mutation endpoints (audit AUD-TAX-02)
 
 from llm import get_openai, openai_chat  # OpenAI factory + logged chat wrapper
+from bkk import bkk_today
 
 try:
     from main import (  # type: ignore
@@ -228,7 +229,7 @@ def _upload_slip_to_storage(
     """Upload to Supabase Storage under slips/YYYY-MM/uuid.ext. Returns public URL."""
     sb = get_supabase()
     bucket = SUPABASE_STORAGE_BUCKET
-    today = date.today().strftime("%Y-%m")
+    today = bkk_today().strftime("%Y-%m")
     ext = os.path.splitext(file_name)[1] or ".jpg"
     storage_path = f"slips/{today}/{uuid.uuid4()}{ext}"
 

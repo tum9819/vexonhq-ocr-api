@@ -125,7 +125,9 @@ def get_openai() -> OpenAI:
     if _openai_client is None:
         if not OPENAI_API_KEY:
             raise RuntimeError("OPENAI_API_KEY must be set")
-        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        # Client-level cap: without it the SDK default (~600s) can hang a cron
+        # job (e.g. the 06:00 LINE digest) for 10 minutes per call.
+        _openai_client = OpenAI(api_key=OPENAI_API_KEY, timeout=60.0)
     return _openai_client
 
 

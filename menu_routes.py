@@ -25,6 +25,8 @@ import psycopg2
 from dateutil.relativedelta import relativedelta
 from fastapi import APIRouter, HTTPException, Query
 
+from bkk import bkk_today
+
 try:
     from main import get_db_conn  # type: ignore
 except ImportError:
@@ -75,7 +77,7 @@ def _rows_to_dicts(cur_or_conn, sql=None, params=None) -> list[dict]:
 
 def _month_bounds(month: Optional[str]):
     if not month:
-        today = date.today()
+        today = bkk_today()
         start = today.replace(day=1)
     else:
         try:
@@ -266,7 +268,7 @@ def menu_trends(
     if not names:
         raise HTTPException(400, "item_names required")
 
-    today = date.today()
+    today = bkk_today()
     end = (today.replace(day=28) + timedelta(days=4)).replace(day=1)
     start = end
     for _ in range(months):
@@ -313,7 +315,7 @@ def pos_dow_stats(
     Returns per-DOW averages + per-month per-DOW breakdown for heatmap.
     PostgreSQL DOW: 0=Sunday … 6=Saturday
     """
-    today = date.today()
+    today = bkk_today()
     end = (today.replace(day=28) + timedelta(days=4)).replace(day=1)
     start = end
     for _ in range(months):
@@ -443,7 +445,7 @@ def get_hourly_stats(
     try:
         with conn.cursor() as cur:
             # Date window
-            end   = date.today()
+            end   = bkk_today()
             start = (end.replace(day=1) - timedelta(days=1)).replace(day=1)
             for _ in range(months - 1):
                 start = (start.replace(day=1) - timedelta(days=1)).replace(day=1)
@@ -524,7 +526,7 @@ def get_channel_stats(
     try:
         with conn.cursor() as cur:
             # Date window
-            end   = date.today()
+            end   = bkk_today()
             start = (end.replace(day=1) - timedelta(days=1)).replace(day=1)
             for _ in range(months - 1):
                 start = (start.replace(day=1) - timedelta(days=1)).replace(day=1)
@@ -658,7 +660,7 @@ def get_staff_stats(
     try:
         with conn.cursor() as cur:
             # Date window
-            end   = date.today()
+            end   = bkk_today()
             start = (end.replace(day=1) - timedelta(days=1)).replace(day=1)
             for _ in range(months - 1):
                 start = (start.replace(day=1) - timedelta(days=1)).replace(day=1)
@@ -793,7 +795,7 @@ def get_table_stats(
     try:
         with conn.cursor() as cur:
             # Date window
-            end   = date.today()
+            end   = bkk_today()
             start = (end.replace(day=1) - timedelta(days=1)).replace(day=1)
             for _ in range(months - 1):
                 start = (start.replace(day=1) - timedelta(days=1)).replace(day=1)
@@ -909,7 +911,7 @@ def get_pos_overview(
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            today      = date.today()
+            today      = bkk_today()
             this_start = today.replace(day=1)
             last_end   = this_start
             last_start = (last_end - timedelta(days=1)).replace(day=1)
@@ -1107,7 +1109,7 @@ def delivery_summary(months: int = 6, branch: str = "thawi_watthana"):
     """
     conn = get_db_conn()
     try:
-        since = date.today().replace(day=1) - relativedelta(months=months - 1)
+        since = bkk_today().replace(day=1) - relativedelta(months=months - 1)
 
         # ── Per-platform KPIs ──
         platform_sql = """
@@ -1237,7 +1239,7 @@ def revenue_breakdown(months: int = 6, branch: str = "thawi_watthana"):
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            since = date.today().replace(day=1) - relativedelta(months=months - 1)
+            since = bkk_today().replace(day=1) - relativedelta(months=months - 1)
 
             # ── Per-source totals ──
             cur.execute(
@@ -1340,7 +1342,7 @@ def alerts_summary(branch: str = "thawi_watthana"):
     """
     conn = get_db_conn()
     try:
-        today = date.today()
+        today = bkk_today()
         this_month = today.strftime("%Y-%m")
         alerts: list[dict] = []
 
@@ -1566,7 +1568,7 @@ def scorecard(month: str = "", branch: str = "thawi_watthana"):
     Returns 8 KPIs each with value, label, status (good/warning/danger), vs_last_month.
     """
     if not month:
-        month = date.today().strftime("%Y-%m")
+        month = bkk_today().strftime("%Y-%m")
 
     # Compute previous month
     y, m = int(month[:4]), int(month[5:7])
@@ -1834,7 +1836,7 @@ def pos_menu_engineering(
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            end   = date.today().replace(day=1)
+            end   = bkk_today().replace(day=1)
             start = end - relativedelta(months=months)
 
             # ── Check item-level data exists ──────────────────────────────
@@ -2010,7 +2012,7 @@ def pos_payments(
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            end   = date.today().replace(day=1)
+            end   = bkk_today().replace(day=1)
             start = end - relativedelta(months=months)
 
             # ── Payment method breakdown ──────────────────────────────────
@@ -2192,8 +2194,8 @@ def pos_heatmap(
 ):
     conn = get_db_conn()
     try:
-        start = (date.today().replace(day=1) - relativedelta(months=months - 1))
-        end   = date.today()
+        start = (bkk_today().replace(day=1) - relativedelta(months=months - 1))
+        end   = bkk_today()
 
         branch_filter = "AND b.branch_code = %(branch)s" if branch else ""
 
@@ -2284,7 +2286,7 @@ def pos_item_trend(
 ):
     conn = get_db_conn()
     try:
-        end        = date.today()
+        end        = bkk_today()
         start      = (end.replace(day=1) - relativedelta(months=months - 1))
         # previous period (same length) for MoM comparison
         prev_end   = start - timedelta(days=1)
@@ -2453,7 +2455,7 @@ def pos_bill_analysis(
 ):
     conn = get_db_conn()
     try:
-        end   = date.today()
+        end   = bkk_today()
         start = (end.replace(day=1) - relativedelta(months=months - 1))
 
         branch_filter = "AND branch_code = %(branch)s" if branch else ""
@@ -2616,7 +2618,7 @@ def pos_categories(
 
     conn = get_db_conn()
     try:
-        end   = date.today()
+        end   = bkk_today()
         start = end - relativedelta(months=months)
 
         branch_sql = "AND b.branch_code = %(branch)s" if branch else ""
@@ -2738,7 +2740,7 @@ def pos_calendar(
     import calendar
     from datetime import date
 
-    today = date.today()
+    today = bkk_today()
     if not year:  year  = today.year
     if not month: month = today.month
 
@@ -2868,7 +2870,7 @@ def pos_combos(
 
     conn = get_db_conn()
     try:
-        end   = date.today()
+        end   = bkk_today()
         start = end - relativedelta(months=months)
 
         branch_sql_b = "AND b.branch_code = %(branch)s" if branch else ""
@@ -3788,7 +3790,7 @@ def pos_goals(
 ):
     import calendar as cal
     from datetime import date
-    today = date.today()
+    today = bkk_today()
     # Build first_day/days_in_month inside the try so a malformed month (e.g.
     # '2026-13' or '0000-05') falls back to today instead of an uncaught 500 —
     # date()/monthrange() raise ValueError on month>12 or year 0.
@@ -3915,7 +3917,7 @@ def pos_voids(
     branch: str = Query(""),
 ):
     from datetime import date, timedelta
-    today = date.today()
+    today = bkk_today()
     start = (today.replace(day=1) - timedelta(days=1)).replace(day=1)
     # go back `months` months from start of current month
     for _ in range(months - 1):
@@ -4054,7 +4056,7 @@ def pos_food_cost(
     branch: str = Query(""),
 ):
     from datetime import date, timedelta
-    today = date.today()
+    today = bkk_today()
     start = today.replace(day=1)
     for _ in range(months - 1):
         start = (start - timedelta(days=1)).replace(day=1)
@@ -4193,7 +4195,7 @@ def pos_shifts(
     branch: str = Query(""),
 ):
     from datetime import date, timedelta
-    today = date.today()
+    today = bkk_today()
     start = today.replace(day=1)
     for _ in range(months - 1):
         start = (start - timedelta(days=1)).replace(day=1)
@@ -4369,7 +4371,7 @@ def pos_prep_forecast(
 ):
     from collections import defaultdict as _dd
 
-    today  = date.today()
+    today  = bkk_today()
     cutoff = today - timedelta(weeks=lookback_weeks)
 
     conn = get_db_conn()

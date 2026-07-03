@@ -46,6 +46,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from auth_routes import _require_admin_role  # admin-only gate for money-mutation endpoints (audit AUD-TAX-02)
+from bkk import bkk_today
 
 # Reuse main.get_db_conn (same pattern as pos_import.py + phase2_routes.py)
 try:
@@ -708,7 +709,7 @@ def _thai_short_date(d):
 
 
 def _query_due_bills(days_ahead: int = 3):
-    today = date.today()
+    today = bkk_today()
     date_from = today + timedelta(days=1)
     date_to   = today + timedelta(days=days_ahead)
     sql = (
@@ -734,7 +735,7 @@ def _query_due_bills(days_ahead: int = 3):
 
 
 def _build_due_reminder_message(rows):
-    today = date.today()
+    today = bkk_today()
     result_lines = ["⚠️ บิลใกล้ครบกำหนด"]
     total_amount = 0.0
     for r in rows:

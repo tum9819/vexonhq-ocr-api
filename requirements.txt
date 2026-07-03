@@ -1,9 +1,11 @@
-fastapi
-uvicorn
-pytesseract
-opencv-python-headless
-numpy
-Pillow
+# Upper bounds keep a Coolify rebuild from silently pulling a breaking major
+# (audit 2026-07-03). Floors = versions the offline test suite runs against.
+fastapi>=0.133,<1.0
+uvicorn>=0.41,<1.0
+pytesseract>=0.3.13,<0.4
+opencv-python-headless>=4.13,<5
+numpy>=2.4,<3
+Pillow>=12,<13
 pypdfium2>=4.30.0
 pdfplumber>=0.11.0
 openai>=1.40.0

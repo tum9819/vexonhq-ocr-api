@@ -19,6 +19,8 @@ import psycopg2.extras
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from bkk import bkk_today
+
 log = logging.getLogger("vexonhq-budget")
 router = APIRouter(prefix="/budget", tags=["budget"])
 
@@ -168,7 +170,7 @@ def run_budget_alert_check(month: Optional[str] = None, branch_code: str = "thaw
     Returns summary dict.
     """
     if not month:
-        month = date.today().strftime("%Y-%m")
+        month = bkk_today().strftime("%Y-%m")
 
     conn = _get_db()
     try:

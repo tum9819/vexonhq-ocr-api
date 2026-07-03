@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from auth_routes import _require_admin_role  # admin-only gate for money-mutation endpoints (audit AUD-TAX-02)
+from bkk import bkk_today
 
 try:
     from main import get_db_conn  # type: ignore
@@ -212,7 +213,7 @@ def list_chips(
 def quick_summary():
     """Totals for dashboard cards.
     Returns: today, week, month totals by direction."""
-    today = date.today()
+    today = bkk_today()
     week_start = today - timedelta(days=today.weekday())
     month_start = today.replace(day=1)
 
@@ -264,7 +265,7 @@ def create_entry(body: QuickEntryCreate, _admin: dict = Depends(_require_admin_r
         # allow custom payment methods but warn
         logger.info("Unknown payment_method: %s", body.payment_method)
 
-    entry_date = body.entry_date or date.today()
+    entry_date = body.entry_date or bkk_today()
     label = body.label.strip()[:120]   # bounded length
 
     conn = get_db_conn()

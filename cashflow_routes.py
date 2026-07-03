@@ -19,6 +19,8 @@ from typing import Optional
 import psycopg2
 from fastapi import APIRouter, Query
 
+from bkk import bkk_today
+
 router = APIRouter(prefix="/cashflow", tags=["cashflow"])
 
 
@@ -48,7 +50,7 @@ def cashflow_forecast(days: int = Query(30, ge=7, le=90, description="Forecast w
 
     Also returns `ap_due_entries`: the specific AP bills used in the forecast.
     """
-    today = date.today()
+    today = bkk_today()
     lookback_start = today - timedelta(days=30)
 
     conn = get_db_conn()
@@ -183,7 +185,7 @@ def cashflow_forecast(days: int = Query(30, ge=7, le=90, description="Forecast w
 @router.get("/summary")
 def cashflow_summary():
     """Quick cash position: this month income/expense + pending AP."""
-    today = date.today()
+    today = bkk_today()
     month_start = date(today.year, today.month, 1)
 
     conn = get_db_conn()

@@ -43,6 +43,8 @@ from llm import get_openai, openai_chat, openai_chat_structured  # OpenAI client
 from PIL import Image
 from pydantic import BaseModel
 from supabase import Client, create_client
+
+from bkk import bkk_today
 from pos_import import router as pos_router
 from stock_in_routes import router as stock_in_router
 from phase2_routes import router as phase2_router
@@ -1241,7 +1243,7 @@ def invoice_items_monthly_by_sku(
     """
     if not month:
         # Default to current month (Asia/Bangkok local — Coolify TZ=Asia/Bangkok)
-        month = date.today().strftime("%Y-%m")
+        month = bkk_today().strftime("%Y-%m")
 
     try:
         year, mon = month.split("-")
@@ -2715,7 +2717,7 @@ def _upload_to_storage(image_bytes: bytes, file_name: str, mime_type: Optional[s
     """Upload to Supabase Storage. Returns (public_url, storage_path)."""
     sb = get_supabase()
     bucket = SUPABASE_STORAGE_BUCKET
-    today = date.today().strftime("%Y-%m")
+    today = bkk_today().strftime("%Y-%m")
     ext = os.path.splitext(file_name)[1] or ".bin"
     storage_path = f"invoices/{today}/{uuid.uuid4()}{ext}"
 

@@ -43,6 +43,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from zoneinfo import ZoneInfo
 
 from auth_routes import _require_admin_role
+from bkk import bkk_today
 
 # Reuse main.get_db_conn (same pattern as pos_import.py)
 try:
@@ -92,7 +93,7 @@ def _serialize_row(row: dict) -> dict:
 def _month_start(month: Optional[str]) -> date:
     """Parse 'YYYY-MM' string to date. Defaults to current month if None."""
     if not month:
-        today = date.today()
+        today = bkk_today()
         return today.replace(day=1)
     try:
         return datetime.strptime(month + "-01", "%Y-%m-%d").date()
@@ -1188,7 +1189,7 @@ def category_trends(
     from datetime import date as _date
     from collections import defaultdict
 
-    today = _date.today()
+    today = bkk_today()
     # end = first day of next month (exclusive)
     end = (_date(today.year, today.month, 1).replace(day=28) +
            __import__('datetime').timedelta(days=4)).replace(day=1)

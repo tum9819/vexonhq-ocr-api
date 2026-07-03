@@ -16,6 +16,8 @@ from typing import Optional
 import psycopg2
 from fastapi import APIRouter, HTTPException, Query
 
+from bkk import bkk_today
+
 router = APIRouter(prefix="/supplier", tags=["supplier"])
 
 
@@ -125,7 +127,7 @@ def supplier_top(
     limit:  int = Query(10, ge=1, le=50,  description="Max suppliers to return"),
 ):
     """Top suppliers by total spend over the last N months."""
-    today = date.today()
+    today = bkk_today()
     date_from = date(today.year, today.month, 1) - timedelta(days=months * 30)
     date_to   = today
 
@@ -187,7 +189,7 @@ def supplier_trend(
     Month-by-month spend trend for the top N suppliers.
     Returns a list of months and per-supplier monthly amounts.
     """
-    today = date.today()
+    today = bkk_today()
 
     # Build list of months (YYYY-MM strings) from oldest to newest
     month_list = []
@@ -334,7 +336,7 @@ def supplier_price_trend(
     Monthly avg unit_price for a given product name, broken down by supplier.
     Joins invoice_items -> vendor_bills (confirmed only).
     """
-    today     = date.today()
+    today     = bkk_today()
     date_from = date(today.year, today.month, 1) - timedelta(days=(months - 1) * 30)
     date_to   = today
 

@@ -601,7 +601,7 @@ def _save_quick_expense(description: str, amount: float) -> str:
                  payment_method, branch_code)
             VALUES (%s, 'expense', %s, %s, 'cash', 'thawi_watthana')
             RETURNING id
-        """, (date.today(), amount, description))
+        """, (_bkk_today(), amount, description))
         entry_id = str(cur.fetchone()[0])
         conn.commit()
         return entry_id
@@ -2157,7 +2157,7 @@ def _process_one_event(event: dict) -> None:
                 f"✅ บันทึกรายจ่ายแล้ว!\n"
                 f"─────────────────────────\n"
                 f"📝 {quick['description']}: {amt_str}\n"
-                f"📅 {date.today().strftime('%d/%m/%Y')}\n"
+                f"📅 {_bkk_today().strftime('%d/%m/%Y')}\n"
                 f"🔑 ID: {entry_id[:8]}..."
             )
         except Exception as e:
