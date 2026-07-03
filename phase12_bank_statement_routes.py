@@ -21,6 +21,7 @@ Flow:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import logging
 import os
@@ -32,6 +33,7 @@ from typing import Optional
 import psycopg2
 import pdfplumber
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from auth_routes import _require_admin_role  # admin-only gate for money-mutation endpoints (audit AUD-TAX-02)
@@ -44,6 +46,12 @@ except ImportError:
 
 logger = logging.getLogger("bank_statement")
 router = APIRouter(prefix="/bank-statement", tags=["bank-statement"])
+
+
+class AlreadyImportedStatement(Exception):
+    def __init__(self, payload: dict):
+        self.payload = payload
+        super().__init__("already_imported")
 
 
 # ─── Models ───────────────────────────────────────────────────────────────────
@@ -350,6 +358,38 @@ def _classify(row: dict, rules: list[dict]) -> dict:
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
+def _find_successful_statement_import(cur, file_hash: str):
+    cur.execute(
+        """
+        SELECT id, source_file, row_count, period_start, period_end, uploaded_at
+        FROM public.pos_imports
+        WHERE report_type = 'bank_statement'
+          AND file_hash = %s
+          AND status = 'success'
+        ORDER BY uploaded_at DESC
+        LIMIT 1
+        """,
+        (file_hash,),
+    )
+    return cur.fetchone()
+
+
+def _already_imported_statement_payload(orig, file_hash: str) -> dict:
+    return {
+        "detail": "already_imported",
+        "status": "already_imported",
+        "import_id": str(orig[0]) if orig else "duplicate",
+        "report_type": "bank_statement",
+        "source_file": orig[1] if orig else None,
+        "rows_imported": int(orig[2] or 0) if orig else 0,
+        "period_start": str(orig[3]) if orig and orig[3] else None,
+        "period_end": str(orig[4]) if orig and orig[4] else None,
+        "uploaded_at": orig[5].isoformat() if orig and orig[5] else None,
+        "file_hash": file_hash,
+        "message": "ไฟล์ statement นี้นำเข้าไปแล้ว ข้ามซ้ำโดยอัตโนมัติ",
+    }
+
+
 @router.post("/upload")
 async def upload_statement(
     file: UploadFile = File(...),
@@ -371,7 +411,15 @@ async def upload_statement(
     # loop are blocking/CPU-bound. Run them OFF the event loop so a monthly
     # statement upload does not freeze uvicorn -> /health/deep timeout ->
     # UptimeRobot DOWN + the in-process Discord bot dies.
-    return await asyncio.to_thread(_process_statement_upload, pdf_bytes, branch_code)
+    try:
+        return await asyncio.to_thread(
+            _process_statement_upload,
+            pdf_bytes,
+            branch_code,
+            file.filename,
+        )
+    except AlreadyImportedStatement as e:
+        return JSONResponse(status_code=409, content=e.payload)
 
 
 def _read_pdf_summary_totals(pdf_bytes: bytes) -> dict:
@@ -433,28 +481,51 @@ def _statement_checksum(pdf_bytes: bytes, raw_rows: list) -> dict:
     }
 
 
-def _process_statement_upload(pdf_bytes: bytes, branch_code: str) -> dict:
+def _process_statement_upload(pdf_bytes: bytes, branch_code: str, filename: str = "bank-statement.pdf") -> dict:
     """Sync worker: parse PDF, classify rows, insert. Runs in a thread (off loop)."""
-    # Parse PDF
-    try:
-        raw_rows = _extract_transactions(pdf_bytes)
-    except Exception as e:
-        logger.exception("PDF parse failed")
-        raise HTTPException(422, f"ไม่สามารถอ่านไฟล์ PDF: {e}")
-
-    if not raw_rows:
-        raise HTTPException(422, "ไม่พบรายการธุรกรรมในไฟล์ PDF นี้ กรุณาตรวจสอบรูปแบบไฟล์")
-
+    file_hash = hashlib.sha256(pdf_bytes).hexdigest()
+    source_file = filename or "bank-statement.pdf"
     batch_id = str(uuid.uuid4())
+    import_id = str(uuid.uuid4())
     conn = get_db_conn()
     try:
+        with conn.cursor() as cur:
+            dup = _find_successful_statement_import(cur, file_hash)
+            if dup:
+                raise AlreadyImportedStatement(_already_imported_statement_payload(dup, file_hash))
+
+        # Parse PDF only after the file-level duplicate check.
+        try:
+            raw_rows = _extract_transactions(pdf_bytes)
+        except Exception as e:
+            logger.exception("PDF parse failed")
+            raise HTTPException(422, f"ไม่สามารถอ่านไฟล์ PDF: {e}")
+
+        if not raw_rows:
+            raise HTTPException(422, "ไม่พบรายการธุรกรรมในไฟล์ PDF นี้ กรุณาตรวจสอบรูปแบบไฟล์")
+
         rules = _load_rules(conn)
         classified = [_classify(r, rules) for r in raw_rows]
 
         auto_count = sum(1 for r in classified if r["match_status"] == "auto")
         review_count = sum(1 for r in classified if r["match_status"] == "needs_review")
+        dates = [r["txn_date"] for r in classified]
+        period_start = min(dates) if dates else None
+        period_end = max(dates) if dates else None
+        inserted = 0
+        skipped_duplicates = 0
 
         with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.pos_imports
+                    (id, report_type, branch_code, source_file, file_size,
+                     file_hash, status, uploaded_by, uploaded_at, processing_started_at)
+                VALUES (%s, 'bank_statement', %s, %s, %s,
+                        %s, 'parsing', 'bank_statement_upload', now(), now())
+                """,
+                (import_id, branch_code, source_file, len(pdf_bytes), file_hash),
+            )
             for r in classified:
                 cur.execute("""
                     INSERT INTO public.bank_statement_entries
@@ -474,6 +545,22 @@ def _process_statement_upload(pdf_bytes: bytes, branch_code: str) -> dict:
                     r["match_status"],
                     branch_code,
                 ))
+                if cur.rowcount == 1:
+                    inserted += 1
+                else:
+                    skipped_duplicates += 1
+            cur.execute(
+                """
+                UPDATE public.pos_imports
+                SET status = 'success',
+                    row_count = %s,
+                    period_start = %s,
+                    period_end = %s,
+                    finished_at = now()
+                WHERE id = %s
+                """,
+                (inserted, period_start, period_end, import_id),
+            )
         conn.commit()
 
         # AUD-DATA-01: verify the parse against the statement's own รวมฝาก/รวมถอน
@@ -483,9 +570,11 @@ def _process_statement_upload(pdf_bytes: bytes, branch_code: str) -> dict:
         # checksum_ok so the frontend can show a red banner.
         chk = _statement_checksum(pdf_bytes, raw_rows)
         base_msg = (
-            f"นำเข้าสำเร็จ {len(classified)} รายการ "
+            f"นำเข้าสำเร็จ {inserted} รายการ "
             f"(จัดหมวดอัตโนมัติ {auto_count} รายการ, รอจัดหมวด {review_count} รายการ)"
         )
+        if skipped_duplicates:
+            base_msg += f" ข้ามแถวซ้ำ {skipped_duplicates} รายการ"
         if chk.get("available") and chk.get("ok") is False:
             d = chk.get("deposits") or {}
             w = chk.get("withdrawals") or {}
@@ -503,19 +592,33 @@ def _process_statement_upload(pdf_bytes: bytes, branch_code: str) -> dict:
         else:
             message = base_msg
 
-        logger.info("Bank statement batch %s: %d rows (%d auto, %d review) checksum_ok=%s",
-                    batch_id, len(classified), auto_count, review_count, chk.get("ok"))
+        logger.info(
+            "Bank statement batch %s: %d rows (%d inserted, %d duplicate, %d auto, %d review) checksum_ok=%s",
+            batch_id, len(classified), inserted, skipped_duplicates,
+            auto_count, review_count, chk.get("ok"),
+        )
 
         return {
             "success": True,
+            "status": "success",
             "batch_id": batch_id,
+            "import_id": import_id,
+            "file_hash": file_hash,
             "total_rows": len(classified),
+            "inserted": inserted,
+            "skipped_duplicates": skipped_duplicates,
             "auto_classified": auto_count,
             "needs_review": review_count,
             "checksum_ok": chk.get("ok"),
             "checksum": chk,
             "message": message,
         }
+    except AlreadyImportedStatement:
+        conn.rollback()
+        raise
+    except HTTPException:
+        conn.rollback()
+        raise
     except Exception as e:
         conn.rollback()
         logger.exception("Insert failed")
