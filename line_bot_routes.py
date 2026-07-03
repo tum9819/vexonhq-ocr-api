@@ -1098,7 +1098,16 @@ def _scheduled_monthly_breakeven_close():
             log.warning("Monthly breakeven close: no fixed-cost categories configured — skipping LINE push")
             return
         ai_msg = _gen_breakeven_ai_message(ctx)
-        _push_text(_build_breakeven_line_message(ctx, ai_msg))
+        text = _build_breakeven_line_message(ctx, ai_msg)
+        try:
+            from reconcile_routes import build_platform_payout_digest_lines
+
+            month = f"{prev.year}-{prev.month:02d}"
+            payout_lines = build_platform_payout_digest_lines(month, lag_days=7)
+            text = text + "\n" + "\n".join(payout_lines)
+        except Exception:
+            log.exception("monthly breakeven close: platform payout reconcile failed")
+        _push_text(text)
         log.info("Monthly breakeven close sent OK — %s", ctx["month_label"])
     except Exception as e:
         log.error("Monthly breakeven close FAILED: %s", e)

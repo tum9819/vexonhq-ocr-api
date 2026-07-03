@@ -324,6 +324,8 @@ app.include_router(slip_router)
 app.include_router(loan_router)
 app.include_router(store_context_router)
 app.include_router(ai_monitor_router)   # /ai/stats + /ai/calls (JWT-gated; audit Monitoring)
+from reconcile_routes import router as reconcile_router  # noqa: E402
+app.include_router(reconcile_router)
 # ============================================================
 # JWT Auth Middleware — protects all routes except public ones
 # NOTE: Must be added BEFORE CORSMiddleware so CORS is outermost.
