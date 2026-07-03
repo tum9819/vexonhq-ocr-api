@@ -24,8 +24,11 @@ DIFF_WARN_PCT = 2.0
 DEFAULT_BRANCH = "thawi_watthana"
 
 
-def get_db_conn():
-    return psycopg2.connect(os.environ["DATABASE_URL"])
+try:
+    from main import get_db_conn  # type: ignore
+except Exception:
+    def get_db_conn():
+        return psycopg2.connect(os.environ["DATABASE_URL"])
 
 
 def _parse_month(month: str) -> date:
