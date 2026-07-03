@@ -120,6 +120,9 @@ def fetch_platform_payout_reconciliation(
 ) -> dict:
     month_start = _parse_month(month)
     sales_end = _next_month(month_start)
+    # Payouts land ~lag_days after the sale, so shift BOTH edges of the bank
+    # window; a wider window would sweep in the previous month's payouts.
+    bank_start = month_start + timedelta(days=lag_days)
     bank_end = sales_end + timedelta(days=lag_days)
 
     conn = get_db_conn()
@@ -154,7 +157,7 @@ def fetch_platform_payout_reconciliation(
                 GROUP BY source_type
                 ORDER BY source_type
                 """,
-                (month_start, bank_end, branch_code),
+                (bank_start, bank_end, branch_code),
             )
             bank_rows = cur.fetchall()
     finally:
@@ -169,7 +172,7 @@ def fetch_platform_payout_reconciliation(
             "to": sales_end.isoformat(),
         },
         "bank_window": {
-            "from": month_start.isoformat(),
+            "from": bank_start.isoformat(),
             "to": bank_end.isoformat(),
         },
         "platforms": reconcile_platform_payout_rows(system_rows, bank_rows),
@@ -189,9 +192,9 @@ def build_platform_payout_digest_lines(
         if row["status"] == "no_data":
             lines.append(f"{label}: ไม่มีข้อมูล")
         elif row["status"] == "no_bank_data":
-            lines.append(f"{label}: ยังไม่มีเงินเข้า bank")
+            lines.append(f"{label}: รอยอด bank (แอป {row['system_payout']:,.2f})")
         elif row["diff_pct"] is None:
-            lines.append(f"{label}: เทียบไม่ได้")
+            lines.append(f"{label}: มีเฉพาะยอด bank ({row['bank_payout']:,.2f})")
         else:
             mark = " !" if row["warning"] else ""
             lines.append(f"{label}: diff {row['diff_pct']:+.1f}%{mark}")

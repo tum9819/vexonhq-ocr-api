@@ -9,7 +9,10 @@ from fastapi.testclient import TestClient
 
 import auth_routes
 import main
-from reconcile_routes import reconcile_platform_payout_rows
+from reconcile_routes import (
+    build_platform_payout_digest_lines,
+    reconcile_platform_payout_rows,
+)
 
 
 def _fake_verify(token):
@@ -97,6 +100,9 @@ def test_reconcile_endpoint_uses_staff_jwt_and_read_only_sql(monkeypatch):
     data = response.json()
     assert data["month"] == "2026-06"
     assert data["lag_days"] == 7
+    # Bank window is the sales month shifted by lag_days on BOTH edges,
+    # so it never sweeps in the previous month's payouts.
+    assert data["bank_window"] == {"from": "2026-06-08", "to": "2026-07-08"}
     assert data["platforms"]["grab"]["diff_pct"] == 1.0
     assert data["platforms"]["grab"]["estimated"] is False
 
@@ -106,3 +112,31 @@ def test_reconcile_endpoint_uses_staff_jwt_and_read_only_sql(monkeypatch):
     assert not any("INSERT " in q or "UPDATE " in q or "DELETE " in q for q in executed)
     mock_conn.commit.assert_not_called()
     mock_conn.close.assert_called_once()
+
+
+def test_digest_lines_show_amounts_when_not_comparable():
+    fake = {
+        "platforms": {
+            "grab": {
+                "status": "no_bank_data",
+                "system_payout": 12345.5,
+                "bank_payout": 0.0,
+                "diff_pct": None,
+                "warning": False,
+            },
+            "lineman": {
+                "status": "bank_only",
+                "system_payout": 0.0,
+                "bank_payout": 6789.0,
+                "diff_pct": None,
+                "warning": False,
+            },
+        }
+    }
+    with patch(
+        "reconcile_routes.fetch_platform_payout_reconciliation", return_value=fake
+    ):
+        lines = build_platform_payout_digest_lines("2026-06")
+
+    assert lines[1] == "Grab: รอยอด bank (แอป 12,345.50)"
+    assert lines[2] == "LINE MAN: มีเฉพาะยอด bank (6,789.00)"
