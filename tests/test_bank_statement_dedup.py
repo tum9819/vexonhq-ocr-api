@@ -116,6 +116,10 @@ def test_same_file_hash_returns_409_already_imported(monkeypatch):
 
     app = FastAPI()
     app.include_router(bank_routes.router)
+    app.dependency_overrides[bank_routes._require_admin_role] = lambda: {
+        "sub": "tum",
+        "_role": "admin",
+    }
     client = TestClient(app, raise_server_exceptions=False)
 
     response = client.post(
@@ -175,3 +179,40 @@ def test_response_keeps_existing_fields(monkeypatch):
         "message",
     ):
         assert key in result
+
+
+def test_upload_requires_admin_role():
+    app = FastAPI()
+    app.include_router(bank_routes.router)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post(
+        "/bank-statement/upload?branch_code=thawi_watthana",
+        files={"file": ("kbank-june.pdf", b"pdf bytes", "application/pdf")},
+    )
+
+    # No Authorization header at all -> _require_admin_role rejects before
+    # any parsing or DB work happens.
+    assert response.status_code == 401
+
+
+def test_uploaded_by_flows_into_pos_imports_insert(monkeypatch):
+    cursor = FakeCursor(insert_rowcounts=[1, 1])
+    conn = FakeConn(cursor)
+    monkeypatch.setattr(bank_routes, "get_db_conn", lambda: conn)
+    _patch_parser(monkeypatch)
+
+    bank_routes._process_statement_upload(
+        b"audit trail pdf bytes",
+        "thawi_watthana",
+        filename="kbank-june.pdf",
+        uploaded_by="tum@marastation.com",
+    )
+
+    pos_import_inserts = [
+        params
+        for sql, params in cursor.queries
+        if " ".join(sql.upper().split()).startswith("INSERT INTO PUBLIC.POS_IMPORTS")
+    ]
+    assert len(pos_import_inserts) == 1
+    assert "tum@marastation.com" in pos_import_inserts[0]

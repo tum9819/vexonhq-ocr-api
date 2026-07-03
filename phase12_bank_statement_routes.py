@@ -394,6 +394,7 @@ def _already_imported_statement_payload(orig, file_hash: str) -> dict:
 async def upload_statement(
     file: UploadFile = File(...),
     branch_code: str = Query("thawi_watthana"),
+    _admin: dict = Depends(_require_admin_role),
 ):
     """
     อัปโหลด KBank PDF statement → parse → classify → insert
@@ -411,12 +412,16 @@ async def upload_statement(
     # loop are blocking/CPU-bound. Run them OFF the event loop so a monthly
     # statement upload does not freeze uvicorn -> /health/deep timeout ->
     # UptimeRobot DOWN + the in-process Discord bot dies.
+    # Legacy tokens carry the username in "sub"; Supabase tokens have a UUID
+    # "sub" but a readable "email" — prefer the readable identity.
+    uploaded_by = str(_admin.get("email") or _admin.get("sub") or "unknown")
     try:
         return await asyncio.to_thread(
             _process_statement_upload,
             pdf_bytes,
             branch_code,
             file.filename,
+            uploaded_by,
         )
     except AlreadyImportedStatement as e:
         return JSONResponse(status_code=409, content=e.payload)
@@ -481,7 +486,12 @@ def _statement_checksum(pdf_bytes: bytes, raw_rows: list) -> dict:
     }
 
 
-def _process_statement_upload(pdf_bytes: bytes, branch_code: str, filename: str = "bank-statement.pdf") -> dict:
+def _process_statement_upload(
+    pdf_bytes: bytes,
+    branch_code: str,
+    filename: str = "bank-statement.pdf",
+    uploaded_by: str = "bank_statement_upload",
+) -> dict:
     """Sync worker: parse PDF, classify rows, insert. Runs in a thread (off loop)."""
     file_hash = hashlib.sha256(pdf_bytes).hexdigest()
     source_file = filename or "bank-statement.pdf"
@@ -522,9 +532,9 @@ def _process_statement_upload(pdf_bytes: bytes, branch_code: str, filename: str 
                     (id, report_type, branch_code, source_file, file_size,
                      file_hash, status, uploaded_by, uploaded_at, processing_started_at)
                 VALUES (%s, 'bank_statement', %s, %s, %s,
-                        %s, 'parsing', 'bank_statement_upload', now(), now())
+                        %s, 'parsing', %s, now(), now())
                 """,
-                (import_id, branch_code, source_file, len(pdf_bytes), file_hash),
+                (import_id, branch_code, source_file, len(pdf_bytes), file_hash, uploaded_by),
             )
             for r in classified:
                 cur.execute("""
