@@ -91,6 +91,8 @@ vexonhq-ocr-api/
 ├── phase11_search_routes.py         # smart search
 ├── phase12_bank_statement_routes.py # KBank PDF parser
 ├── bill_payment_routes.py           # /bills/payment + /bills/payment/slip-match (Phase 32)
+├── reconcile_routes.py              # /reconcile/platform-payout — Grab/LINE MAN payout ระบบ vs เงินเข้า bank
+│                                    # (LINE MAN net_payout เป็นค่าประมาณจาก 32.1% ใน pos_import.py — endpoint นี้คือตัววัด drift)
 ├── menu_routes.py                   # POS analytics — HUGE file (~4100 lines, 41 endpoints)
 │                                    # /pos/menu, /pos/heatmap, /pos/menu-engineering, /pos/payments,
 │                                    # /pos/bill-analysis, /pos/voids, /pos/staff, /pos/shifts, /pos/tables,
