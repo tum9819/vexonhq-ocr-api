@@ -54,7 +54,7 @@ _EXCLUDED_SOURCES_SQL = (
     "AND d.source NOT IN ("
     "'owner_capital', 'owner_advance', 'transfer_error', "
     "'bank_statement', 'vendor_payment', "
-    "'grab_payout', 'lineman_payout', "
+    "'grab_payout', 'lineman_payout', 'payment_gateway_payout', "
     "'pos_cash_deposit', 'cash_withdrawal', "
     "'loan_in', 'loan_repayment'"
     ")"

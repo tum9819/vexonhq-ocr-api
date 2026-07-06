@@ -19,6 +19,33 @@ DATE_TIME = re.compile(r"^(\d{2})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})\s+(.*)$")
 MONEY = re.compile(r"\d[\d,]*\.\d{2}")
 # dated lines that are NOT transactions
 SKIP_IN_REST = ("ยอดยกมา", "ยอดยกไป")
+STATEMENT_BOILERPLATE_MARKERS = (
+    "ออกโดย K PLUS",
+    "PAGE/OF",
+    "ชื่อบัญชี",
+    "เลขที่บัญชีเงินฝาก",
+    "รอบระหว่างวันที่",
+    "สาขาเจ้าของบัญชี",
+    "เวลา/ ยอดคงเหลือ",
+    "วันที่ รายการ ถอนเงิน / ฝากเงิน",
+)
+
+
+def is_statement_boilerplate_continuation(line: str) -> bool:
+    text = (line or "").strip()
+    if not text:
+        return False
+    return any(marker in text for marker in STATEMENT_BOILERPLATE_MARKERS)
+
+
+def clean_statement_detail(detail: str) -> str:
+    text = re.sub(r"\s+", " ", (detail or "").strip())
+    for marker in (")52-30(", ")1.", "V-AS_AC", "FDPBK", " DD.048", " วันที่มีผล"):
+        pos = text.find(marker)
+        if pos >= 0:
+            text = text[:pos].strip()
+    text = re.sub(r"\s+ที่\s+\d+/\d+\(\d+\)\s*$", "", text).strip()
+    return text
 
 
 def parse_kbank(pdf_bytes: bytes) -> list[dict]:
@@ -41,8 +68,15 @@ def parse_kbank(pdf_bytes: bytes) -> list[dict]:
                 m = DATE_TIME.match(line)
                 if not m:
                     # wrapped continuation of the previous transaction's detail
-                    if rows and "ยอดยก" not in line and "รวม" not in line[:4]:
-                        rows[-1]["description"] = (rows[-1]["description"] + " " + line).strip()
+                    if (
+                        rows
+                        and "ยอดยก" not in line
+                        and "รวม" not in line[:4]
+                        and not is_statement_boilerplate_continuation(line)
+                    ):
+                        rows[-1]["description"] = clean_statement_detail(
+                            rows[-1]["description"] + " " + line
+                        )
                     continue
 
                 dd, mo, yy = int(m.group(1)), int(m.group(2)), int(m.group(3)) + 2000
@@ -61,7 +95,7 @@ def parse_kbank(pdf_bytes: bytes) -> list[dict]:
 
                 amount = float(monies[0].group().replace(",", ""))
                 balance = float(monies[1].group().replace(",", ""))
-                detail = rest[monies[1].end():].strip()
+                detail = clean_statement_detail(rest[monies[1].end():])
                 type_word = rest.split()[0]
 
                 if prev_balance is not None:

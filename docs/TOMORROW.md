@@ -1,11 +1,31 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-06-05 (Sentry removed by TUM request; backend compileall + smoke tests passed. Earlier: OCR-1 DONE; all systems 200)
+**Last updated**: 2026-07-06 (statement parser/payment-gateway reclass implementation prepared; pending Antigravity review, TUM Confirm, deploy, and separate historical DB update approval)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
 
 ---
+
+## 🟡 2026-07-06 — Statement parser + historical reclass tooling pending review
+
+Implementation prepared but **not pushed/deployed yet**:
+- KBank parser now filters page header/footer continuations and cleans KBank page fragments from transaction descriptions while keeping checksum validation unchanged.
+- `LINE PAY` / `ไลน์ เพย์` inflows classify as `payment_gateway_payout` instead of LINE MAN delivery income. TUM confirmed these rows can include non-delivery LINE Pay / QR / payment-gateway money.
+- Thai Grab descriptions containing `แกร็บ` classify as `grab_payout`, overriding legacy DB rules that mapped them to `rider_income_grab`.
+- Added read-only `GET /bank-statement/reclass-dry-run` for admin users. It reports candidate historical rows and month/source totals only; it does **not** update the DB.
+- Added migration `2026_07_06_payment_gateway_payout_pnl_exclude.sql` so `payment_gateway_payout` is excluded from `v_daybook_pnl` when applied.
+
+Read-only dry-run against production data found `813` candidate historical rows from `2025-11` to `2026-06`, total credit `1,643,932.51`:
+- `payment_gateway_payout`: mostly old `rider_income_lineman` / LINE PAY rows.
+- `grab_payout`: old `rider_income_grab` / Thai Grab rows.
+
+Next order:
+1. Finish local verification.
+2. Send Antigravity review request.
+3. If accepted, ask TUM Confirm before push/deploy.
+4. After deploy, run dry-run from production.
+5. Only after a separate DB backup and TUM approval, run historical update migration/script. Do not bulk-update from keyword alone.
 
 ## 🟢 2026-06-05 — Sentry removed from backend
 

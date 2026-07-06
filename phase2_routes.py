@@ -283,7 +283,7 @@ def _summarize_month(cur, period_month: date, branch_code: str) -> dict:
              AND entry_date >= %s AND entry_date < %s
              AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
                             'bank_statement', 'vendor_payment',
-                            'grab_payout', 'lineman_payout',
+                            'grab_payout', 'lineman_payout', 'payment_gateway_payout',
                             'pos_cash_deposit', 'cash_withdrawal',
                             'loan_in', 'loan_repayment')""",
         (branch_code, period_month, pe),
@@ -354,7 +354,7 @@ def dashboard_overview(
                          AND entry_date >= %s AND entry_date < %s
                          AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
                             'bank_statement', 'vendor_payment',
-                            'grab_payout', 'lineman_payout',
+                            'grab_payout', 'lineman_payout', 'payment_gateway_payout',
                             'pos_cash_deposit', 'cash_withdrawal',
                             'loan_in', 'loan_repayment')""",
                     (branch, year_start, ytd_end),
@@ -583,7 +583,7 @@ SELECT
           AND entry_date >  (SELECT as_of FROM sa) - 30
           AND entry_date <= (SELECT as_of FROM sa)
           AND source NOT IN ('owner_capital','owner_advance','transfer_error','bank_statement',
-                             'vendor_payment','grab_payout','lineman_payout','pos_cash_deposit',
+                             'vendor_payment','grab_payout','lineman_payout','payment_gateway_payout','pos_cash_deposit',
                              'cash_withdrawal','loan_in','loan_repayment'))               AS sales_30d,
     (SELECT COUNT(*) FROM public.vendor_bills WHERE review_status IN ('pending', 'needs_attention'))        AS bills_pending,
     (SELECT COUNT(*) FROM public.vendor_bills WHERE payment_status = 'unpaid')             AS ap_count,

@@ -27,7 +27,7 @@ import logging
 import os
 import re
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 import psycopg2
@@ -37,6 +37,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from auth_routes import _require_admin_role  # admin-only gate for money-mutation endpoints (audit AUD-TAX-02)
+from bkk import bkk_today
 
 try:
     from main import get_db_conn  # type: ignore
@@ -106,6 +107,37 @@ def _clean_number(raw: str) -> float:
         return 0.0
 
 
+_STATEMENT_BOILERPLATE_MARKERS = (
+    "ออกโดย K PLUS",
+    "PAGE/OF",
+    "ชื่อบัญชี",
+    "เลขที่บัญชีเงินฝาก",
+    "รอบระหว่างวันที่",
+    "สาขาเจ้าของบัญชี",
+    "เวลา/ ยอดคงเหลือ",
+    "วันที่ รายการ ถอนเงิน / ฝากเงิน",
+)
+
+
+def _is_statement_boilerplate_continuation(line: str) -> bool:
+    """Return True for KBank page header/footer lines extracted as continuations."""
+    text = (line or "").strip()
+    if not text:
+        return False
+    return any(marker in text for marker in _STATEMENT_BOILERPLATE_MARKERS)
+
+
+def _clean_statement_detail(detail: str) -> str:
+    """Remove KBank PDF page-header fragments that can land inside detail text."""
+    text = re.sub(r"\s+", " ", (detail or "").strip())
+    for marker in (")52-30(", ")1.", "V-AS_AC", "FDPBK", " DD.048", " วันที่มีผล"):
+        pos = text.find(marker)
+        if pos >= 0:
+            text = text[:pos].strip()
+    text = re.sub(r"\s+ที่\s+\d+/\d+\(\d+\)\s*$", "", text).strip()
+    return text
+
+
 def _extract_transactions(pdf_bytes: bytes) -> list[dict]:
     """
     Extract transaction rows from KBank PDF (K+ / KBank Online format).
@@ -154,8 +186,15 @@ def _extract_transactions(pdf_bytes: bytes) -> list[dict]:
                     # wrapped continuation of the previous transaction's detail
                     # (guard kept identical to scripts/verify_statement_parse.py so the
                     #  two parsers cannot drift — AGENTS #18)
-                    if rows and "ยอดยก" not in line and "รวม" not in line[:4]:
-                        rows[-1]["description"] = (rows[-1]["description"] + " " + line).strip()
+                    if (
+                        rows
+                        and "ยอดยก" not in line
+                        and "รวม" not in line[:4]
+                        and not _is_statement_boilerplate_continuation(line)
+                    ):
+                        rows[-1]["description"] = _clean_statement_detail(
+                            rows[-1]["description"] + " " + line
+                        )
                     continue
 
                 dd, mo, yy = int(m.group(1)), int(m.group(2)), int(m.group(3)) + 2000
@@ -175,7 +214,7 @@ def _extract_transactions(pdf_bytes: bytes) -> list[dict]:
 
                 amount = float(monies[0].group().replace(",", ""))
                 balance = float(monies[1].group().replace(",", ""))
-                detail = rest[monies[1].end():].strip()
+                detail = _clean_statement_detail(rest[monies[1].end():])
                 type_word = rest.split()[0]
 
                 if prev_balance is not None:
@@ -228,11 +267,15 @@ MUSICIAN_AMOUNTS = {600, 700, 2100, 2800}
 #   utility_expense / payroll_expense / tax_expense / bank_fee -> counted
 #     because these are real cash-only expenses with no other source.
 _BUILTIN_PATTERNS: list[tuple[str, list[str], str, str]] = [
+    # Payment gateway / QR inflows. TUM confirmed LINE PAY statement rows can be
+    # non-delivery money, so these must not be treated as LINE MAN settlement.
+    ("income", ["line pay", "ไลน์ เพย์", "rabbit linepay", "rabbit line pay"],
+                                                       "payment_gateway_payout", "payment_gateway"),
     # ── Income side (delivery platform payouts) ──────────────────────────
     # Already counted under rider_income_grab / rider_income_lineman from the
     # CSV/XLSX uploads, so do NOT double-count here.
     ("income", ["lineman", "lmn", "ไลน์แมน"],          "lineman_payout", "delivery_lineman"),
-    ("income", ["grab", "กราบ", "GrabFood"],            "grab_payout",    "delivery_grab"),
+    ("income", ["grab", "แกร็บ", "กราบ", "GrabFood"],  "grab_payout",    "delivery_grab"),
     # Cash deposit from the POS drawer — same revenue as pos_sale.
     ("income", ["cash dep", "cdm", "นำฝากเงินสด", "เงินสด", "เงินฝาก"],
                                                        "pos_cash_deposit", "pos_cash"),
@@ -354,6 +397,87 @@ def _classify(row: dict, rules: list[dict]) -> dict:
     return {**row, "direction": direction, "amount": amount,
             "category_code": None, "source_type": "bank_statement",
             "match_status": "needs_review"}
+
+
+def _month_key(value: date) -> str:
+    return f"{value.year:04d}-{value.month:02d}"
+
+
+def _round_money(value) -> float:
+    return round(float(value or 0), 2)
+
+
+def _build_reclass_dry_run(rows: list[dict], rules: list[dict]) -> dict:
+    """Build a read-only reclassification preview for historical statement rows."""
+    candidates = []
+    months: dict[str, dict] = {}
+
+    for row in rows:
+        classified = _classify(
+            {
+                "txn_date": row["txn_date"],
+                "description": row.get("description") or "",
+                "debit": row.get("debit") or 0,
+                "credit": row.get("credit") or 0,
+                "balance": row.get("balance") or 0,
+            },
+            rules,
+        )
+        current_source = row.get("source_type") or "bank_statement"
+        current_category = row.get("category_code")
+        suggested_source = classified["source_type"]
+        suggested_category = classified["category_code"]
+        suggested_status = classified["match_status"]
+
+        if (
+            current_source == suggested_source
+            and current_category == suggested_category
+            and row.get("match_status") == suggested_status
+        ):
+            continue
+
+        credit = _round_money(row.get("credit") or 0)
+        month = _month_key(row["txn_date"])
+        month_bucket = months.setdefault(
+            month,
+            {
+                "candidate_count": 0,
+                "candidate_total_credit": 0.0,
+                "by_suggested_source": {},
+            },
+        )
+        source_bucket = month_bucket["by_suggested_source"].setdefault(
+            suggested_source,
+            {"count": 0, "credit": 0.0},
+        )
+        month_bucket["candidate_count"] += 1
+        month_bucket["candidate_total_credit"] = _round_money(
+            month_bucket["candidate_total_credit"] + credit
+        )
+        source_bucket["count"] += 1
+        source_bucket["credit"] = _round_money(source_bucket["credit"] + credit)
+
+        candidates.append({
+            "id": str(row["id"]),
+            "txn_date": row["txn_date"].isoformat(),
+            "description": row.get("description") or "",
+            "credit": credit,
+            "debit": _round_money(row.get("debit") or 0),
+            "current_source_type": current_source,
+            "suggested_source_type": suggested_source,
+            "current_category_code": current_category,
+            "suggested_category_code": suggested_category,
+            "current_match_status": row.get("match_status"),
+            "suggested_match_status": suggested_status,
+        })
+
+    return {
+        "write_mode": False,
+        "candidate_count": len(candidates),
+        "candidate_total_credit": _round_money(sum(row["credit"] for row in candidates)),
+        "months": months,
+        "candidates": candidates,
+    }
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
@@ -711,6 +835,85 @@ def search_entries(
         return {"items": rows}
     finally:
         conn.close()
+
+
+@router.get("/reclass-dry-run")
+def reclass_dry_run(
+    date_from: date = Query(date(2025, 11, 1), description="inclusive start date"),
+    date_to: Optional[date] = Query(None, description="exclusive end date; defaults to tomorrow in Bangkok"),
+    branch_code: str = Query("thawi_watthana"),
+    limit: int = Query(1000, ge=1, le=5000),
+    _admin: dict = Depends(_require_admin_role),
+):
+    """Read-only preview of historical statement rows affected by current policy."""
+    end_date = date_to or (bkk_today() + timedelta(days=1))
+    if end_date <= date_from:
+        raise HTTPException(400, "date_to must be after date_from")
+
+    conn = get_db_conn()
+    try:
+        rules = _load_rules(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, txn_date, description, debit, credit, balance,
+                       category_code, source_type, match_status
+                FROM public.bank_statement_entries
+                WHERE branch_code = %s
+                  AND txn_date >= %s
+                  AND txn_date < %s
+                  AND credit > 0
+                  AND (
+                    source_type IN (
+                        'rider_income_grab',
+                        'rider_income_lineman',
+                        'pos_cash_deposit',
+                        'bank_statement'
+                    )
+                    OR description ILIKE %s
+                    OR description ILIKE %s
+                    OR description LIKE %s
+                    OR description LIKE %s
+                  )
+                ORDER BY txn_date, id
+                LIMIT %s
+                """,
+                (
+                    branch_code,
+                    date_from,
+                    end_date,
+                    "%LINE PAY%",
+                    "%GRAB%",
+                    "%แกร็บ%",
+                    "%ไลน์ เพย์%",
+                    limit,
+                ),
+            )
+            cols = [
+                "id",
+                "txn_date",
+                "description",
+                "debit",
+                "credit",
+                "balance",
+                "category_code",
+                "source_type",
+                "match_status",
+            ]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    result = _build_reclass_dry_run(rows, rules)
+    return {
+        **result,
+        "branch_code": branch_code,
+        "date_from": date_from.isoformat(),
+        "date_to": end_date.isoformat(),
+        "row_limit": limit,
+        "rows_scanned": len(rows),
+        "note": "read-only dry run; no database rows were updated",
+    }
 
 
 @router.post("/classify/{entry_id}")

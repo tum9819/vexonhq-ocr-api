@@ -95,7 +95,7 @@ def pnl_daily(
                   AND d.entry_date BETWEEN %s AND %s
                   AND d.source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
                             'bank_statement', 'vendor_payment',
-                            'grab_payout', 'lineman_payout',
+                            'grab_payout', 'lineman_payout', 'payment_gateway_payout',
                             'pos_cash_deposit', 'cash_withdrawal',
                             'loan_in', 'loan_repayment')
                 GROUP BY d.entry_date
@@ -166,7 +166,7 @@ def pnl_monthly(
                   AND EXTRACT(YEAR FROM d.entry_date) = %s
                   AND d.source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
                             'bank_statement', 'vendor_payment',
-                            'grab_payout', 'lineman_payout',
+                            'grab_payout', 'lineman_payout', 'payment_gateway_payout',
                             'pos_cash_deposit', 'cash_withdrawal',
                             'loan_in', 'loan_repayment')
                 GROUP BY TO_CHAR(d.entry_date, 'YYYY-MM')
@@ -243,7 +243,7 @@ def pnl_by_category(
                   AND entry_date BETWEEN %s AND %s
                   AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
                             'bank_statement', 'vendor_payment',
-                            'grab_payout', 'lineman_payout',
+                            'grab_payout', 'lineman_payout', 'payment_gateway_payout',
                             'pos_cash_deposit', 'cash_withdrawal',
                             'loan_in', 'loan_repayment')
             """, (branch_code, from_date, to_date))
@@ -263,7 +263,7 @@ def pnl_by_category(
                   AND d.entry_date BETWEEN %s AND %s
                   AND d.source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
                             'bank_statement', 'vendor_payment',
-                            'grab_payout', 'lineman_payout',
+                            'grab_payout', 'lineman_payout', 'payment_gateway_payout',
                             'pos_cash_deposit', 'cash_withdrawal',
                             'loan_in', 'loan_repayment')
                 GROUP BY d.category_code, ec.name_th
@@ -282,7 +282,7 @@ def pnl_by_category(
                   AND entry_date BETWEEN %s AND %s
                   AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
                             'bank_statement', 'vendor_payment',
-                            'grab_payout', 'lineman_payout',
+                            'grab_payout', 'lineman_payout', 'payment_gateway_payout',
                             'pos_cash_deposit', 'cash_withdrawal',
                             'loan_in', 'loan_repayment')
                 GROUP BY category_code

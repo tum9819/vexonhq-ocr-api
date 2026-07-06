@@ -67,7 +67,7 @@ def cashflow_forecast(days: int = Query(30, ge=7, le=90, description="Forecast w
             WHERE entry_date BETWEEN %s AND %s
               AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
                             'bank_statement', 'vendor_payment',
-                            'grab_payout', 'lineman_payout',
+                            'grab_payout', 'lineman_payout', 'payment_gateway_payout',
                             'pos_cash_deposit', 'cash_withdrawal',
                             'loan_in', 'loan_repayment')
         """, (lookback_start.isoformat(), (today - timedelta(days=1)).isoformat()))
@@ -88,7 +88,7 @@ def cashflow_forecast(days: int = Query(30, ge=7, le=90, description="Forecast w
             WHERE entry_date BETWEEN %s AND %s
               AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
                             'bank_statement', 'vendor_payment',
-                            'grab_payout', 'lineman_payout',
+                            'grab_payout', 'lineman_payout', 'payment_gateway_payout',
                             'pos_cash_deposit', 'cash_withdrawal',
                             'loan_in', 'loan_repayment')
             GROUP BY entry_date
@@ -200,7 +200,7 @@ def cashflow_summary():
             WHERE entry_date BETWEEN %s AND %s
               AND source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
                             'bank_statement', 'vendor_payment',
-                            'grab_payout', 'lineman_payout',
+                            'grab_payout', 'lineman_payout', 'payment_gateway_payout',
                             'pos_cash_deposit', 'cash_withdrawal',
                             'loan_in', 'loan_repayment')
         """, (month_start.isoformat(), today.isoformat()))
