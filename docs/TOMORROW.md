@@ -1,11 +1,43 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-07-07 (statement parser/payment-gateway reclass shipped; June + May historical corrections committed and verified)
+**Last updated**: 2026-07-09 (monthly-close risk marker V1 migration applied; rollout ready for deploy verification)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
 
 ---
+
+## 🟢 2026-07-09 — Monthly Close Risk Marking V1 ready
+
+Implementation prepared after TUM request to prevent month-end statement/POS/platform issues from being discovered only after the month has passed.
+
+Shipped design/implementation scope:
+- New `monthly_close_routes.py` with admin-only `POST /monthly-close/check` and `GET /monthly-close/risks`.
+- New additive table `public.monthly_close_risks` for one row per `(branch_code, month, risk_key)`, with `last_line_sent_at` for 24-hour LINE throttling.
+- Existing `/alerts/summary` now includes open monthly-close risks.
+- Frontend `/alerts` supports the new `monthly_close` alert type.
+- V1 is read-only against source data: it does not reclassify bank rows, lock months, change P&L views, or reconcile payouts.
+
+Production DB migration:
+- Applied via Supabase MCP on 2026-07-09 as migration `monthly_close_risks_v1`.
+- Verified table exists with 20 columns, RLS enabled, policy count `0`, row count `0`, and expected indexes.
+
+Review notes:
+- Antigravity blocker fixed: R4 now uses `COALESCE(source_type, '') NOT IN (...)` so `NULL` source types are not silently excluded.
+- R3 keeps `K Plus shop = Grab` as a `danger` rule because TUM confirmed this POS mapping for the current bill-detail export. If the POS meaning changes later, downgrade before enabling LINE for it.
+- Migration-first deploy order is required to avoid `/alerts/summary` missing-table noise.
+
+Verification before deploy:
+- `pytest tests/test_monthly_close.py -q`: `38 passed`.
+- `pytest tests/test_admin_gate.py tests/test_reconcile_routes.py -q`: `10 passed`.
+- Backend syntax check for `monthly_close_routes.py`, `main.py`, `menu_routes.py`: OK.
+- Frontend `npm run lint`: 0 errors, existing warnings only.
+- Frontend `npx tsc --noEmit`: passed.
+- Frontend `npm run build`: passed.
+
+Next order:
+1. Verify deploy with `/health/deep`, `/alerts`, and CPU settle after push.
+2. First live use should be a manual check for the current month only; avoid running historical months unless TUM expects LINE critical risks for old data.
 
 ## 🟢 2026-07-07 — Statement parser shipped; June-only historical reclass committed
 

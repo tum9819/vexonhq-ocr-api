@@ -259,6 +259,7 @@ Important V1 limitation:
 
 - This is a month-level sanity check only.
 - Do not attempt daily completeness validation in V1.
+- This `danger` severity depends on TUM's confirmed current POS mapping that `K Plus shop` means Grab for this bill-detail export. If that POS meaning changes to generic storefront QR later, downgrade this rule before enabling LINE for it.
 
 Evidence:
 
@@ -286,7 +287,7 @@ AND NOT (
   AND source_type IN ('grab_payout', 'lineman_payout', 'payment_gateway_payout')
   AND category_code IN ('delivery_grab', 'delivery_lineman', 'payment_gateway')
 )
-AND source_type NOT IN ('grab_payout', 'lineman_payout', 'payment_gateway_payout')
+AND COALESCE(source_type, '') NOT IN ('grab_payout', 'lineman_payout', 'payment_gateway_payout')
 ```
 
 This means already-reviewed payout rows are not flagged, while unresolved or old income-like rows are still visible.

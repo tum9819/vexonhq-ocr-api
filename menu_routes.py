@@ -1525,6 +1525,36 @@ def alerts_summary(branch: str = "thawi_watthana"):
             # Coolify logs. log.exception() includes the traceback.
             log.exception("alerts/summary: subquery failed (section continues with empty list)")
 
+        # ── 5. Monthly Close Risks (open) ────────────────────────
+        try:
+            mc_sql = """
+                SELECT branch_code, month, risk_key, severity, title, message, amount, link
+                FROM public.monthly_close_risks
+                WHERE status = 'open'
+                  AND (%s = '' OR branch_code = %s)
+                ORDER BY
+                    CASE severity WHEN 'danger' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
+                    risk_key
+                LIMIT 30
+            """
+            mc_rows = _rows_to_dicts(conn, mc_sql, (branch, branch))
+            for r in mc_rows:
+                alerts.append({
+                    "id":       f"mclose_{r['branch_code']}_{r['month']}_{r['risk_key']}",
+                    "type":     "monthly_close",
+                    "severity": r["severity"],
+                    "title":    r["title"],
+                    "message":  r["message"],
+                    "amount":   float(r["amount"] or 0),
+                    "date":     r["month"],
+                    "link":     r["link"] or "/alerts",
+                    "link_label": "ดูรายละเอียด",
+                })
+        except Exception:
+            # Best-effort like the other sections — a failure here (e.g. table not
+            # migrated yet) must not break the whole Alert Center. Logged for Coolify.
+            log.exception("alerts/summary: subquery failed (section continues with empty list)")
+
         # ── Sort: danger first, then warning, then info ──────────
         sev_order = {"danger": 0, "warning": 1, "info": 2}
         alerts.sort(key=lambda a: sev_order.get(a["severity"], 9))
