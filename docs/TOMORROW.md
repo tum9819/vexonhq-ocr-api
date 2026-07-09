@@ -1,31 +1,60 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-07-06 (statement parser/payment-gateway reclass implementation prepared; pending Antigravity review, TUM Confirm, deploy, and separate historical DB update approval)
+**Last updated**: 2026-07-07 (statement parser/payment-gateway reclass shipped; June + May historical corrections committed and verified)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
 
 ---
 
-## 🟡 2026-07-06 — Statement parser + historical reclass tooling pending review
+## 🟢 2026-07-07 — Statement parser shipped; June-only historical reclass committed
 
-Implementation prepared but **not pushed/deployed yet**:
+Implementation **pushed, deployed, and verified**:
 - KBank parser now filters page header/footer continuations and cleans KBank page fragments from transaction descriptions while keeping checksum validation unchanged.
 - `LINE PAY` / `ไลน์ เพย์` inflows classify as `payment_gateway_payout` instead of LINE MAN delivery income. TUM confirmed these rows can include non-delivery LINE Pay / QR / payment-gateway money.
 - Thai Grab descriptions containing `แกร็บ` classify as `grab_payout`, overriding legacy DB rules that mapped them to `rider_income_grab`.
 - Added read-only `GET /bank-statement/reclass-dry-run` for admin users. It reports candidate historical rows and month/source totals only; it does **not** update the DB.
-- Added migration `2026_07_06_payment_gateway_payout_pnl_exclude.sql` so `payment_gateway_payout` is excluded from `v_daybook_pnl` when applied.
+- Applied migration `2026_07_06_payment_gateway_payout_pnl_exclude.sql` so `payment_gateway_payout` is excluded from `v_daybook_pnl`.
+
+Verification already run:
+- Backend `.\verify.ps1`: `425 passed, 1 skipped`.
+- Backend `.\verify.ps1 -Smoke`: `71 passed`.
+- Production `/health/deep`: healthy after deploy and CPU settled.
 
 Read-only dry-run against production data found `813` candidate historical rows from `2025-11` to `2026-06`, total credit `1,643,932.51`:
 - `payment_gateway_payout`: mostly old `rider_income_lineman` / LINE PAY rows.
 - `grab_payout`: old `rider_income_grab` / Thai Grab rows.
 
+June-only production reclass **committed after Claude/Antigravity review and TUM explicit Confirm**:
+- SQL draft kept rollback-safe on disk: `docs/superpowers/plans/2026-07-07-june-statement-reclass-draft.sql` still has active `ROLLBACK;` and commented `COMMIT;`.
+- Local pre-COMMIT evidence backup: `C:\Users\rapee\Desktop\PJ-MARA\VPS-VEXONHQ\Audit Reports\statement_reclass_commit_20260707_175258\before_bank_statement_entries_102_rows.json`.
+- DB rollback backup table: `audit.bank_statement_reclass_backup_20260707_june` (`102` rows / `175,899.24`).
+- Updated rows: `102` rows / `175,899.24`; `payment_gateway_payout` 76 rows / `161,719.11`; `grab_payout` 26 rows / `14,180.13`; manual overrides 2 rows (`345.79` on 2026-06-07, `551.31` on 2026-06-30).
+- P&L June check unchanged after COMMIT: `v_daybook_pnl` income `225,924.63`, expense `201,929.67`.
+- Raw `v_daybook` June income increased from `252,821.73` to `427,823.87` (+`175,002.14`), not +`175,899.24`, because the 2 `pos_cash_deposit` exception rows (`897.10`) were already included in raw income before reclass. This is expected; raw ledger now shows settlement movements for reconciliation.
+- Reconcile evidence after COMMIT: June Grab system payout `15,069.03`; June bank `grab_payout` `14,180.13`; remaining `888.90` is the known 2026-07-01 Grab settlement outside the June statement window.
+
+May duplicate cleanup **committed after Claude/Antigravity review and TUM explicit Confirm**:
+- SQL draft kept rollback-safe on disk: `docs/superpowers/plans/2026-07-07-may-statement-duplicate-cleanup-draft.sql` still has active `ROLLBACK;` and commented `COMMIT;`.
+- Local evidence folder: `C:\Users\rapee\Desktop\PJ-MARA\VPS-VEXONHQ\Audit Reports\statement_duplicate_cleanup_may_commit_20260707_183229\`.
+- DB rollback backup tables: `audit.bank_statement_duplicate_cleanup_backup_202605_20260707` (`14` rows: 7 delete + 7 keep) and `audit.statement_duplicate_cleanup_slip_backup_202605_20260707` (`1` slip).
+- Verified after COMMIT: delete rows remaining `0`, keep rows `7`, target duplicate keys `0`; slip `5c788be1-50d5-4a9c-81d6-20c61efa81d9` now points to kept statement `89aa5df5-e7b0-4492-8d74-a40b3c8d62d7`.
+- May `v_daybook_pnl` expense dropped from `275,926.22` to `275,226.22` (-`700.00`) because one duplicate musician-fee row had been double-counted. Income stayed `325,695.51`.
+- Backend health after DB write: `/health/deep` healthy, postgres/supabase OK, CPU `0.0%`.
+
+May statement reclass **committed after Claude/Antigravity review and TUM explicit Confirm**:
+- SQL draft kept rollback-safe on disk: `docs/superpowers/plans/2026-07-07-may-statement-reclass-draft.sql` still has active `ROLLBACK;` and commented `COMMIT;`.
+- Local evidence folder: `C:\Users\rapee\Desktop\PJ-MARA\VPS-VEXONHQ\Audit Reports\statement_reclass_may_commit_20260707_223428\`.
+- DB rollback backup table: `audit.bank_statement_reclass_backup_20260707_may` (`110` rows / `234,703.16`).
+- Updated rows: `110` rows / `234,703.16`; `payment_gateway_payout` 84 rows / `221,034.91`; `grab_payout` auto 25 rows / `13,154.93`; manual Grab exception 1 row / `513.32`.
+- Manual exception row `a13569a8-7463-4874-b9a9-91d0372f8d67` was justified by May Grab CSV transfer-date aggregate `2026-05-30 = 513.32` / 4 rows despite the bank description lacking a Grab keyword.
+- May P&L stayed unchanged after reclass: `v_daybook_pnl` income `325,695.51`, expense `275,226.22`.
+- Backend health after DB write: `/health/deep` healthy, postgres/supabase OK, CPU `0.0%`.
+
 Next order:
-1. Finish local verification.
-2. Send Antigravity review request.
-3. If accepted, ask TUM Confirm before push/deploy.
-4. After deploy, run dry-run from production.
-5. Only after a separate DB backup and TUM approval, run historical update migration/script. Do not bulk-update from keyword alone.
+1. Do not rerun the June reclass, May duplicate-cleanup, or May reclass scripts: the audit backup tables exist by design and a second run should hard-fail.
+2. For remaining historical months before May 2026, repeat the same reviewed-ID-only workflow month by month; do not bulk-update old months from keywords.
+3. Treat statement `payment_gateway_payout` as cash settlement evidence, not LINE MAN delivery payout; LINE MAN actual settlement still needs better source evidence than the current 32.1% estimate.
 
 ## 🟢 2026-06-05 — Sentry removed from backend
 
@@ -251,6 +280,25 @@ All specced in **`HANDOFF_AUDIT_FIXES.md`**. Status as of round 2 (current STILL
 - Added `autocommit=True` to the psycopg2 connection options immediately upon initialization to satisfy PgBouncer transaction mode for COPY streams.
 - Implemented a resilient connection retry helper `connect_with_retry(url)` supporting up to 3 attempts on `psycopg2.OperationalError` with a 5-second sleep in between.
 - Verified the fix end-to-end with a live dry-run (`python scripts/backup.py --skip-storage`), successfully backing up all 83 base tables (56,793 rows) cleanly.
+
+## 2026-07-07 Historical statement cleanup status
+
+### Committed and verified
+- April 2026 reclass committed: `91` rows / `207,763.87`, backup `audit.bank_statement_reclass_backup_20260707_april`.
+- March 2026 reclass committed: `105` rows / `212,939.86`, backup `audit.bank_statement_reclass_backup_20260707_march`; includes manual Grab parser-miss row `588.18`.
+- February 2026 reclass committed: `98` rows / `179,513.36`, backup `audit.bank_statement_reclass_backup_20260707_february`.
+- January 2026 reclass committed: `102` rows / `197,126.35`, backup `audit.bank_statement_reclass_backup_20260707_january`; includes two Grab category-only corrections from `grab_payout/pos_cash`.
+- December 2025 reclass committed: `102` rows / `181,553.15`, backup `audit.bank_statement_reclass_backup_20260707_december`.
+- November 2025 verified-subset reclass committed: `96` rows / `253,502.11`, backup `audit.bank_statement_reclass_backup_20260707_november_verified_subset`.
+- November 2025 early-Grab manual reclass committed: `11` rows / `3,168.81`, backup `audit.bank_statement_reclass_backup_20260709_november_early_grab`.
+- Local execution/log evidence folder: `C:\Users\rapee\Desktop\PJ-MARA\VPS-VEXONHQ\Audit Reports\historical_reclass_commit_20260707_231950`.
+- Draft SQL files under `docs/superpowers/plans/` remain rollback-safe on disk with active `ROLLBACK;`.
+
+### Blocked / needs TUM evidence decision
+- None for this historical statement reclass batch.
+
+### Safety reminder
+- May, June, the committed April-November verified batch, and the committed 2025-11 early-Grab manual batch must not be rerun.
 
 ---
 
