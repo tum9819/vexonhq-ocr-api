@@ -1924,8 +1924,8 @@ def _scheduled_ai_anomaly_scan():
     """APScheduler job: AI bill anomaly scan daily at 03:00 Bangkok time."""
     log.info("Scheduled AI anomaly scan running")
     try:
-        from phase3a_anomaly_routes import scan_anomalies
-        res = scan_anomalies(limit=500)
+        from phase3a_anomaly_routes import _scan_anomalies
+        res = _scan_anomalies(limit=500)
         log.info(
             "AI anomaly scan completed: scanned=%s, alerts_created=%s, by_severity=%s",
             res.get("scanned"),

@@ -16,7 +16,8 @@ Algorithm:
   5. Insert into bill_anomalies (unique on bill_id + anomaly_type when user_action IS NULL).
 
 Endpoints (6):
-    POST  /ai/anomalies/scan            — scan confirmed bills, create alerts (cron target)
+    POST  /ai/anomalies/scan            — scan confirmed bills, create alerts (admin; the
+                                          scheduled scan runs in-process via line_bot_routes)
     GET   /ai/anomalies/list            — list with filters
     GET   /ai/anomalies/baselines       — per-category stats
     GET   /ai/anomalies/stats           — summary counts
@@ -26,21 +27,27 @@ Endpoints (6):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import date, datetime
 from typing import Any, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
+from auth_routes import _require_admin_role
+
 try:
-    from main import get_db_conn  # type: ignore
+    from main import get_db_conn, _sign_uploads_url  # type: ignore
 except ImportError:
     import psycopg2
     def get_db_conn():
         return psycopg2.connect(os.environ["DATABASE_URL"])
+
+    def _sign_uploads_url(url, *args, **kwargs):  # type: ignore
+        return url
 
 
 logger = logging.getLogger("phase3a_anomaly")
@@ -240,9 +247,18 @@ def _insert_anomaly(cur, rec: dict) -> Optional[str]:
 # ============================================================
 
 @router.post("/ai/anomalies/scan")
-def scan_anomalies(limit: int = Query(500, ge=1, le=2000)):
-    """Scan confirmed bills + flag anomalies. Cron target.
-    Returns: {scanned, alerts_created, by_severity}"""
+def scan_anomalies(limit: int = Query(500, ge=1, le=2000), _admin: dict = Depends(_require_admin_role)):
+    """HTTP route: manual, admin-only re-scan (mutating + heavy = a DoS surface, so
+    admin-gated). Delegates to the plain internal function below so in-process callers
+    run a scan without tripping over FastAPI's Query/Depends parameter defaults."""
+    return _scan_anomalies(limit)
+
+
+def _scan_anomalies(limit: int = 500) -> dict:
+    """Core anomaly scan — a plain function, safe to call in-process. The scheduled
+    job in line_bot_routes calls THIS directly (not the HTTP route), so the admin gate
+    never blocks scheduled scanning. Scans confirmed bills and flags anomalies vs
+    category baselines. Returns: {scanned, alerts_created, by_severity, baselines_used}."""
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -290,6 +306,7 @@ def list_anomalies(
     category_code: Optional[str] = Query(None),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    _admin: dict = Depends(_require_admin_role),
 ):
     """List anomaly alerts. Default = pending (user_action IS NULL) sorted by severity."""
     where: list[str] = []
@@ -345,7 +362,7 @@ def list_anomalies(
 
 
 @router.get("/ai/anomalies/baselines")
-def category_baselines():
+def category_baselines(_admin: dict = Depends(_require_admin_role)):
     """Per-category statistics for context."""
     conn = get_db_conn()
     try:
@@ -364,7 +381,7 @@ def category_baselines():
 
 
 @router.get("/ai/anomalies/stats")
-def anomaly_stats():
+def anomaly_stats(_admin: dict = Depends(_require_admin_role)):
     """Summary counts."""
     conn = get_db_conn()
     try:
@@ -388,7 +405,7 @@ def anomaly_stats():
 
 
 @router.patch("/ai/anomalies/{anomaly_id}")
-def user_acknowledge(anomaly_id: str, body: AnomalyUserAction):
+def user_acknowledge(anomaly_id: str, body: AnomalyUserAction, _admin: dict = Depends(_require_admin_role)):
     """User marks the alert as false_positive / confirmed / ignored."""
     aid = _parse_uuid(anomaly_id, "anomaly_id")
     if body.action not in ("false_positive", "confirmed", "ignored"):
@@ -410,6 +427,120 @@ def user_acknowledge(anomaly_id: str, body: AnomalyUserAction):
             conn.commit()
             cols = [d[0] for d in cur.description]
             return _serialize_row(dict(zip(cols, row)))
+    finally:
+        conn.close()
+
+
+@router.get("/ai/anomalies/{anomaly_id}/context")
+def anomaly_context(anomaly_id: str, _admin: dict = Depends(_require_admin_role)):
+    """Evidence for reviewing one anomaly (read-only):
+      - bill:            the actual bill behind it — signed image + OCR items + totals
+      - vendor_history:  up to 8 other bills from the SAME vendor (match by tax id when
+                         present, else exact vendor_name) so the reviewer can see the
+                         vendor's normal range
+      - category_baseline: n / mean / p50 / p95 / stddev / p99 for the bill's category
+    """
+    aid = _parse_uuid(anomaly_id, "anomaly_id")
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT vb.id, vb.vendor_name, vb.invoice_no, vb.bill_date, vb.amount,
+                          vb.subtotal, vb.vat, vb.category_code, c.name_th AS category_name,
+                          vb.review_status, vb.merchant_tax_id, vb.attachment_url, vb.ocr_json
+                   FROM public.bill_anomalies a
+                   JOIN public.vendor_bills vb ON vb.id = a.bill_id
+                   LEFT JOIN public.expense_categories c ON c.code = vb.category_code
+                   WHERE a.id = %s""",
+                (str(aid),),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "Anomaly not found")
+            b = dict(zip([d[0] for d in cur.description], row))
+
+            # OCR items — jsonb usually comes back as dict; guard str/None/non-dict.
+            ocr = b.get("ocr_json")
+            if isinstance(ocr, str):
+                try:
+                    ocr = json.loads(ocr)
+                except Exception:
+                    ocr = {}
+            if not isinstance(ocr, dict):
+                ocr = {}
+            items = ocr.get("items")
+
+            bill = {
+                "bill_id":         str(b["id"]),
+                "vendor_name":     b["vendor_name"],
+                "invoice_no":      b["invoice_no"],
+                "bill_date":       b["bill_date"].isoformat() if b["bill_date"] else None,
+                "amount":          float(b["amount"] or 0),
+                "subtotal":        float(b["subtotal"]) if b["subtotal"] is not None else None,
+                "vat":             float(b["vat"]) if b["vat"] is not None else None,
+                "category_code":   b["category_code"],
+                "category_name":   b["category_name"],
+                "review_status":   b["review_status"],
+                "merchant_tax_id": b["merchant_tax_id"],
+                # uploads bucket is private — sign so <img> can load it (raw URL 403s)
+                "preview_url":     _sign_uploads_url(b["attachment_url"]) if b["attachment_url"] else None,
+                "items":           items if isinstance(items, list) else [],
+            }
+
+            # Match the vendor by tax id when present (OCR reads it reliably), else by
+            # exact vendor_name. If neither exists, skip — never match on NULL/'' which
+            # would pull unrelated bills or return nothing useful.
+            taxid = (b["merchant_tax_id"] or "").strip()
+            vname = (b["vendor_name"] or "").strip()
+            match_clause = None
+            match_val = None
+            if taxid:
+                # TRIM both sides — the param is stripped, so the column must be too,
+                # or a stored tax id with stray whitespace would miss (Codex #3).
+                match_clause, match_val = "TRIM(COALESCE(merchant_tax_id, '')) = %s", taxid
+            elif vname:
+                match_clause, match_val = "vendor_name = %s", vname
+
+            vendor_history: list[dict] = []
+            if match_clause:
+                cur.execute(
+                    f"""SELECT bill_date, amount, invoice_no, category_code, review_status
+                        FROM public.vendor_bills
+                        WHERE id <> %s::uuid AND {match_clause}
+                        ORDER BY bill_date DESC NULLS LAST
+                        LIMIT 8""",
+                    (str(b["id"]), match_val),
+                )
+                vendor_history = [
+                    {
+                        "bill_date":     r[0].isoformat() if r[0] else None,
+                        "amount":        float(r[1] or 0),
+                        "invoice_no":    r[2],
+                        "category_code": r[3],
+                        "review_status": r[4],
+                    }
+                    for r in cur.fetchall()
+                ]
+
+            baseline = None
+            if b["category_code"]:
+                cur.execute(
+                    """SELECT n, mean, p50, p95, stddev, p99
+                       FROM public.v_category_baselines
+                       WHERE category_code = %s""",
+                    (b["category_code"],),
+                )
+                br = cur.fetchone()
+                if br:
+                    baseline = {
+                        "n":      int(br[0]) if br[0] is not None else None,
+                        "mean":   float(br[1]) if br[1] is not None else None,
+                        "p50":    float(br[2]) if br[2] is not None else None,
+                        "p95":    float(br[3]) if br[3] is not None else None,
+                        "stddev": float(br[4]) if br[4] is not None else None,
+                        "p99":    float(br[5]) if br[5] is not None else None,
+                    }
+        return {"bill": bill, "vendor_history": vendor_history, "category_baseline": baseline}
     finally:
         conn.close()
 
