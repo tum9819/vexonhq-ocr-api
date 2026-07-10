@@ -470,6 +470,17 @@ def anomaly_context(anomaly_id: str, _admin: dict = Depends(_require_admin_role)
                 ocr = {}
             items = ocr.get("items")
 
+            # main.py imports this module (main.py:56) before it defines
+            # `_sign_uploads_url` (main.py:2735), so the module-level `from main import`
+            # above hit a circular-import ImportError and fell back to the no-op signer —
+            # which returns the RAW url. The uploads bucket is private, so that raw url
+            # 400s in an <img>. Re-import at request time (main is fully loaded now) to get
+            # the real signer; keep the no-op as a last-resort fallback.
+            try:
+                from main import _sign_uploads_url as _sign_url
+            except Exception:
+                _sign_url = _sign_uploads_url
+
             bill = {
                 "bill_id":         str(b["id"]),
                 "vendor_name":     b["vendor_name"],
@@ -483,7 +494,7 @@ def anomaly_context(anomaly_id: str, _admin: dict = Depends(_require_admin_role)
                 "review_status":   b["review_status"],
                 "merchant_tax_id": b["merchant_tax_id"],
                 # uploads bucket is private — sign so <img> can load it (raw URL 403s)
-                "preview_url":     _sign_uploads_url(b["attachment_url"]) if b["attachment_url"] else None,
+                "preview_url":     _sign_url(b["attachment_url"]) if b["attachment_url"] else None,
                 "items":           items if isinstance(items, list) else [],
             }
 
