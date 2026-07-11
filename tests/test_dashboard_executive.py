@@ -1,12 +1,19 @@
 """
 Offline unit tests for the Executive Dashboard pure logic — freshness +
-card assembly + reconciliation. No DB / network / key needed.
+card assembly + reconciliation. No external DB / network / key needed.
 (admin-only gating is covered separately in tests/test_admin_gate.py.)
 """
 
-from datetime import date
+import sqlite3
+from datetime import date, timedelta
 
-from phase2_routes import _card_freshness, _build_executive_cards, _min_date, _sales_waterfall
+from phase2_routes import (
+    _EXEC_METRICS_SQL,
+    _build_executive_cards,
+    _card_freshness,
+    _min_date,
+    _sales_waterfall,
+)
 
 TODAY = date(2026, 6, 9)
 
@@ -88,6 +95,52 @@ def test_ap_card_surfaces_overdue():
     assert ap["value"] == 298861.73 and ap["count"] == 36
     assert ap["alert"]["value"] == 75075.02
     assert ap["as_of"] == "live" and ap["fresh"] is True
+
+
+def test_ap_metrics_exclude_rejected_unpaid_bills():
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE vendor_bills "
+        "(payment_status TEXT, review_status TEXT, amount NUMERIC, due_date TEXT)"
+    )
+    confirmed_amounts = (5000, 4000, 3000, 2000, 1000, 10841)
+    rejected_amounts = (6000,) * 14 + (7145.80,)
+    conn.executemany(
+        "INSERT INTO vendor_bills VALUES ('unpaid', 'confirmed', ?, '2020-01-01')",
+        ((amount,) for amount in confirmed_amounts),
+    )
+    conn.executemany(
+        "INSERT INTO vendor_bills VALUES ('unpaid', 'rejected', ?, '2020-01-01')",
+        ((amount,) for amount in rejected_amounts[:-1]),
+    )
+    conn.execute(
+        "INSERT INTO vendor_bills VALUES ('unpaid', 'rejected', ?, ?)",
+        (rejected_amounts[-1], (date.today() + timedelta(days=3)).isoformat()),
+    )
+    conn.execute(
+        "INSERT INTO vendor_bills VALUES ('credit_card', 'confirmed', 23480.75, '2020-01-01')"
+    )
+
+    expected = {
+        "ap_count": 6,
+        "ap_total": 25841,
+        "ap_overdue": 25841,
+        "ap_due_7d": 0,
+        "ap_due_7d_count": 0,
+    }
+    for alias, expected_value in expected.items():
+        before_alias = _EXEC_METRICS_SQL.split(f"AS {alias}", 1)[0]
+        metric_sql = "SELECT" + before_alias.rsplit("(SELECT", 1)[1].rsplit(")", 1)[0]
+        metric_sql = (
+            metric_sql.replace("public.", "")
+            .replace("::numeric", "")
+            .replace(
+                "(now() AT TIME ZONE 'Asia/Bangkok')::date + 7",
+                "date('now', '+7 days')",
+            )
+            .replace("(now() AT TIME ZONE 'Asia/Bangkok')::date", "date('now')")
+        )
+        assert conn.execute(metric_sql).fetchone()[0] == expected_value, alias
 
 
 def test_freshness_reflected_per_card_when_stale():

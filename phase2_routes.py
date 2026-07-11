@@ -586,11 +586,15 @@ SELECT
                              'vendor_payment','grab_payout','lineman_payout','payment_gateway_payout','pos_cash_deposit',
                              'cash_withdrawal','loan_in','loan_repayment'))               AS sales_30d,
     (SELECT COUNT(*) FROM public.vendor_bills WHERE review_status IN ('pending', 'needs_attention'))        AS bills_pending,
-    (SELECT COUNT(*) FROM public.vendor_bills WHERE payment_status = 'unpaid')             AS ap_count,
-    (SELECT COALESCE(SUM(amount),0)::numeric FROM public.vendor_bills
-        WHERE payment_status = 'unpaid')                                                   AS ap_total,
+    (SELECT COUNT(*) FROM public.vendor_bills
+        WHERE payment_status = 'unpaid'
+          AND review_status <> 'rejected')                                                AS ap_count,
     (SELECT COALESCE(SUM(amount),0)::numeric FROM public.vendor_bills
         WHERE payment_status = 'unpaid'
+          AND review_status <> 'rejected')                                                AS ap_total,
+    (SELECT COALESCE(SUM(amount),0)::numeric FROM public.vendor_bills
+        WHERE payment_status = 'unpaid'
+          AND review_status <> 'rejected'
           AND due_date < (now() AT TIME ZONE 'Asia/Bangkok')::date)                        AS ap_overdue,
     (SELECT max(snapshot_at)::date FROM public.pos_inventory_snapshots)                    AS stock_as_of,
     (SELECT COUNT(*) FROM public.v_low_stock WHERE branch_code = %s)                       AS low_stock_count,
@@ -601,10 +605,12 @@ SELECT
         WHERE branch_code = %s AND sales_date = (SELECT prev FROM pa) AND bill_net > 0)     AS prev_day_sales,
     (SELECT COALESCE(SUM(amount),0)::numeric FROM public.vendor_bills
         WHERE payment_status = 'unpaid'
+          AND review_status <> 'rejected'
           AND due_date >= (now() AT TIME ZONE 'Asia/Bangkok')::date
           AND due_date <= (now() AT TIME ZONE 'Asia/Bangkok')::date + 7)                   AS ap_due_7d,
     (SELECT COUNT(*) FROM public.vendor_bills
         WHERE payment_status = 'unpaid'
+          AND review_status <> 'rejected'
           AND due_date >= (now() AT TIME ZONE 'Asia/Bangkok')::date
           AND due_date <= (now() AT TIME ZONE 'Asia/Bangkok')::date + 7)                   AS ap_due_7d_count,
     (SELECT COUNT(*) FROM public.pos_inventory_items
