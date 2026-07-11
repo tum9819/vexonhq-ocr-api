@@ -321,6 +321,30 @@ def _summarize_month(cur, period_month: date, branch_code: str) -> dict:
     }
 
 
+def _build_top_categories(
+    rows: list[tuple[Any, Any, Any]],
+    uncategorized_spent: float,
+    expense_total: float,
+) -> list[dict[str, Any]]:
+    denominator = float(expense_total or 0)
+
+    def category_row(code: str, name: str, spent: float) -> dict[str, Any]:
+        amount = float(spent or 0)
+        return {
+            "category_code": code,
+            "name_th": name,
+            "spent": amount,
+            "pct": round(amount / denominator * 100, 1) if denominator else 0.0,
+        }
+
+    categories = [category_row(r[0], r[1], r[2]) for r in rows]
+    if uncategorized_spent:
+        categories.append(
+            category_row("uncategorized", "ไม่ระบุหมวด", uncategorized_spent)
+        )
+    return categories
+
+
 @router.get("/dashboard/overview")
 def dashboard_overview(
     month: Optional[str] = Query(None, description="YYYY-MM, default current"),
@@ -410,16 +434,21 @@ def dashboard_overview(
                     (branch, branch, month_start, pe),
                 )
                 top_rows = cur.fetchall()
-                total_categorized = sum(float(r[2] or 0) for r in top_rows) or 1.0
-                top_categories = [
-                    {
-                        "category_code": r[0],
-                        "name_th": r[1],
-                        "spent": float(r[2] or 0),
-                        "pct": round(float(r[2] or 0) / total_categorized * 100, 1),
-                    }
-                    for r in top_rows
-                ]
+                cur.execute(
+                    """SELECT COALESCE(SUM(d.amount), 0)::numeric
+                       FROM public.v_daybook_pnl d
+                       WHERE d.direction = 'expense'
+                         AND COALESCE(d.branch_code, %s) = %s
+                         AND d.entry_date >= %s AND d.entry_date < %s
+                         AND d.category_code IS NULL""",
+                    (branch, branch, month_start, pe),
+                )
+                uncategorized_spent = float(cur.fetchone()[0] or 0)
+                top_categories = _build_top_categories(
+                    top_rows,
+                    uncategorized_spent,
+                    current["expense_total"],
+                )
             except Exception as e:
                 logger.error("dashboard_overview: top_categories query failed: %s", e)
                 conn.rollback()

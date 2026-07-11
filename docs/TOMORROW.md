@@ -1,11 +1,19 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-07-11 (category-integrity migration applied; repository changes awaiting push)
+**Last updated**: 2026-07-12 (FA-004 backend fix committed locally; awaiting review and push confirmation)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
 
 ---
+
+## 🟡 2026-07-12 — FA-004 dashboard category reconciliation
+
+Local backend commit adds an appended `ไม่ระบุหมวด` bucket for `category_code IS NULL` spend and calculates each category percentage from `current.expense_total`. The Top 5 categorized query remains unchanged; the uncategorized bucket does not consume its LIMIT. Frontend has a companion commit so the sixth bucket is not sliced out.
+
+Verified: `ast.parse`, focused pytest, and `verify.ps1` (`466 passed, 2 skipped`). No DB/data mutation and no deploy yet.
+
+Next: obtain review + TUM push confirmation, deploy backend before/with the frontend companion, then verify June 2026 `sum(top_categories.spent) == current.expense_total`, `/health/deep`, and settled VPS CPU.
 
 ## 🟢 2026-07-11 — Expense category integrity migration applied
 
