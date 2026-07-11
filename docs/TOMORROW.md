@@ -1,11 +1,35 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-07-09 (monthly-close risk marker V1 migration applied; rollout ready for deploy verification)
+**Last updated**: 2026-07-11 (category-integrity migration applied; repository changes awaiting push)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
 
 ---
+
+## 🟢 2026-07-11 — Expense category integrity migration applied
+
+Production Supabase migration `upsert_missing_expense_categories_20260711` registered:
+- `beverage_raw → beverage_cost`, Thai name `วัตถุดิบเครื่องดื่ม (เบียร์/น้ำ)`.
+- `gas → food_cost`, per TUM's explicit cooking-COGS decision.
+
+The migration changes configuration rows only. It does not rewrite historical transactions or change `v_daybook*` views. June `/dashboard/overview` now returns beverage cost `฿35,684.17 / 15.8%` (previously zero) and the Thai category label.
+
+Local backend files awaiting push:
+- `migrations/2026_07_11_upsert_missing_categories.sql` — idempotent migration record; omits `sort_order` so new rows use default 999 and reruns preserve operator ordering.
+- `tests/test_category_integrity.py` — opt-in read-only integrity test using `CATEGORY_INTEGRITY_DATABASE_URL`; offline suite skips safely.
+- `sql/2026_07_11_category_cleanup_review.sql` — SELECT-only owner report for `other_expense`/NULL rows; no automatic reclassification.
+
+Verification:
+- Pre-migration explicit integrity test RED: `beverage_raw` only.
+- Post-migration explicit integrity test GREEN; remaining non-whitelisted orphan set is empty.
+- `verify.ps1`: 464 passed, 2 skipped.
+- Production HTTPS June dashboard: HTTP 200, corrected beverage cost and Thai label.
+
+Next:
+1. Obtain TUM's separate push confirmation; commit/push the migration record, test, review SQL, frontend catalog changes, and canonical docs only.
+2. After deploy, run `/health/deep`, smoke the four category-consuming frontend pages, and wait for shared VPS CPU to settle.
+3. Keep historical `other_expense`/NULL cleanup owner-driven and read-only until TUM approves individual classifications.
 
 ## 🟢 2026-07-09 — Monthly Close Risk Marking V1 ready
 
