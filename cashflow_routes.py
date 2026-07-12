@@ -7,9 +7,10 @@ Endpoints:
 
 Logic:
   - Actual income/expense: rolling 30-day average from v_daybook
-  - Known outflows: AP bills due within `days` window (ar_ap_entries)
+  - Known outflows: unpaid vendor bills due within `days` window
   - Projected daily cash: average_daily_income - average_daily_expense
-  - Days with known AP bills: subtract the bill amount as a spike
+  - Days with known AP bills: subtract the bill amount as a spike.
+    Overdue AP is treated as a day-0 outflow because it is already payable.
 """
 
 import os
@@ -31,6 +32,50 @@ def get_db_conn():
 def _rows_to_dicts(cur) -> list[dict]:
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+STANDARD_AP_FILTER_SQL = "vb.payment_status = 'unpaid' AND vb.review_status <> 'rejected'"
+
+STANDARD_AP_QUERY_SQL = f"""
+    SELECT
+        vb.due_date,
+        COALESCE(NULLIF(TRIM(vb.vendor_name), ''), 'ไม่ระบุ') AS vendor,
+        COALESCE(vb.amount, 0) AS remaining
+    FROM public.vendor_bills vb
+    WHERE {STANDARD_AP_FILTER_SQL}
+      AND (vb.due_date IS NULL OR vb.due_date <= %s)
+    ORDER BY vb.due_date NULLS FIRST, vb.vendor_name
+"""
+
+
+def _coerce_date(value) -> Optional[date]:
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return value
+    if hasattr(value, "date"):
+        return value.date()
+    return date.fromisoformat(str(value)[:10])
+
+
+def _bucket_standard_ap_rows(rows, today: date) -> dict[str, list[dict]]:
+    """Bucket standard AP rows by forecast date; overdue/no-due bills hit day 0."""
+    ap_by_date: dict[str, list[dict]] = {}
+    for due_date_raw, vendor, remaining in rows:
+        due_date = _coerce_date(due_date_raw)
+        forecast_date = today if due_date is None or due_date < today else due_date
+        key = str(forecast_date)
+        ap_by_date.setdefault(key, []).append({
+            "vendor": vendor or "ไม่ระบุ",
+            "amount": round(float(remaining or 0), 2),
+            "due_date": str(due_date) if due_date else None,
+            "overdue": bool(due_date and due_date < today),
+        })
+    return ap_by_date
+
+
+def _cashflow_health(net_position: float, ap_overdue: float) -> str:
+    return "warning" if net_position <= 0 or ap_overdue > 0 else "good"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -97,29 +142,14 @@ def cashflow_forecast(days: int = Query(30, ge=7, le=90, description="Forecast w
         actual_rows = {str(r[0]): {"income": float(r[1]), "expense": float(r[2])}
                        for r in cur.fetchall()}
 
-        # ── 3. AP bills due within forecast window ──
+        # ── 3. Standard AP bills due within forecast window ──
         forecast_end = today + timedelta(days=days)
-        cur.execute("""
-            SELECT
-                e.due_date,
-                COALESCE(c.name, e.counterparty_name_snapshot, 'ไม่ระบุ') AS vendor,
-                (e.amount_total - e.amount_paid) AS remaining
-            FROM public.ar_ap_entries e
-            LEFT JOIN public.counterparties c ON c.id = e.counterparty_id
-            WHERE e.direction = 'payable'
-              AND e.status IN ('pending', 'partial')
-              AND e.due_date BETWEEN %s AND %s
-            ORDER BY e.due_date
-        """, (today.isoformat(), forecast_end.isoformat()))
+        cur.execute(STANDARD_AP_QUERY_SQL, (forecast_end.isoformat(),))
         ap_rows = cur.fetchall()
 
-        # Build dict: due_date → list of AP bills
-        ap_by_date: dict[str, list[dict]] = {}
-        for due_date, vendor, remaining in ap_rows:
-            key = str(due_date)
-            if key not in ap_by_date:
-                ap_by_date[key] = []
-            ap_by_date[key].append({"vendor": vendor, "amount": round(float(remaining or 0), 2)})
+        # Build dict: forecast date → list of AP bills. Overdue bills are
+        # day-0 outflows, not invisible past due-date rows.
+        ap_by_date = _bucket_standard_ap_rows(ap_rows, today)
 
         # ── 4. Build forecast days ──
         forecast = []
@@ -208,25 +238,35 @@ def cashflow_summary():
         mtd_income  = float(row[0] or 0)
         mtd_expense = float(row[1] or 0)
 
-        cur.execute("""
-            SELECT COALESCE(SUM(amount_total - amount_paid), 0), COUNT(*)
-            FROM public.ar_ap_entries
-            WHERE direction='payable' AND status IN ('pending','partial')
+        cur.execute(f"""
+            SELECT COALESCE(SUM(vb.amount), 0), COUNT(*)
+            FROM public.vendor_bills vb
+            WHERE {STANDARD_AP_FILTER_SQL}
         """)
         ap_row = cur.fetchone()
         ap_outstanding = float(ap_row[0] or 0)
         ap_count       = int(ap_row[1] or 0)
 
-        # AP due in next 7 days
-        cur.execute("""
-            SELECT COALESCE(SUM(amount_total - amount_paid), 0), COUNT(*)
-            FROM public.ar_ap_entries
-            WHERE direction='payable' AND status IN ('pending','partial')
-              AND due_date BETWEEN %s AND %s
-        """, (today.isoformat(), (today + timedelta(days=7)).isoformat()))
+        # AP due now/next 7 days. Overdue bills are still imminent outflows.
+        cur.execute(f"""
+            SELECT COALESCE(SUM(vb.amount), 0), COUNT(*)
+            FROM public.vendor_bills vb
+            WHERE {STANDARD_AP_FILTER_SQL}
+              AND (vb.due_date IS NULL OR vb.due_date <= %s)
+        """, ((today + timedelta(days=7)).isoformat(),))
         due_row = cur.fetchone()
         ap_due_7d       = float(due_row[0] or 0)
         ap_due_7d_count = int(due_row[1] or 0)
+
+        cur.execute(f"""
+            SELECT COALESCE(SUM(vb.amount), 0), COUNT(*)
+            FROM public.vendor_bills vb
+            WHERE {STANDARD_AP_FILTER_SQL}
+              AND vb.due_date < %s
+        """, (today.isoformat(),))
+        overdue_row = cur.fetchone()
+        ap_overdue       = float(overdue_row[0] or 0)
+        ap_overdue_count = int(overdue_row[1] or 0)
 
         net_position = mtd_income - mtd_expense - ap_outstanding
 
@@ -239,8 +279,10 @@ def cashflow_summary():
             "ap_count":         ap_count,
             "ap_due_next_7d":   round(ap_due_7d, 2),
             "ap_due_7d_count":  ap_due_7d_count,
+            "ap_overdue":       round(ap_overdue, 2),
+            "ap_overdue_count": ap_overdue_count,
             "net_cash_position": round(net_position, 2),
-            "health":           "good" if net_position > 0 else "warning",
+            "health":           _cashflow_health(net_position, ap_overdue),
         }
     finally:
         conn.close()
