@@ -74,6 +74,12 @@ def _default_range() -> tuple[date, date]:
     return today.replace(day=1), today
 
 
+def _pnl_totals_from_row(row: tuple[Any, Any]) -> tuple[float, float, float]:
+    income_pnl = float(row[0] or 0)
+    expense_pnl = float(row[1] or 0)
+    return income_pnl, expense_pnl, round(income_pnl - expense_pnl, 2)
+
+
 # ============================================================
 # Endpoints
 # ============================================================
@@ -202,19 +208,20 @@ def daybook_summary(
             # transfers). Kept for the full-ledger view. NOT profit.
             net = by_direction["income"]["total"] - by_direction["expense"]["total"]
 
-            # Audit M6 fix (2026-05-27): the true P&L net excludes equity /
-            # transfer sources. Computed from v_daybook_pnl with the same filter
-            # so the frontend can label "กำไร/ขาดทุน" honestly (see audit C6).
+            # Audit M6 fix (2026-05-27): true P&L totals exclude equity /
+            # transfer sources. Keep income and expense separate so clients never
+            # have to combine a raw-ledger total with the P&L net.
             cur.execute(
                 f"""SELECT
                        COALESCE(SUM(CASE WHEN direction='income'  THEN amount ELSE 0 END), 0)
-                     - COALESCE(SUM(CASE WHEN direction='expense' THEN amount ELSE 0 END), 0)
-                       AS net_pnl
+                         AS income_pnl,
+                       COALESCE(SUM(CASE WHEN direction='expense' THEN amount ELSE 0 END), 0)
+                         AS expense_pnl
                     FROM public.v_daybook_pnl
                     WHERE {base_where}""",
                 base_params,
             )
-            net_pnl = float(cur.fetchone()[0] or 0)
+            income_pnl, expense_pnl, net_pnl = _pnl_totals_from_row(cur.fetchone())
 
             # Source breakdown — always show ALL sources here so users see
             # which sources are hidden by filter (helpful UX context)
@@ -242,6 +249,8 @@ def daybook_summary(
             "by_direction": by_direction,
             "net":          float(net),
             "net_pnl":      net_pnl,
+            "income_pnl":   income_pnl,
+            "expense_pnl":  expense_pnl,
             "by_source":    by_source,
             "applied_sources": sources_filter,
         }

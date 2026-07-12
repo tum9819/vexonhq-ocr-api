@@ -1,11 +1,19 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-07-12 (FA-004 backend fix committed locally; awaiting review and push confirmation)
+**Last updated**: 2026-07-12 (T3 daybook P&L totals fix-forward local; awaiting final review and push confirmation)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
 
 ---
+
+## 🟡 2026-07-12 — T3 daybook P&L basis fix-forward
+
+Auditor production evidence showed the first frontend T3 fix mixed raw income with `net_pnl`, inflating June expense. Backend `/daybook/summary` now returns explicit `income_pnl` and `expense_pnl` from its existing filtered `v_daybook_pnl` scan and preserves the existing `net`/`net_pnl` contract. Frontend consumes the explicit fields directly and uses clearly labeled raw totals only as a legacy fallback.
+
+Regression evidence: June `225,924.63 - 201,929.67 = 23,994.96`; July `80,525 - 17,016 = 63,509`. No DB/data mutation and no deploy yet.
+
+Next: final review, explicit TUM push confirmation, deploy backend before/with frontend, then authenticate and verify `/daybook` for June and July plus `/health/deep` and settled VPS CPU.
 
 ## 🟡 2026-07-12 — FA-004 dashboard category reconciliation
 
