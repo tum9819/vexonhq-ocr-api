@@ -217,6 +217,19 @@ def _build_category_summary(month: str) -> openpyxl.Workbook:
                 (month, month),
             )
             no_budget_rows = _rows_to_dicts(cur)
+
+            # FA-016: uncategorized spend must appear so the sheet total ties to the
+            # daybook expense total (auditors cross-foot the two files).
+            cur.execute(
+                """SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total
+                   FROM public.v_daybook_pnl
+                   WHERE direction = 'expense'
+                     AND category_code IS NULL
+                     AND TO_CHAR(entry_date, 'YYYY-MM') = %s""",
+                (month,),
+            )
+            _u = cur.fetchone()
+            uncat_count, uncat_total = int(_u[0]), float(_u[1])
     finally:
         conn.close()
 
@@ -268,6 +281,19 @@ def _build_category_summary(month: str) -> openpyxl.Workbook:
             _data_cell(ws_exp, row, 7, None, align=CENTER, fill=FILL_GRAY)
             ws_exp.row_dimensions[row].height = 18
             row += 1
+
+    # FA-016: uncategorized bucket row (before total) so the total ties to daybook.
+    if uncat_total > 0:
+        _data_cell(ws_exp, row, 1, "", align=CENTER, fill=FILL_AMBER)
+        _data_cell(ws_exp, row, 2, f"ไม่ระบุหมวด ({uncat_count} รายการ)", fill=FILL_AMBER)
+        _data_cell(ws_exp, row, 3, "Uncategorized", fill=FILL_AMBER)
+        _data_cell(ws_exp, row, 4, None, align=CENTER, fill=FILL_AMBER)
+        _data_cell(ws_exp, row, 5, uncat_total, align=RIGHT, num_format='#,##0.00', fill=FILL_AMBER)
+        _data_cell(ws_exp, row, 6, None, align=CENTER, fill=FILL_AMBER)
+        _data_cell(ws_exp, row, 7, None, align=CENTER, fill=FILL_AMBER)
+        ws_exp.row_dimensions[row].height = 18
+        total_actual += uncat_total
+        row += 1
 
     # Total row
     t1 = ws_exp.cell(row=row, column=1, value="รวมทั้งหมด")
@@ -377,7 +403,7 @@ def _build_daybook(month: str) -> openpyxl.Workbook:
             cur.execute(
                 """SELECT d.entry_date,
                           d.direction,
-                          COALESCE(ec.name_th, d.category_code, d.source, '') AS category_name,
+                          COALESCE(ec.name_th, d.category_code, 'ไม่ระบุ') AS category_name,
                           COALESCE(d.label, d.counterparty, '') AS detail,
                           d.source,
                           CASE WHEN d.direction = 'income'  THEN d.amount ELSE NULL END AS income,
@@ -822,6 +848,18 @@ def export_summary(month: str = Query(..., description="YYYY-MM")):
             r3 = cur.fetchone()
             cat_count, total_spend = int(r3[0]), float(r3[1])
 
+            # FA-016: surface uncategorized spend so the UI can warn before export.
+            cur.execute(
+                """SELECT COUNT(*), COALESCE(SUM(amount), 0)
+                   FROM public.v_daybook_pnl
+                   WHERE direction = 'expense'
+                     AND category_code IS NULL
+                     AND entry_date BETWEEN %s AND %s""",
+                (first, last),
+            )
+            r3u = cur.fetchone()
+            uncat_count, uncat_total = int(r3u[0]), float(r3u[1])
+
             # commission breakdown stats
             cur.execute(
                 """SELECT COUNT(DISTINCT platform) AS plat_count,
@@ -853,6 +891,8 @@ def export_summary(month: str = Query(..., description="YYYY-MM")):
         "category_summary": {
             "categories": cat_count,
             "total_spend": round(total_spend, 2),
+            "uncategorized_rows": uncat_count,
+            "uncategorized_total": round(uncat_total, 2),
         },
         "commission_breakdown": {
             "platforms": plat_count,
@@ -861,6 +901,195 @@ def export_summary(month: str = Query(..., description="YYYY-MM")):
         "zip_bundle": {
             "files": 3,
             "size_bytes_est": zip_est,
+        },
+    }
+
+
+def _assemble_audit_vouchers(vrows: list[dict], slips_by_stmt: dict, inv_by_stmt: dict,
+                             wht_rules: dict) -> list[dict]:
+    """Pure voucher assembly (no DB) so ordering/WHT/evidence-linking are unit-testable.
+    `vrows` must already be sorted (entry_date, ref_id); seq is assigned here."""
+    vouchers = []
+    for i, r in enumerate(vrows, 1):
+        cat = r.get("category_code")
+        rule = wht_rules.get(cat) if cat else None
+        amount = float(r["amount"] or 0)
+        wht = None
+        if rule:
+            wht = {"rate": rule["wht_pct"], "amount": round(amount * rule["wht_pct"] / 100.0, 2)}
+        ref = str(r["ref_id"]) if r.get("ref_id") is not None else None
+        vouchers.append({
+            "seq": i,
+            "date": str(r["entry_date"]),
+            "counterparty": r.get("counterparty") or "",
+            "description": r.get("label") or "",
+            "category_code": cat,
+            "category_name_th": r.get("category_name_th") or "ไม่ระบุ",
+            "amount": round(amount, 2),
+            "wht": wht,
+            "slip": slips_by_stmt.get(ref),
+            "invoice": inv_by_stmt.get(ref),
+        })
+    return vouchers
+
+
+@router.get("/audit-package")
+def export_audit_package(month: str = Query(..., description="YYYY-MM")):
+    """ชุดเอกสารตรวจสอบรายเดือน (ใบสำคัญจ่าย + เงินสดย่อย + รายการรอเอกสาร).
+
+    Read-only JSON bundle for the printable A4 audit-package page. Evidence images
+    are public Supabase storage URLs already used elsewhere in the app.
+    Voucher numbering is stateless (PV-YYYYMM-### by entry_date,ref_id) — the
+    printed/archived PDF is the immutable snapshot (design review 2026-07-13, 5b)."""
+    from tax_routes import WHT_RULES  # noqa: PLC0415 — single source of WHT rates
+
+    first, last = _month_range(month)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # ── Summary (same P&L basis as daybook export) ──
+            cur.execute(
+                """SELECT COALESCE(SUM(CASE WHEN direction='income'  THEN amount END),0),
+                          COALESCE(SUM(CASE WHEN direction='expense' THEN amount END),0)
+                   FROM public.v_daybook_pnl
+                   WHERE entry_date BETWEEN %s AND %s""",
+                (first, last),
+            )
+            _s = cur.fetchone()
+            income_pnl, expense_pnl = float(_s[0] or 0), float(_s[1] or 0)
+
+            # ── Voucher rows: bank-side expenses (petty cash goes to its own book) ──
+            cur.execute(
+                """SELECT d.entry_date, d.amount, d.category_code,
+                          COALESCE(ec.name_th, d.category_code, 'ไม่ระบุ') AS category_name_th,
+                          d.counterparty, d.label, d.ref_id::text AS ref_id
+                   FROM public.v_daybook_pnl d
+                   LEFT JOIN public.expense_categories ec ON ec.code = d.category_code
+                   WHERE d.direction = 'expense'
+                     AND d.source <> 'pos_cashflow'
+                     AND d.entry_date BETWEEN %s AND %s
+                   ORDER BY d.entry_date, d.ref_id""",
+                (first, last),
+            )
+            vrows = _rows_to_dicts(cur)
+            ref_ids = [r["ref_id"] for r in vrows if r["ref_id"]]
+
+            # ── Evidence: slips matched to those statement rows ──
+            slips_by_stmt: dict = {}
+            if ref_ids:
+                cur.execute(
+                    """SELECT matched_statement_id::text AS stmt_id, raw_image_url, ref_no,
+                              transfer_date, transfer_time
+                       FROM public.slips
+                       WHERE matched_statement_id::text = ANY(%s)""",
+                    (ref_ids,),
+                )
+                for s in _rows_to_dicts(cur):
+                    slips_by_stmt[s["stmt_id"]] = {
+                        "image_url": s["raw_image_url"],
+                        "ref_no": s["ref_no"],
+                        "transfer_date": str(s["transfer_date"]) if s["transfer_date"] else None,
+                        "transfer_time": str(s["transfer_time"]) if s["transfer_time"] else None,
+                    }
+
+            # ── Evidence: invoices linked via bank_statement_entries.matched_invoice_id ──
+            inv_by_stmt: dict = {}
+            if ref_ids:
+                cur.execute(
+                    """SELECT b.id::text AS stmt_id, vb.attachment_url, vb.invoice_no, vb.vendor_name
+                       FROM public.bank_statement_entries b
+                       JOIN public.vendor_bills vb ON vb.id = b.matched_invoice_id
+                       WHERE b.id::text = ANY(%s)""",
+                    (ref_ids,),
+                )
+                for v in _rows_to_dicts(cur):
+                    inv_by_stmt[v["stmt_id"]] = {
+                        "image_url": v["attachment_url"],
+                        "invoice_no": v["invoice_no"],
+                        "vendor_name": v["vendor_name"],
+                    }
+
+            vouchers = _assemble_audit_vouchers(vrows, slips_by_stmt, inv_by_stmt, WHT_RULES)
+
+            # ── Petty cash book (pos_cashflow) ──
+            cur.execute(
+                """SELECT d.entry_date, d.label,
+                          COALESCE(ec.name_th, d.category_code, 'ไม่ระบุ') AS category_name_th,
+                          d.amount
+                   FROM public.v_daybook_pnl d
+                   LEFT JOIN public.expense_categories ec ON ec.code = d.category_code
+                   WHERE d.direction = 'expense'
+                     AND d.source = 'pos_cashflow'
+                     AND d.entry_date BETWEEN %s AND %s
+                   ORDER BY d.entry_date, d.ref_id""",
+                (first, last),
+            )
+            petty = [
+                {"date": str(p["entry_date"]), "description": p["label"] or "",
+                 "category_name_th": p["category_name_th"], "amount": round(float(p["amount"] or 0), 2)}
+                for p in _rows_to_dicts(cur)
+            ]
+            petty_total = round(sum(p["amount"] for p in petty), 2)
+
+            # ── Missing-documents schedule (3 explicit types — design review risk #2) ──
+            expenses_without_slip = [
+                {"pv": f"PV-{month.replace('-', '')}-{v['seq']:03d}", "date": v["date"],
+                 "counterparty": v["counterparty"], "description": v["description"], "amount": v["amount"]}
+                for v in vouchers if v["slip"] is None
+            ]
+            cur.execute(
+                """SELECT bill_date, vendor_name, invoice_no, amount
+                   FROM public.vendor_bills
+                   WHERE COALESCE(review_status, '') <> 'rejected'
+                     AND attachment_url IS NULL
+                     AND bill_date BETWEEN %s AND %s
+                   ORDER BY bill_date""",
+                (first, last),
+            )
+            bills_without_attachment = [
+                {"date": str(b["bill_date"]), "vendor_name": b["vendor_name"],
+                 "invoice_no": b["invoice_no"], "amount": round(float(b["amount"] or 0), 2)}
+                for b in _rows_to_dicts(cur)
+            ]
+            cur.execute(
+                """SELECT transfer_date, amount, memo, recipient_name
+                   FROM public.slips
+                   WHERE matched_statement_id IS NULL
+                     AND transfer_date BETWEEN %s AND %s
+                   ORDER BY transfer_date""",
+                (first, last),
+            )
+            unmatched_slips = [
+                {"date": str(s["transfer_date"]), "amount": round(float(s["amount"] or 0), 2),
+                 "memo": s["memo"] or "", "recipient_name": s["recipient_name"] or ""}
+                for s in _rows_to_dicts(cur)
+            ]
+    finally:
+        conn.close()
+
+    return {
+        "month": month,
+        "month_label_th": _month_label_th(month),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "summary": {
+            "income_pnl": round(income_pnl, 2),
+            "expense_pnl": round(expense_pnl, 2),
+            "voucher_count": len(vouchers),
+            "voucher_total": round(sum(v["amount"] for v in vouchers), 2),
+            "petty_count": len(petty),
+            "petty_total": petty_total,
+            "missing_counts": {
+                "no_slip": len(expenses_without_slip),
+                "no_invoice_attachment": len(bills_without_attachment),
+                "unmatched_slips": len(unmatched_slips),
+            },
+        },
+        "vouchers": vouchers,
+        "petty_cash": petty,
+        "missing": {
+            "expenses_without_slip": expenses_without_slip,
+            "bills_without_attachment": bills_without_attachment,
+            "unmatched_slips": unmatched_slips,
         },
     }
 
