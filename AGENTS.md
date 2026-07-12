@@ -11,6 +11,10 @@ description: AI coding agent for vexonhq-ocr-api FastAPI backend (Mara Station r
 
 > **🔁 Multi-agent flow + 3-AI self-review → source of truth = global `~/.claude/CLAUDE.md`.**
 > ตั้งแต่ **2026-06-08 roles สลับ**: *Claude เขียนโค้ดเอง*, Antigravity เป็น reviewer. ก่อนรายงาน TUM, Claude self-review ด้วย `C:\Users\rapee\review.ps1` (Tier 2 **Codex** → Tier 3 **Gemini REST** ฟรี สลับอัตโนมัติเมื่อ Codex หมด limit). รันเฉพาะงานสำคัญ (auth/เงิน/security/migration/หลายไฟล์); งาน routine ใช้ `-Engine gemini`.
+
+> **✅ FULL SYSTEM AUDIT — DONE & CLOSED 2026-07-12.** ตรวจใหญ่ clean-slate ทั้งระบบเสร็จแล้ว (15 findings ปิดครบ + data backfill ฿274k + ระบบ auto-categorize ใหม่).
+> **Baseline บังคับก่อนแตะงาน audit/การเงิน/หมวดบัญชี:** `VEXONHQ/docs/audit/fresh-audit-2026-07-11/00-AUDIT-CLOSED-SUMMARY.md` (กติกา TUM: ห้าม re-audit จากศูนย์ / ห้ามใช้ audit เก่ากว่านี้).
+> Standing facts ที่ต้องเคารพ: AP = `vendor_bills` unpaid AND `review_status<>'rejected'` · P&L cash basis ใช้ `income_pnl`/`expense_pnl` ตรงๆ (ห้าม derive จากการลบ) · `ai_cat_status` รองรับค่า `'rule'` · โอนให้นุศราต้องมีหลักฐานต่อรายการ ห้ามเหมาหมวด.
 ---
 
 ## Persona
