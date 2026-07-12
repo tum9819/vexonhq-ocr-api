@@ -267,6 +267,93 @@ def purchase_history(
 # qty_in_stock < qty_max (i.e. qty_diff > 0). Includes urgency
 # band and excludes Pro/(pro) promo SKUs.
 
+UNCATEGORIZED_TAGS = {"", "nan", "null", "none", "undefined", "ไม่ระบุ"}
+DEFAULT_UNCATEGORIZED_QTY_MAX = 300.0
+MAX_REVIEW_NOTE = "MAX ยังไม่ได้ตั้ง — ตรวจสอบ"
+
+
+def _normalize_inventory_tag(tag: Optional[str]) -> str:
+    t = str(tag or "").strip()
+    if not t:
+        return "ไม่ระบุ"
+    if t.lower() in UNCATEGORIZED_TAGS or set(t) == {"?"}:
+        return "ไม่ระบุ"
+    return t
+
+
+def _is_orderable_inventory_tag(tag: Optional[str]) -> bool:
+    return str(tag or "").strip().upper() != "MENU"
+
+
+def _looks_like_default_uncategorized_max(tag: Optional[str], qty_max: float) -> bool:
+    return (
+        _normalize_inventory_tag(tag) == "ไม่ระบุ"
+        and float(qty_max or 0) == DEFAULT_UNCATEGORIZED_QTY_MAX
+    )
+
+
+def _build_reorder_item(name: str,
+                        tag: Optional[str],
+                        qty_current,
+                        qty_max,
+                        price,
+                        unit: Optional[str]) -> dict:
+    q_cur_raw = float(qty_current or 0)
+    q_cur_for_order = max(q_cur_raw, 0.0)
+    q_max = float(qty_max or 0)
+    price = float(price or 0)
+    max_needs_review = _looks_like_default_uncategorized_max(tag, q_max)
+    to_order = 0.0 if max_needs_review else max(q_max - q_cur_for_order, 0.0)
+
+    if q_cur_for_order <= 0:
+        urgency = "critical"
+    elif q_max > 0 and q_cur_for_order < q_max * 0.25:
+        urgency = "high"
+    elif q_max > 0 and q_cur_for_order < q_max * 0.5:
+        urgency = "medium"
+    else:
+        urgency = "low"
+
+    est_cost = 0.0 if max_needs_review else round(to_order * price, 2)
+
+    return {
+        "item_name":   name,
+        "tag":         _normalize_inventory_tag(tag),
+        "qty_current": q_cur_raw,
+        "qty_max":     q_max,
+        "qty_to_order": to_order,
+        "unit":        unit or "",
+        "unit_price":  price,
+        "est_cost":    est_cost,
+        "urgency":     urgency,
+        "max_needs_review": max_needs_review,
+        "reorder_note": MAX_REVIEW_NOTE if max_needs_review else None,
+        "cost_included": not max_needs_review,
+    }
+
+
+def _summarize_reorder_items(items: list[dict]) -> dict:
+    summary = {
+        "total_items": 0,
+        "critical": 0,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "needs_max_review": 0,
+        "est_total_cost": 0.0,
+    }
+    for item in items:
+        urgency = item.get("urgency", "low")
+        summary["total_items"] += 1
+        summary[urgency] += 1
+        if item.get("max_needs_review"):
+            summary["needs_max_review"] += 1
+        else:
+            summary["est_total_cost"] += float(item.get("est_cost") or 0)
+    summary["est_total_cost"] = round(summary["est_total_cost"], 2)
+    return summary
+
+
 def _compute_reorder_list(branch_code: str = DEFAULT_BRANCH,
                           tag: Optional[str] = None) -> dict:
     """
@@ -281,9 +368,7 @@ def _compute_reorder_list(branch_code: str = DEFAULT_BRANCH,
 
     snapshot_id, snapshot_at = _get_latest_snapshot_id(branch_code)
     if not snapshot_id:
-        return {"snapshot_at": None, "items": [], "summary": {
-            "total_items": 0, "critical": 0, "high": 0, "medium": 0, "low": 0,
-        }}
+        return {"snapshot_at": None, "items": [], "summary": _summarize_reorder_items([])}
 
     sql = """
         SELECT
@@ -295,7 +380,8 @@ def _compute_reorder_list(branch_code: str = DEFAULT_BRANCH,
             unit
         FROM public.pos_inventory_items
         WHERE snapshot_id = %s
-          AND COALESCE(qty_max, 0) > COALESCE(qty_in_stock, 0)
+          AND UPPER(COALESCE(NULLIF(TRIM(tag), ''), '')) <> 'MENU'
+          AND COALESCE(qty_max, 0) > GREATEST(COALESCE(qty_in_stock, 0), 0)
           AND LOWER(item_name) NOT LIKE %s
           AND LOWER(item_name) NOT LIKE %s
     """
@@ -315,41 +401,12 @@ def _compute_reorder_list(branch_code: str = DEFAULT_BRANCH,
     finally:
         conn.close()
 
-    items: list[dict] = []
-    summary = {"total_items": 0, "critical": 0, "high": 0, "medium": 0, "low": 0,
-               "est_total_cost": 0.0}
-
-    for name, t, q_cur, q_max, price, unit in rows:
-        q_cur = float(q_cur or 0)
-        q_max = float(q_max or 0)
-        to_order = max(q_max - q_cur, 0)
-        price = float(price or 0)
-
-        if q_cur <= 0:
-            urgency = "critical"
-        elif q_max > 0 and q_cur < q_max * 0.25:
-            urgency = "high"
-        elif q_max > 0 and q_cur < q_max * 0.5:
-            urgency = "medium"
-        else:
-            urgency = "low"
-
-        items.append({
-            "item_name":   name,
-            "tag":         t or "ไม่ระบุ",
-            "qty_current": q_cur,
-            "qty_max":     q_max,
-            "qty_to_order": to_order,
-            "unit":        unit or "",
-            "unit_price":  price,
-            "est_cost":    round(to_order * price, 2),
-            "urgency":     urgency,
-        })
-        summary["total_items"] += 1
-        summary[urgency] += 1
-        summary["est_total_cost"] += to_order * price
-
-    summary["est_total_cost"] = round(summary["est_total_cost"], 2)
+    items = [
+        _build_reorder_item(name, t, q_cur, q_max, price, unit)
+        for name, t, q_cur, q_max, price, unit in rows
+        if _is_orderable_inventory_tag(t)
+    ]
+    summary = _summarize_reorder_items(items)
 
     return {
         "snapshot_at": snapshot_at,
