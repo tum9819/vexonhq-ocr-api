@@ -391,6 +391,7 @@ class JWTAuthMiddleware(BaseHTTPMiddleware):
         # After Supabase SSO migration, sub is a UUID (e.g. "a1b2c3d4-...").
         # Falls back to None if the token had no `sub` claim.
         request.state.username = payload.get("sub")
+        request.state.role = payload.get("_role")
 
         return await call_next(request)
 

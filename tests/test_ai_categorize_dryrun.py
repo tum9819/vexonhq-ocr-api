@@ -156,7 +156,7 @@ def test_cashflow_batch_categorize_dry_run(client):
         [("9504a58b-3023-455b-bf99-2e06180a316d",)],  # pos_cashflow_entries
     ]
     mock_cur.fetchone.side_effect = [
-        ("9504a58b-3023-455b-bf99-2e06180a316d", "ผักสด", False, "pending"), # pos_cashflow_entries details
+        ("9504a58b-3023-455b-bf99-2e06180a316d", "ผักสด", False, "pending", None), # pos_cashflow_entries details
         ("ผักสด Rule", "food_raw"),                   # vendor_category_rules pattern, category_code
     ]
 
@@ -198,7 +198,7 @@ def test_cashflow_batch_categorize_no_dry_run(client):
         [("9504a58b-3023-455b-bf99-2e06180a316d",)],  # pos_cashflow_entries
     ]
     mock_cur.fetchone.side_effect = [
-        ("9504a58b-3023-455b-bf99-2e06180a316d", "ผักสด", False, "pending"), # pos_cashflow_entries details
+        ("9504a58b-3023-455b-bf99-2e06180a316d", "ผักสด", False, "pending", None), # pos_cashflow_entries details
         ("ผักสด Rule", "food_raw"),                   # vendor_category_rules pattern, category_code
     ]
 
@@ -234,8 +234,7 @@ def test_reject_user_action_nulls_out_category(client):
     mock_cur = MagicMock()
     mock_conn.cursor.return_value.__enter__.return_value = mock_cur
 
-    # SELECT bill_id, suggested_category FROM public.ai_categorization_log WHERE id = %s
-    mock_cur.fetchone.return_value = ("bill-uuid-1", "food_raw")
+    mock_cur.fetchone.return_value = ("bill-uuid-1", None, "bill", "food_raw", None, True, None)
 
     with patch("phase3a_ai_categorize_routes.get_db_conn", return_value=mock_conn):
         response = client.patch(
@@ -251,4 +250,4 @@ def test_reject_user_action_nulls_out_category(client):
     assert mock_conn.commit.called
 
     executed_queries = [call[0][0] for call in mock_cur.execute.call_args_list]
-    assert any("UPDATE public.vendor_bills SET category_code = NULL WHERE id = %s" in q for q in executed_queries)
+    assert any("UPDATE public.vendor_bills SET category_code = %s WHERE id = %s" in q for q in executed_queries)

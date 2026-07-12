@@ -1,11 +1,30 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-07-12 (T3 daybook P&L totals fix-forward local; awaiting final review and push confirmation)
+**Last updated**: 2026-07-12 (FA-003 auto-categorize rules + audit trail local; awaiting auditor review and push confirmation)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
 
 ---
+
+## 🟡 2026-07-12 — FA-003 deterministic rules + AI auto-apply audit trail
+
+Local backend commits only, not pushed and not deployed.
+
+Scope:
+- Part 1: `pos_import.py` classifies TUM-confirmed POS cashflow shorthand `i/v/g` and proven keywords at import time, setting `category_code` plus `ai_cat_status='rule'`. Unknown descriptions remain `pending`.
+- Part 1: `migrations/2026_07_12_fa003_slip_beverage_rules.sql` seeds beverage memo keywords in `statement_rules`.
+- Part 2: `phase3a_ai_categorize_routes.py` adds confidence-gated auto-apply, additive audit columns, admin undo, and a dry-run-first endpoint for applying already logged pending suggestions.
+- Part 2: `/ai-review` frontend companion lives in the VEXONHQ repo and separates Pending vs Auto review queues.
+
+Deploy order:
+1. Apply `migrations/2026_07_12_fa003_ai_autoapply_audit.sql` before deploying the backend code that reads the new columns.
+2. Push/deploy backend, then frontend.
+3. Verify `/health/deep`, `/ai-review` Pending/Auto, and VPS CPU settled.
+
+Guardrails:
+- No `v_daybook*`, WAC, amount, or historical row mutation.
+- Old backlog is not auto-applied. The pending apply endpoint defaults to `dry_run=true` and should only be run for real after TUM approves the candidate list.
 
 ## 🟡 2026-07-12 — T3 daybook P&L basis fix-forward
 

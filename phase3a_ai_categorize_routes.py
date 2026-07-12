@@ -23,7 +23,7 @@ from datetime import date, datetime
 from typing import Any, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 try:
@@ -32,6 +32,11 @@ except ImportError:
     import psycopg2
     def get_db_conn():
         return psycopg2.connect(os.environ["DATABASE_URL"])
+
+try:
+    from auth_routes import verify_token  # type: ignore
+except ImportError:
+    verify_token = None  # type: ignore
 
 
 logger = logging.getLogger("phase3a_ai_categorize")
@@ -42,6 +47,7 @@ LLM_MODEL = MODELS["categorize"]
 # Pricing as of 2026-05 (per 1M tokens)
 LLM_PRICE_INPUT_PER_1M = 0.15
 LLM_PRICE_OUTPUT_PER_1M = 0.60
+DEFAULT_AUTOAPPLY_MIN_CONF = 0.90
 
 
 # ============================================================
@@ -76,6 +82,42 @@ def _calculate_cost(prompt_tokens: int, completion_tokens: int) -> float:
         + (completion_tokens * LLM_PRICE_OUTPUT_PER_1M / 1_000_000),
         6,
     )
+
+
+def _autoapply_min_confidence() -> float:
+    raw = os.getenv("AI_AUTOAPPLY_MIN_CONF", str(DEFAULT_AUTOAPPLY_MIN_CONF))
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid AI_AUTOAPPLY_MIN_CONF=%r; using %.2f", raw, DEFAULT_AUTOAPPLY_MIN_CONF)
+        return DEFAULT_AUTOAPPLY_MIN_CONF
+
+
+def _should_autoapply(result: dict) -> bool:
+    """Rules are deterministic; LLM suggestions need confidence >= env threshold."""
+    if result.get("tier") == "rule":
+        return True
+    confidence = result.get("confidence")
+    try:
+        return float(confidence) >= _autoapply_min_confidence()
+    except (TypeError, ValueError):
+        return False
+
+
+def _require_admin_actor(request: Request) -> str:
+    if getattr(request.state, "role", None) == "admin":
+        return str(getattr(request.state, "username", None) or "admin")
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(401, "Not authenticated")
+    if verify_token is None:
+        raise HTTPException(500, "Auth verifier unavailable")
+    payload = verify_token(auth_header[7:])
+    if not payload:
+        raise HTTPException(401, "Token expired or invalid")
+    if payload.get("_role") != "admin":
+        raise HTTPException(403, "Admin access required")
+    return str(payload.get("sub") or "admin")
 
 
 # ============================================================
@@ -308,23 +350,27 @@ def _categorize_one(conn, bill_id: str, allow_llm: bool = True, dry_run: bool = 
                 "dry_run": True,
             }
 
-        # Apply category to bill
-        cur.execute(
-            "UPDATE public.vendor_bills SET category_code = %s WHERE id = %s",
-            (result["category_code"], bill_id),
-        )
+        before_category = bill.get("category_code")
+        should_apply = _should_autoapply(result)
+
+        if should_apply:
+            cur.execute(
+                "UPDATE public.vendor_bills SET category_code = %s WHERE id = %s",
+                (result["category_code"], bill_id),
+            )
 
         # Insert log entry
         cur.execute(
             """INSERT INTO public.ai_categorization_log
                  (bill_id, tier_used, suggested_category, confidence,
                   rule_pattern, model_name, prompt_tokens, completion_tokens,
-                  cost_usd, reason)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                  cost_usd, reason, applied, before_category, applied_by)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                RETURNING id, applied_at""",
             (bill_id, result["tier"], result["category_code"], result["confidence"],
              result.get("rule_pattern"), model_name, prompt_tokens, completion_tokens,
-             cost_usd, result.get("reason")),
+             cost_usd, result.get("reason"), should_apply, before_category,
+             "rule" if result["tier"] == "rule" else "ai"),
         )
         log_id, applied_at = cur.fetchone()
         conn.commit()
@@ -337,7 +383,115 @@ def _categorize_one(conn, bill_id: str, allow_llm: bool = True, dry_run: bool = 
             "confidence": result["confidence"],
             "cost_usd": cost_usd,
             "reason": result.get("reason"),
+            "applied": should_apply,
         }
+
+
+def _log_target_status(before_category: Optional[str]) -> str:
+    return "pending" if before_category is None else "confirmed"
+
+
+def _apply_target_category(cur, source: str, bill_id: Optional[str], cashflow_entry_id: Optional[str],
+                           category_code: Optional[str]) -> None:
+    if source == "cashflow":
+        if not cashflow_entry_id:
+            raise HTTPException(400, "Log entry has no cashflow_entry_id")
+        cur.execute(
+            """UPDATE public.pos_cashflow_entries
+               SET category_code = %s,
+                   ai_cat_status = %s
+               WHERE id = %s""",
+            (category_code, _log_target_status(category_code), cashflow_entry_id),
+        )
+        return
+
+    if not bill_id:
+        raise HTTPException(400, "Log entry has no bill_id")
+    cur.execute(
+        "UPDATE public.vendor_bills SET category_code = %s WHERE id = %s",
+        (category_code, bill_id),
+    )
+
+
+def _fetch_log_target(cur, log_id: str) -> tuple:
+    cur.execute(
+        """SELECT bill_id, cashflow_entry_id, source, suggested_category,
+                  before_category, COALESCE(applied, true), undone_at
+           FROM public.ai_categorization_log
+           WHERE id = %s""",
+        (log_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Log entry not found")
+    return row
+
+
+def _apply_log_user_action(cur, log_id: str, action: str,
+                           override_category: Optional[str] = None,
+                           *, actor: Optional[str] = None) -> None:
+    bill_id, cashflow_entry_id, source, suggested, before_category, applied, undone_at = _fetch_log_target(cur, log_id)
+    if undone_at is not None:
+        raise HTTPException(409, "Log entry already undone")
+
+    if action == "accept":
+        target_category = suggested
+        _apply_target_category(cur, source, bill_id, cashflow_entry_id, target_category)
+        cur.execute(
+            """UPDATE public.ai_categorization_log
+               SET user_action = 'accept',
+                   user_action_at = now(),
+                   applied = true,
+                   applied_at = now(),
+                   applied_by = 'human'
+               WHERE id = %s""",
+            (log_id,),
+        )
+        return
+
+    if action == "override":
+        if not override_category:
+            raise HTTPException(400, "override_category required when action=override")
+        _apply_target_category(cur, source, bill_id, cashflow_entry_id, override_category)
+        cur.execute(
+            """UPDATE public.ai_categorization_log
+               SET user_action = 'override',
+                   user_action_at = now(),
+                   override_category = %s,
+                   applied = true,
+                   applied_at = now(),
+                   applied_by = 'human'
+               WHERE id = %s""",
+            (override_category, log_id),
+        )
+        return
+
+    if action == "reject":
+        if applied:
+            _apply_target_category(cur, source, bill_id, cashflow_entry_id, before_category)
+            cur.execute(
+                """UPDATE public.ai_categorization_log
+                   SET user_action = 'reject',
+                       user_action_at = now(),
+                       applied = false,
+                       undone_at = now(),
+                       undone_by = %s,
+                       undo_reason = 'user_reject'
+                   WHERE id = %s""",
+                (actor, log_id),
+            )
+        else:
+            cur.execute(
+                """UPDATE public.ai_categorization_log
+                   SET user_action = 'reject',
+                       user_action_at = now(),
+                       applied = false
+                   WHERE id = %s""",
+                (log_id,),
+            )
+        return
+
+    raise HTTPException(400, "action must be accept | reject | override")
 
 
 # ============================================================
@@ -370,8 +524,16 @@ def categorize_batch(
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT id FROM public.v_bills_needing_category
-                   ORDER BY created_at ASC LIMIT %s""",
+                """SELECT v.id
+                   FROM public.v_bills_needing_category v
+                   WHERE NOT EXISTS (
+                       SELECT 1
+                       FROM public.ai_categorization_log l
+                       WHERE l.bill_id = v.id
+                         AND l.user_action IS NULL
+                         AND COALESCE(l.applied, true) = false
+                   )
+                   ORDER BY v.created_at ASC LIMIT %s""",
                 (limit,),
             )
             bill_ids = [str(row[0]) for row in cur.fetchall()]
@@ -413,7 +575,7 @@ def categorize_batch(
 
 
 @router.patch("/ai/categorize/log/{log_id}")
-def user_action(log_id: str, body: UserActionBody):
+def user_action(log_id: str, body: UserActionBody, request: Request):
     """Accept/reject/override the AI suggestion. If override, update vendor_bills too."""
     try:
         UUID(log_id)
@@ -424,42 +586,49 @@ def user_action(log_id: str, body: UserActionBody):
     if body.action == "override" and not body.override_category:
         raise HTTPException(400, "override_category required when action=override")
 
+    actor = _require_admin_actor(request)
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT bill_id, suggested_category FROM public.ai_categorization_log WHERE id = %s",
-                (log_id,),
-            )
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(404, "Log entry not found")
-            bill_id, _suggested = row
-
             if body.action == "override":
                 if not _validate_category_exists(cur, body.override_category):
                     raise HTTPException(404, f"Category not found: {body.override_category}")
-                cur.execute(
-                    "UPDATE public.vendor_bills SET category_code = %s WHERE id = %s",
-                    (body.override_category, bill_id),
-                )
-
-            if body.action == "reject":
-                cur.execute(
-                    "UPDATE public.vendor_bills SET category_code = NULL WHERE id = %s",
-                    (bill_id,),
-                )
-
-            cur.execute(
-                """UPDATE public.ai_categorization_log
-                   SET user_action = %s,
-                       user_action_at = now(),
-                       override_category = %s
-                   WHERE id = %s""",
-                (body.action, body.override_category if body.action == "override" else None, log_id),
-            )
+            _apply_log_user_action(cur, log_id, body.action, body.override_category, actor=actor)
             conn.commit()
         return {"log_id": log_id, "action": body.action, "applied": True}
+    finally:
+        conn.close()
+
+
+@router.post("/ai/categorize/{log_id}/undo")
+def undo_categorize_log(log_id: str, request: Request):
+    """Admin undo for an auto-applied categorization log."""
+    try:
+        UUID(log_id)
+    except (ValueError, TypeError):
+        raise HTTPException(400, "Invalid log_id UUID")
+
+    actor = _require_admin_actor(request)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            bill_id, cashflow_entry_id, source, _suggested, before_category, applied, undone_at = _fetch_log_target(cur, log_id)
+            if undone_at is not None:
+                raise HTTPException(409, "Log entry already undone")
+            if not applied:
+                raise HTTPException(409, "Log entry was not applied")
+            _apply_target_category(cur, source, bill_id, cashflow_entry_id, before_category)
+            cur.execute(
+                """UPDATE public.ai_categorization_log
+                   SET applied = false,
+                       undone_at = now(),
+                       undone_by = %s,
+                       undo_reason = 'admin_undo'
+                   WHERE id = %s""",
+                (actor, log_id),
+            )
+            conn.commit()
+        return {"log_id": log_id, "undone": True, "restored_category": before_category}
     finally:
         conn.close()
 
@@ -486,7 +655,7 @@ def list_pending(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge
 
 @router.get("/ai/categorize/log/list")
 def list_log_entries(
-    user_action: Optional[str] = Query(None, description="pending | accept | reject | override | all"),
+    user_action: Optional[str] = Query(None, description="pending | auto | accept | reject | override | all"),
     tier: Optional[str] = Query(None, description="rule | llm | manual | fallback"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
@@ -497,13 +666,15 @@ def list_log_entries(
     params: list[Any] = []
 
     if user_action == "pending" or user_action is None:
-        where.append("l.user_action IS NULL")
+        where.append("l.user_action IS NULL AND COALESCE(l.applied, true) = false")
+    elif user_action == "auto":
+        where.append("l.user_action IS NULL AND COALESCE(l.applied, true) = true AND l.undone_at IS NULL")
     elif user_action in ("accept", "reject", "override"):
         where.append("l.user_action = %s"); params.append(user_action)
     elif user_action == "all":
         pass
     else:
-        raise HTTPException(400, "user_action must be pending | accept | reject | override | all")
+        raise HTTPException(400, "user_action must be pending | auto | accept | reject | override | all")
 
     if tier:
         if tier not in ("rule", "llm", "manual", "fallback"):
@@ -521,9 +692,16 @@ def list_log_entries(
                            l.confidence, l.rule_pattern, l.model_name,
                            l.prompt_tokens, l.completion_tokens, l.cost_usd, l.reason,
                            l.applied_at, l.user_action, l.user_action_at, l.override_category,
-                           vb.vendor_name, vb.amount, vb.bill_date, vb.invoice_no
+                           COALESCE(l.applied, true) AS applied,
+                           l.before_category, l.applied_by, l.undone_at,
+                           l.cashflow_entry_id, l.source,
+                           COALESCE(vb.vendor_name, pce.description) AS vendor_name,
+                           COALESCE(vb.amount, pce.amount) AS amount,
+                           COALESCE(vb.bill_date, pce.txn_date) AS bill_date,
+                           vb.invoice_no
                     FROM public.ai_categorization_log l
                     LEFT JOIN public.vendor_bills vb ON vb.id = l.bill_id
+                    LEFT JOIN public.pos_cashflow_entries pce ON pce.id = l.cashflow_entry_id
                     LEFT JOIN public.expense_categories c ON c.code = l.suggested_category
                     {sql_where}
                     ORDER BY l.applied_at DESC
@@ -554,6 +732,74 @@ def categorize_stats():
         conn.close()
 
 
+@router.post("/ai/categorize/pending/apply")
+def apply_pending_categorizations(
+    request: Request,
+    min_conf: Optional[float] = Query(None, ge=0, description="Confidence threshold; defaults to AI_AUTOAPPLY_MIN_CONF"),
+    dry_run: bool = Query(True),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Admin-controlled one-shot apply for already logged pending suggestions."""
+    actor = _require_admin_actor(request)
+    threshold = _autoapply_min_confidence() if min_conf is None else min_conf
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT l.id, l.bill_id, l.cashflow_entry_id, l.source,
+                          l.suggested_category, l.confidence,
+                          COALESCE(vb.vendor_name, pce.description) AS label,
+                          COALESCE(vb.amount, pce.amount) AS amount
+                   FROM public.ai_categorization_log l
+                   LEFT JOIN public.vendor_bills vb ON vb.id = l.bill_id
+                   LEFT JOIN public.pos_cashflow_entries pce ON pce.id = l.cashflow_entry_id
+                   WHERE l.user_action IS NULL
+                     AND COALESCE(l.applied, true) = false
+                     AND l.undone_at IS NULL
+                     AND l.confidence >= %s
+                   ORDER BY l.applied_at ASC
+                   LIMIT %s""",
+                (threshold, limit),
+            )
+            rows = _rows_to_dicts(cur)
+            if dry_run:
+                conn.rollback()
+                return {
+                    "dry_run": True,
+                    "threshold": threshold,
+                    "count": len(rows),
+                    "rows": rows,
+                }
+
+            applied_rows = []
+            for row in rows:
+                _apply_target_category(
+                    cur,
+                    row["source"],
+                    row.get("bill_id"),
+                    row.get("cashflow_entry_id"),
+                    row["suggested_category"],
+                )
+                cur.execute(
+                    """UPDATE public.ai_categorization_log
+                       SET applied = true,
+                           applied_at = now(),
+                           applied_by = %s
+                       WHERE id = %s""",
+                    (actor or "admin_backfill", row["id"]),
+                )
+                applied_rows.append(row["id"])
+            conn.commit()
+        return {
+            "dry_run": False,
+            "threshold": threshold,
+            "applied": len(applied_rows),
+            "log_ids": applied_rows,
+        }
+    finally:
+        conn.close()
+
+
 @router.get("/ai/categorize/health")
 def ai_categorize_health():
     """Smoke: DB OK + OpenAI key present + counts."""
@@ -580,8 +826,14 @@ def ai_categorize_health():
 
 # ============================================================
 # CASHFLOW CATEGORIZATION — Phase 3B extension
-# Handles pos_cashflow_entries.ai_cat_status = 'pending'
-# No ai_categorization_log (cashflow tracks status in-table).
+# Handles pos_cashflow_entries.ai_cat_status = 'pending' and writes the same
+# ai_categorization_log audit trail as bill categorization.
+# Status values used by this worker:
+#   pending   = never categorized
+#   review    = low-confidence suggestion logged, waiting in /ai-review
+#   rule      = deterministic rule applied
+#   confirmed = accepted/auto-applied category is on the row
+#   skipped   = import-time non-AI case such as refunds
 # Uses same 2-tier: rules ILIKE first → GPT-4o-mini fallback.
 # ============================================================
 
@@ -614,14 +866,14 @@ def _categorize_cashflow_one(conn, entry_id: str, allow_llm: bool = True, dry_ru
     with conn.cursor() as cur:
         # Fetch entry
         cur.execute(
-            "SELECT id, description, is_refund, ai_cat_status "
+            "SELECT id, description, is_refund, ai_cat_status, category_code "
             "FROM public.pos_cashflow_entries WHERE id = %s",
             (entry_id,)
         )
         row = cur.fetchone()
         if not row:
             raise HTTPException(404, f"Cashflow entry not found: {entry_id}")
-        eid, description, is_refund, status = row
+        eid, description, is_refund, status, before_category = row
 
         if status != "pending":
             raise HTTPException(409, f"Entry already processed: {status}")
@@ -642,7 +894,7 @@ def _categorize_cashflow_one(conn, entry_id: str, allow_llm: bool = True, dry_ru
                         "dry_run": True}
             cur.execute(
                 "UPDATE public.pos_cashflow_entries "
-                "SET category_code=%s, ai_cat_status='confirmed' WHERE id=%s",
+                "SET category_code=%s, ai_cat_status='rule' WHERE id=%s",
                 (cat, entry_id)
             )
             # AI-6: audit-log the rule-tier decision (same txn as the row update,
@@ -650,14 +902,15 @@ def _categorize_cashflow_one(conn, entry_id: str, allow_llm: bool = True, dry_ru
             cur.execute(
                 "INSERT INTO public.ai_categorization_log "
                 "(source, cashflow_entry_id, tier_used, suggested_category, "
-                " confidence, rule_pattern) "
-                "VALUES ('cashflow', %s, 'rule', %s, 1.0, %s)",
-                (entry_id, cat, rule_result.get("rule_pattern")),
+                " confidence, rule_pattern, applied, before_category, applied_by) "
+                "VALUES ('cashflow', %s, 'rule', %s, 1.0, %s, true, %s, 'rule')",
+                (entry_id, cat, rule_result.get("rule_pattern"), before_category),
             )
             conn.commit()
             return {"entry_id": entry_id, "description": description,
                     "tier": "rule", "category_code": cat,
-                    "confidence": 1.0, "cost_usd": 0.0}
+                    "confidence": 1.0, "cost_usd": 0.0,
+                    "applied": True}
 
         # Tier 2 — LLM
         if not allow_llm:
@@ -688,26 +941,37 @@ def _categorize_cashflow_one(conn, entry_id: str, allow_llm: bool = True, dry_ru
                     "confidence": conf, "cost_usd": cost_usd,
                     "dry_run": True}
 
-        cur.execute(
-            "UPDATE public.pos_cashflow_entries "
-            "SET category_code=%s, ai_cat_status='confirmed' WHERE id=%s",
-            (cat, entry_id)
-        )
+        should_apply = _should_autoapply({"tier": "llm", "confidence": conf})
+        if should_apply:
+            cur.execute(
+                "UPDATE public.pos_cashflow_entries "
+                "SET category_code=%s, ai_cat_status='confirmed' WHERE id=%s",
+                (cat, entry_id)
+            )
+        else:
+            cur.execute(
+                "UPDATE public.pos_cashflow_entries "
+                "SET ai_cat_status='review' WHERE id=%s",
+                (entry_id,),
+            )
         # AI-6: audit-log the LLM-tier decision (tier/model/tokens/cost/reason) so
         # cashflow AI guesses are reviewable like bills. Same txn -> atomic.
         cost_usd = _calculate_cost(llm.get("prompt_tokens", 0), llm.get("completion_tokens", 0))
         cur.execute(
             "INSERT INTO public.ai_categorization_log "
             "(source, cashflow_entry_id, tier_used, suggested_category, confidence, "
-            " model_name, prompt_tokens, completion_tokens, cost_usd, reason) "
-            "VALUES ('cashflow', %s, 'llm', %s, %s, %s, %s, %s, %s, %s)",
+            " model_name, prompt_tokens, completion_tokens, cost_usd, reason, "
+            " applied, before_category, applied_by) "
+            "VALUES ('cashflow', %s, 'llm', %s, %s, %s, %s, %s, %s, %s, %s, %s, 'ai')",
             (entry_id, cat, conf, llm.get("model_name"),
-             llm.get("prompt_tokens", 0), llm.get("completion_tokens", 0), cost_usd, reason),
+             llm.get("prompt_tokens", 0), llm.get("completion_tokens", 0), cost_usd, reason,
+             should_apply, before_category),
         )
         conn.commit()
         return {"entry_id": entry_id, "description": description,
                 "tier": "llm", "category_code": cat,
-                "confidence": conf, "cost_usd": cost_usd}
+                "confidence": conf, "cost_usd": cost_usd,
+                "applied": should_apply}
 
 
 @router.post("/ai/categorize/cashflow/batch")
