@@ -1,11 +1,30 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-07-12 (FA-003 auto-categorize rules + audit trail local; awaiting auditor review and push confirmation)
+**Last updated**: 2026-07-12 (FA-008/FA-006 finance+inventory fixes local; awaiting auditor review and push confirmation)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
 
 ---
+
+## 🟡 2026-07-12 — FA-008 cashflow AP + FA-006 reorder fixes
+
+Local backend commits only, not pushed and not deployed.
+
+Scope:
+- `/cashflow` now uses the standard AP definition from `vendor_bills`: `payment_status='unpaid' AND review_status <> 'rejected'`.
+- Overdue unpaid AP is treated as a day-0/first-window cash outflow instead of disappearing from the forecast.
+- `/cashflow/summary` returns overdue AP fields and marks health as warning when any AP is overdue.
+- `/inventory/reorder` excludes `tag='MENU'`, clamps negative stock to zero for order-quantity calculation, and flags uncategorized default `MAX=300` rows as "MAX ยังไม่ได้ตั้ง — ตรวจสอบ" with no estimated cost.
+
+Verified so far:
+- Focused tests: `tests/test_cashflow_ap_standard.py`, `tests/test_inventory_reorder_rules.py`.
+- Read-only production-data check: current reorder estimate drops from the audit's ~฿208,565 to ฿112,351; 24 default-MAX rows are flagged/no-cost; MENU examples are excluded.
+
+Next:
+1. Run final `ast.parse`, focused/full pytest as applicable, and `verify.ps1`.
+2. Auditor reviews backend + frontend companion diffs.
+3. Await TUM's explicit push confirmation; after deploy verify `/cashflow`, `/inventory/reorder`, `/health/deep`, and settled VPS CPU.
 
 ## 🟡 2026-07-12 — FA-003 deterministic rules + AI auto-apply audit trail
 
