@@ -741,6 +741,39 @@ def _parse_cashflow_datetime(v: Any) -> Optional[datetime]:
     return datetime(d.year, d.month, d.day) if d else None
 
 
+_CASHFLOW_EXACT_CATEGORY_RULES = {
+    "i": "raw_beverage",  # TUM confirmed FoodStory shorthand: ice
+    "v": "raw_veggies",
+    "g": "raw_oil_gas",
+}
+
+_CASHFLOW_KEYWORD_CATEGORY_RULES: list[tuple[str, tuple[str, ...]]] = [
+    ("packaging", ("แก้ว", "ออน")),
+    ("raw_meat", ("ใส้กรอก", "ไส้กรอก", "แหนม", "แซลม่อน", "กุ้ง", "หมึก", "สามชั้น")),
+    ("raw_seasoning", ("น้ำจิ้ม", "น้ำซอส")),
+]
+
+
+def _category_for_cashflow_description(description: str) -> Optional[str]:
+    """Deterministic POS cashflow categorization for TUM-confirmed shorthand."""
+    normalized = (description or "").strip().lower()
+    if not normalized:
+        return None
+
+    exact = _CASHFLOW_EXACT_CATEGORY_RULES.get(normalized)
+    if exact:
+        return exact
+
+    for category_code, keywords in _CASHFLOW_KEYWORD_CATEGORY_RULES:
+        if category_code == "packaging":
+            if all(keyword in normalized for keyword in keywords):
+                return category_code
+            continue
+        if any(keyword in normalized for keyword in keywords):
+            return category_code
+    return None
+
+
 def parse_cashflow_detail(df: pd.DataFrame, **_) -> dict:
     """
     Parse FoodStory Type 8: รายละเอียดการจ่ายเข้า/ออก.
@@ -782,6 +815,7 @@ def parse_cashflow_detail(df: pd.DataFrame, **_) -> dict:
 
         # Detect informal customer refunds (only in เงินออก rows)
         is_refund = direction == "expense" and "คืนเงิน" in raw_desc.lower()
+        rule_category = None if is_refund else _category_for_cashflow_description(raw_desc)
 
         rows.append({
             "txn_at":        txn_at.isoformat(),
@@ -794,8 +828,8 @@ def parse_cashflow_detail(df: pd.DataFrame, **_) -> dict:
             "branch_code":   map_branch(r.get("สาขา")),
             "is_refund":     is_refund,
             # Pre-seed category for refunds; everything else → pending AI cat.
-            "category_code": "misc" if is_refund else None,  # misc = closest valid code; no customer_refund in expense_categories
-            "ai_cat_status": "skipped" if is_refund else "pending",
+            "category_code": "misc" if is_refund else rule_category,  # misc = closest valid code; no customer_refund in expense_categories
+            "ai_cat_status": "skipped" if is_refund else ("rule" if rule_category else "pending"),
         })
 
     ps = min(datetime.fromisoformat(r["txn_at"]).date() for r in rows) if rows else None
