@@ -1,11 +1,30 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-07-13 (optional bill-payment bank evidence link local; awaiting auditor review and push confirmation)
+**Last updated**: 2026-07-13 (vendor-bill category guard local; awaiting auditor review and push confirmation)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
 
 ---
+
+## 🟡 2026-07-13 — Vendor-bill category guard (FA-022)
+
+Local backend changes only, not pushed and not deployed.
+
+Scope:
+- `phase3a_ai_categorize_routes.py` keeps the existing cashflow rule behavior but tightens the vendor-bill path.
+- Broad/mixed vendor bills (CP Axtra/Makro/Big C/Lotus/Tops/B.B. Superstore/WEALIMEX/7-Eleven/ขายส่ง) skip deterministic rule auto-apply; if LLM is enabled, the suggestion is logged as pending human review instead of writing `vendor_bills.category_code`.
+- SINGHA/beer vendor-bill rule results normalize `raw_beverage` to the bill-pipeline code `beverage`.
+- `migrations/2026_07_13_dedupe_beverage_label.sql` now records the FA-020 corrected label history: `beverage = เครื่องดื่ม (บิลซื้อจากผู้ขาย)`.
+
+Evidence:
+- Read-only Supabase audit found no orphan `vendor_bills.category_code`, no duplicate active labels, and no vendor rules pointing to missing/inactive categories.
+- Exact production rule-order simulation found 13 pending confirmed vendor bills / ฿51,644.64 that would otherwise auto-match immediately if `/ai/categorize/batch` ran.
+
+Next:
+1. Antigravity reviews the diff as audit-only.
+2. If accepted, run full backend verification before asking TUM for push confirmation.
+3. Avoid running production `/ai/categorize/batch` on pending vendor bills until this guard is deployed.
 
 ## 🟡 2026-07-13 — Optional bill-payment bank evidence link
 

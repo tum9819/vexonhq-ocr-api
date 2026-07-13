@@ -49,6 +49,27 @@ LLM_PRICE_INPUT_PER_1M = 0.15
 LLM_PRICE_OUTPUT_PER_1M = 0.60
 DEFAULT_AUTOAPPLY_MIN_CONF = 0.90
 
+# Vendor-bill rules share the same table as short cashflow keyword rules. Broad
+# wholesalers can sell mixed goods, so bill-level auto-apply must be stricter
+# than cashflow text categorization.
+AMBIGUOUS_BILL_VENDOR_TOKENS = (
+    "แอ็กซ์ตร้า",
+    "makro",
+    "แม็คโคร",
+    "big c",
+    "lotus",
+    "tops",
+    "b.b.",
+    "บี.บี.",
+    "บี บี",
+    "ซุปเปอร์สโตร์",
+    "wealimex",
+    "wealmex",
+    "cp all",
+    "7-eleven",
+    "ขายส่ง",
+)
+
 
 # ============================================================
 # Helpers
@@ -133,7 +154,7 @@ class UserActionBody(BaseModel):
 # Core categorization logic
 # ============================================================
 
-def _try_rule_match(cur, vendor_name: str) -> Optional[dict]:
+def _try_rule_match(cur, vendor_name: str, *, bump_hit: bool = True) -> Optional[dict]:
     """Tier 1: Try vendor_category_rules. Returns dict with category + rule_pattern,
     or None if no match."""
     if not vendor_name:
@@ -151,13 +172,14 @@ def _try_rule_match(cur, vendor_name: str) -> Optional[dict]:
         return None
     pattern, category_code = row
 
-    # Bump hit_count + last_hit_at
-    cur.execute(
-        """UPDATE public.vendor_category_rules
-           SET hit_count = hit_count + 1, last_hit_at = now()
-           WHERE pattern = %s""",
-        (pattern,),
-    )
+    # Bump hit_count + last_hit_at only when the rule is actually used.
+    if bump_hit:
+        cur.execute(
+            """UPDATE public.vendor_category_rules
+               SET hit_count = hit_count + 1, last_hit_at = now()
+               WHERE pattern = %s""",
+            (pattern,),
+        )
     return {
         "tier": "rule",
         "category_code": category_code,
@@ -165,6 +187,28 @@ def _try_rule_match(cur, vendor_name: str) -> Optional[dict]:
         "confidence": 0.99,
         "reason": f"matched rule: {pattern}",
     }
+
+
+def _is_ambiguous_bill_vendor(vendor_name: str) -> bool:
+    text = (vendor_name or "").casefold()
+    return any(token in text for token in AMBIGUOUS_BILL_VENDOR_TOKENS)
+
+
+def _adjust_bill_rule_result(vendor_name: str, result: Optional[dict]) -> Optional[dict]:
+    """Bill-specific guardrails for shared vendor_category_rules matches."""
+    if result is None:
+        return None
+
+    text = (vendor_name or "").casefold()
+    if result.get("category_code") == "raw_beverage" and (
+        "singha" in text or "beer" in text or "สิงห์" in text or "เบียร์" in text
+    ):
+        adjusted = dict(result)
+        adjusted["category_code"] = "beverage"
+        adjusted["reason"] = f"{result.get('reason', '').strip()} [bill-level beverage vendor]"
+        return adjusted
+
+    return result
 
 
 def _build_llm_prompt(bill: dict, items: list[dict], categories: list[dict]) -> str:
@@ -309,9 +353,20 @@ def _categorize_one(conn, bill_id: str, allow_llm: bool = True, dry_run: bool = 
             raise HTTPException(400, f"Bill review_status must be 'confirmed', got: {bill['review_status']}")
 
         vendor_name = bill.get("vendor_name") or ""
+        requires_human_review = _is_ambiguous_bill_vendor(vendor_name)
 
         # Tier 1 — rule
-        result = _try_rule_match(cur, vendor_name)
+        result = _try_rule_match(cur, vendor_name, bump_hit=not requires_human_review)
+        if requires_human_review and result is not None:
+            logger.info(
+                "Skipping bill rule auto-match for ambiguous vendor %r (pattern=%r, category=%r)",
+                vendor_name,
+                result.get("rule_pattern"),
+                result.get("category_code"),
+            )
+            result = None
+        else:
+            result = _adjust_bill_rule_result(vendor_name, result)
         cost_usd = 0.0
         prompt_tokens = 0
         completion_tokens = 0
@@ -351,7 +406,12 @@ def _categorize_one(conn, bill_id: str, allow_llm: bool = True, dry_run: bool = 
             }
 
         before_category = bill.get("category_code")
-        should_apply = _should_autoapply(result)
+        if requires_human_review:
+            result["reason"] = (
+                (result.get("reason") or "").strip()
+                + " [pending human review: broad/mixed vendor]"
+            ).strip()
+        should_apply = _should_autoapply(result) and not requires_human_review
 
         if should_apply:
             cur.execute(
