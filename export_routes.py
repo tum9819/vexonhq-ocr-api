@@ -918,11 +918,16 @@ def _assemble_audit_vouchers(vrows: list[dict], slips_by_stmt: dict, inv_by_stmt
         if rule:
             wht = {"rate": rule["wht_pct"], "amount": round(amount * rule["wht_pct"] / 100.0, 2)}
         ref = str(r["ref_id"]) if r.get("ref_id") is not None else None
+        label = r.get("label") or ""
+        # v_daybook_pnl.counterparty is NULL for bank-sourced rows (payroll/rent/
+        # vendor_purchase/...) — the payee name lives inside `label` instead
+        # (e.g. "K PLUS โอนไป SCB X0060 นาย ศาตราวุธ ..."). Fall back to it so the
+        # printed voucher never shows a blank "จ่ายให้" for a real transaction.
         vouchers.append({
             "seq": i,
             "date": str(r["entry_date"]),
-            "counterparty": r.get("counterparty") or "",
-            "description": r.get("label") or "",
+            "counterparty": r.get("counterparty") or label or "",
+            "description": label,
             "category_code": cat,
             "category_name_th": r.get("category_name_th") or "ไม่ระบุ",
             "amount": round(amount, 2),
@@ -942,6 +947,15 @@ def export_audit_package(month: str = Query(..., description="YYYY-MM")):
     Voucher numbering is stateless (PV-YYYYMM-### by entry_date,ref_id) — the
     printed/archived PDF is the immutable snapshot (design review 2026-07-13, 5b)."""
     from tax_routes import WHT_RULES  # noqa: PLC0415 — single source of WHT rates
+    # The `uploads` storage bucket is private (security hardening 2026-05-31, GAP 2)
+    # — stored .../object/public/... paths 404 unless signed at read time. Reuse the
+    # existing helper (see slip_routes.py for the same lazy-import pattern) instead
+    # of returning raw DB URLs, which would leave every <img> broken.
+    try:
+        from main import _sign_uploads_url  # noqa: PLC0415
+    except Exception:
+        def _sign_uploads_url(url, expires_in: int = 86400):  # type: ignore[no-redef]
+            return url
 
     first, last = _month_range(month)
     conn = get_db_conn()
@@ -986,7 +1000,7 @@ def export_audit_package(month: str = Query(..., description="YYYY-MM")):
                 )
                 for s in _rows_to_dicts(cur):
                     slips_by_stmt[s["stmt_id"]] = {
-                        "image_url": s["raw_image_url"],
+                        "image_url": _sign_uploads_url(s["raw_image_url"]),
                         "ref_no": s["ref_no"],
                         "transfer_date": str(s["transfer_date"]) if s["transfer_date"] else None,
                         "transfer_time": str(s["transfer_time"]) if s["transfer_time"] else None,
@@ -1004,7 +1018,7 @@ def export_audit_package(month: str = Query(..., description="YYYY-MM")):
                 )
                 for v in _rows_to_dicts(cur):
                     inv_by_stmt[v["stmt_id"]] = {
-                        "image_url": v["attachment_url"],
+                        "image_url": _sign_uploads_url(v["attachment_url"]),
                         "invoice_no": v["invoice_no"],
                         "vendor_name": v["vendor_name"],
                     }

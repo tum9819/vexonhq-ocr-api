@@ -55,3 +55,18 @@ def test_null_ref_id_never_matches_evidence():
     assert v[0]["slip"] is None
     assert v[0]["category_name_th"] == "ไม่ระบุ"
     assert v[0]["wht"] is None
+
+
+def test_counterparty_falls_back_to_label_when_null():
+    """v_daybook_pnl.counterparty is NULL for bank-sourced rows (payroll/rent/
+    vendor_purchase); the payee name lives in `label` instead — the printed
+    voucher must not show a blank "จ่ายให้" for a real transaction."""
+    r = _row("2026-06-01", 600, "musician_fee", "x", label="K PLUS โอนไป SCB X0060 นาย ศาตราวุธ", cp=None)
+    v = _assemble_audit_vouchers([r], {}, {}, WHT_RULES)
+    assert v[0]["counterparty"] == "K PLUS โอนไป SCB X0060 นาย ศาตราวุธ"
+
+
+def test_counterparty_uses_real_value_when_present():
+    r = _row("2026-06-01", 600, "rent", "x", label="some label", cp="Real Landlord Co.")
+    v = _assemble_audit_vouchers([r], {}, {}, WHT_RULES)
+    assert v[0]["counterparty"] == "Real Landlord Co."
