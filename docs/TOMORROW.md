@@ -1,103 +1,27 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-07-13 (vendor-bill category guard local; awaiting auditor review and push confirmation)
+**Last updated**: 2026-07-13 (post-FA-022 deploy status cleanup)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
 
 ---
 
-## 🟡 2026-07-13 — Vendor-bill category guard (FA-022)
+## ✅ Recent audit fixes now shipped
 
-Local backend changes only, not pushed and not deployed.
+These were previously listed as local/awaiting review. They are now pushed and production-verified unless noted otherwise:
 
-Scope:
-- `phase3a_ai_categorize_routes.py` keeps the existing cashflow rule behavior but tightens the vendor-bill path.
-- Broad/mixed vendor bills (CP Axtra/Makro/Big C/Lotus/Tops/B.B. Superstore/WEALIMEX/7-Eleven/ขายส่ง) skip deterministic rule auto-apply; if LLM is enabled, the suggestion is logged as pending human review instead of writing `vendor_bills.category_code`.
-- SINGHA/beer vendor-bill rule results normalize `raw_beverage` to the bill-pipeline code `beverage`.
-- `migrations/2026_07_13_dedupe_beverage_label.sql` now records the FA-020 corrected label history: `beverage = เครื่องดื่ม (บิลซื้อจากผู้ขาย)`.
+- **FA-022 vendor-bill category guard** — backend `b12a715` deployed. Broad/mixed vendor bills no longer auto-write `vendor_bills.category_code`; SINGHA/beer bill rules normalize to `beverage`; cashflow categorization unchanged. Verified with `verify.ps1` (`497 passed, 2 skipped`) and production `/health/deep` healthy after deploy.
+- **Optional bill-payment bank evidence link** — backend `a04285a` + frontend `78f9937` shipped. Mark-paid can optionally link a specific outgoing bank row; no retroactive backfill or heuristic matching.
+- **FA-008 / FA-006 follow-up** — backend `4e36d20` + `6fa448e`, frontend `19f1368`/`c7ad2c2`/`02f5a9b`/`460a5ce` shipped. Cashflow AP uses the standard vendor-bill definition; reorder excludes MENU/clamps negative stock/flags unset MAX; `/ar-ap` redirects to `/bills/payment`.
+- **FA-003 auto-categorize pipeline** — backend `23fc162` + `df85148`, frontend `df5aeb9` shipped. Import-time rules, AI auto-apply audit trail, admin undo, and `/ai-review` Pending/Auto filters are live. Old backlog remains review/owner-driven; do not bulk-apply without a dry-run candidate list and TUM approval.
+- **T3 / FA-004 fresh-audit fixes** — backend `9977235` + `e8f8968`, frontend `4fe2cab` and earlier fresh-audit UI commits shipped. `/daybook/summary` returns explicit P&L income/expense; dashboard includes the uncategorized expense bucket.
 
-Evidence:
-- Read-only Supabase audit found no orphan `vendor_bills.category_code`, no duplicate active labels, and no vendor rules pointing to missing/inactive categories.
-- Exact production rule-order simulation found 13 pending confirmed vendor bills / ฿51,644.64 that would otherwise auto-match immediately if `/ai/categorize/batch` ran.
+## 🟡 Current backend next priorities
 
-Next:
-1. Antigravity reviews the diff as audit-only.
-2. If accepted, run full backend verification before asking TUM for push confirmation.
-3. Avoid running production `/ai/categorize/batch` on pending vendor bills until this guard is deployed.
-
-## 🟡 2026-07-13 — Optional bill-payment bank evidence link
-
-Local backend commit only, not pushed and not deployed.
-
-Scope:
-- `PATCH /bills/payment/{id}` accepts optional `bank_statement_entry_id` for `paid` / `credit_card` updates.
-- The selected row is linked by `bank_statement_entries.matched_invoice_id = <bill_id>` in the same DB transaction as the `vendor_bills` payment update.
-- Validation rejects non-expense rows and rows already linked to another bill.
-- Returning a bill to `unpaid` clears any bank rows linked to that bill.
-- `GET /bills/payment/{id}/bank-candidates` lists only unlinked outgoing bank rows with the same amount and `txn_date` in `[bill_date, bill_date + 30 days]`.
-
-Guardrails:
-- This is human-confirmed only: no auto-apply, no retroactive backfill, no amount/date heuristic update for old data.
-- `export_routes.py` / audit-package code remain untouched and will naturally show evidence only after real `matched_invoice_id` links exist.
-
-Next:
-1. Auditor reviews backend + frontend companion diffs.
-2. Await TUM's explicit push confirmation; after deploy verify `/bills/payment` and `/health/deep` with settled CPU.
-
-## 🟡 2026-07-12 — FA-008 cashflow AP + FA-006 reorder fixes
-
-Local backend commits only, not pushed and not deployed.
-
-Scope:
-- `/cashflow` now uses the standard AP definition from `vendor_bills`: `payment_status='unpaid' AND review_status <> 'rejected'`.
-- Overdue unpaid AP is treated as a day-0/first-window cash outflow instead of disappearing from the forecast.
-- `/cashflow/summary` returns overdue AP fields and marks health as warning when any AP is overdue.
-- `/inventory/reorder` excludes `tag='MENU'`, clamps negative stock to zero for order-quantity calculation, and flags uncategorized default `MAX=300` rows as "MAX ยังไม่ได้ตั้ง — ตรวจสอบ" with no estimated cost.
-
-Verified so far:
-- Focused tests: `tests/test_cashflow_ap_standard.py`, `tests/test_inventory_reorder_rules.py`.
-- Read-only production-data check: current reorder estimate drops from the audit's ~฿208,565 to ฿112,351; 24 default-MAX rows are flagged/no-cost; MENU examples are excluded.
-
-Next:
-1. Run final `ast.parse`, focused/full pytest as applicable, and `verify.ps1`.
-2. Auditor reviews backend + frontend companion diffs.
-3. Await TUM's explicit push confirmation; after deploy verify `/cashflow`, `/inventory/reorder`, `/health/deep`, and settled VPS CPU.
-
-## 🟡 2026-07-12 — FA-003 deterministic rules + AI auto-apply audit trail
-
-Local backend commits only, not pushed and not deployed.
-
-Scope:
-- Part 1: `pos_import.py` classifies TUM-confirmed POS cashflow shorthand `i/v/g` and proven keywords at import time, setting `category_code` plus `ai_cat_status='rule'`. Unknown descriptions remain `pending`.
-- Part 1: `migrations/2026_07_12_fa003_slip_beverage_rules.sql` seeds beverage memo keywords in `statement_rules`.
-- Part 2: `phase3a_ai_categorize_routes.py` adds confidence-gated auto-apply, additive audit columns, admin undo, and a dry-run-first endpoint for applying already logged pending suggestions.
-- Part 2: `/ai-review` frontend companion lives in the VEXONHQ repo and separates Pending vs Auto review queues.
-
-Deploy order:
-1. Apply `migrations/2026_07_12_fa003_ai_autoapply_audit.sql` before deploying the backend code that reads the new columns.
-2. Push/deploy backend, then frontend.
-3. Verify `/health/deep`, `/ai-review` Pending/Auto, and VPS CPU settled.
-
-Guardrails:
-- No `v_daybook*`, WAC, amount, or historical row mutation.
-- Old backlog is not auto-applied. The pending apply endpoint defaults to `dry_run=true` and should only be run for real after TUM approves the candidate list.
-
-## 🟡 2026-07-12 — T3 daybook P&L basis fix-forward
-
-Auditor production evidence showed the first frontend T3 fix mixed raw income with `net_pnl`, inflating June expense. Backend `/daybook/summary` now returns explicit `income_pnl` and `expense_pnl` from its existing filtered `v_daybook_pnl` scan and preserves the existing `net`/`net_pnl` contract. Frontend consumes the explicit fields directly and uses clearly labeled raw totals only as a legacy fallback.
-
-Regression evidence: June `225,924.63 - 201,929.67 = 23,994.96`; July `80,525 - 17,016 = 63,509`. No DB/data mutation and no deploy yet.
-
-Next: final review, explicit TUM push confirmation, deploy backend before/with frontend, then authenticate and verify `/daybook` for June and July plus `/health/deep` and settled VPS CPU.
-
-## 🟡 2026-07-12 — FA-004 dashboard category reconciliation
-
-Local backend commit adds an appended `ไม่ระบุหมวด` bucket for `category_code IS NULL` spend and calculates each category percentage from `current.expense_total`. The Top 5 categorized query remains unchanged; the uncategorized bucket does not consume its LIMIT. Frontend has a companion commit so the sixth bucket is not sliced out.
-
-Verified: `ast.parse`, focused pytest, and `verify.ps1` (`466 passed, 2 skipped`). No DB/data mutation and no deploy yet.
-
-Next: obtain review + TUM push confirmation, deploy backend before/with the frontend companion, then verify June 2026 `sum(top_categories.spent) == current.expense_total`, `/health/deep`, and settled VPS CPU.
+1. **AI Review/category queue operations** — now that FA-022 is deployed, pending vendor-bill and AI-review suggestions are safer to review, but still require human approval. Do not run broad backlog apply without a dry-run list and TUM confirmation.
+2. **Export category summary completeness (FA-016 follow-up)** — add an "ไม่ระบุหมวด" row to the category-summary export so it ties to the daybook total.
+3. **Owner/data work** — inventory MAX values, unresolved payees/no-evidence rows, FA-010b recipe 158.5%, and FA-010f `ZZZ_TEST_QUICK` remain outside automatic code cleanup.
 
 ## 🟢 2026-07-11 — Expense category integrity migration applied
 
@@ -107,21 +31,17 @@ Production Supabase migration `upsert_missing_expense_categories_20260711` regis
 
 The migration changes configuration rows only. It does not rewrite historical transactions or change `v_daybook*` views. June `/dashboard/overview` now returns beverage cost `฿35,684.17 / 15.8%` (previously zero) and the Thai category label.
 
-Local backend files awaiting push:
-- `migrations/2026_07_11_upsert_missing_categories.sql` — idempotent migration record; omits `sort_order` so new rows use default 999 and reruns preserve operator ordering.
-- `tests/test_category_integrity.py` — opt-in read-only integrity test using `CATEGORY_INTEGRITY_DATABASE_URL`; offline suite skips safely.
-- `sql/2026_07_11_category_cleanup_review.sql` — SELECT-only owner report for `other_expense`/NULL rows; no automatic reclassification.
-
 Verification:
 - Pre-migration explicit integrity test RED: `beverage_raw` only.
 - Post-migration explicit integrity test GREEN; remaining non-whitelisted orphan set is empty.
 - `verify.ps1`: 464 passed, 2 skipped.
 - Production HTTPS June dashboard: HTTP 200, corrected beverage cost and Thai label.
 
-Next:
-1. Obtain TUM's separate push confirmation; commit/push the migration record, test, review SQL, frontend catalog changes, and canonical docs only.
-2. After deploy, run `/health/deep`, smoke the four category-consuming frontend pages, and wait for shared VPS CPU to settle.
-3. Keep historical `other_expense`/NULL cleanup owner-driven and read-only until TUM approves individual classifications.
+Shipped code records:
+- Backend migration record, opt-in read-only orphan test, and SELECT-only owner cleanup report were committed and shipped.
+- Frontend shared `/receipts/categories` catalog across bank-statement/slip pages was committed and shipped.
+
+Next: keep historical `other_expense`/NULL cleanup owner-driven and read-only until TUM approves individual classifications.
 
 ## 🟢 2026-07-09 — Monthly Close Risk Marking V1 ready
 
