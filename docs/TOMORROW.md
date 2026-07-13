@@ -1,11 +1,30 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-07-12 (FA-008/FA-006 finance+inventory fixes local; awaiting auditor review and push confirmation)
+**Last updated**: 2026-07-13 (optional bill-payment bank evidence link local; awaiting auditor review and push confirmation)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
 
 ---
+
+## 🟡 2026-07-13 — Optional bill-payment bank evidence link
+
+Local backend commit only, not pushed and not deployed.
+
+Scope:
+- `PATCH /bills/payment/{id}` accepts optional `bank_statement_entry_id` for `paid` / `credit_card` updates.
+- The selected row is linked by `bank_statement_entries.matched_invoice_id = <bill_id>` in the same DB transaction as the `vendor_bills` payment update.
+- Validation rejects non-expense rows and rows already linked to another bill.
+- Returning a bill to `unpaid` clears any bank rows linked to that bill.
+- `GET /bills/payment/{id}/bank-candidates` lists only unlinked outgoing bank rows with the same amount and `txn_date` in `[bill_date, bill_date + 30 days]`.
+
+Guardrails:
+- This is human-confirmed only: no auto-apply, no retroactive backfill, no amount/date heuristic update for old data.
+- `export_routes.py` / audit-package code remain untouched and will naturally show evidence only after real `matched_invoice_id` links exist.
+
+Next:
+1. Auditor reviews backend + frontend companion diffs.
+2. Await TUM's explicit push confirmation; after deploy verify `/bills/payment` and `/health/deep` with settled CPU.
 
 ## 🟡 2026-07-12 — FA-008 cashflow AP + FA-006 reorder fixes
 

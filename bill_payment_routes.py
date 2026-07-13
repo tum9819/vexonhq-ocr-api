@@ -6,6 +6,7 @@ Track payment status of confirmed vendor bills per month.
 Endpoints:
   GET   /bills/payment              — list confirmed bills for a month + payment status
   PATCH /bills/payment/{id}         — update payment_status + paid_date
+  GET   /bills/payment/{id}/bank-candidates — optional human-confirmed bank rows
   GET   /bills/payment/summary      — unpaid count + total (for dashboard badge)
   POST  /bills/payment/line-alert   — push LINE for bills unpaid > 7 days (cron Monday 09:00)
 
@@ -98,6 +99,7 @@ def _month_bounds(month: Optional[str]):
 class BillPaymentPatch(BaseModel):
     payment_status: str
     paid_date: Optional[date] = None
+    bank_statement_entry_id: Optional[str] = None
 
 
 # ─────────────────────────────────────────────────────────
@@ -190,6 +192,15 @@ def update_bill_payment(bill_id: str, body: BillPaymentPatch, _admin: dict = Dep
     except (ValueError, AttributeError):
         raise HTTPException(400, f"Invalid bill_id: {bill_id!r}")
 
+    bank_entry_id: str | None = None
+    if body.bank_statement_entry_id:
+        if body.payment_status not in ("paid", "credit_card"):
+            raise HTTPException(400, "bank_statement_entry_id is only valid when marking paid/credit_card")
+        try:
+            bank_entry_id = str(UUID(body.bank_statement_entry_id))
+        except (ValueError, AttributeError):
+            raise HTTPException(400, f"Invalid bank_statement_entry_id: {body.bank_statement_entry_id!r}")
+
     # Auto-set paid_date to today when marking paid/credit_card
     paid_date = body.paid_date
     if paid_date is None and body.payment_status in ("paid", "credit_card"):
@@ -215,16 +226,110 @@ def update_bill_payment(bill_id: str, body: BillPaymentPatch, _admin: dict = Dep
             row = cur.fetchone()
             if not row:
                 raise HTTPException(404, "Bill not found or not confirmed")
+            result_cols = [d[0] for d in cur.description]
+
+            linked_bank_entry_id = None
+            if body.payment_status == "unpaid":
+                cur.execute(
+                    """UPDATE public.bank_statement_entries
+                       SET matched_invoice_id = NULL
+                       WHERE matched_invoice_id = %s""",
+                    (str(uid),),
+                )
+            elif bank_entry_id:
+                cur.execute(
+                    """SELECT id, direction, matched_invoice_id
+                       FROM public.bank_statement_entries
+                       WHERE id = %s
+                       FOR UPDATE""",
+                    (bank_entry_id,),
+                )
+                bank_row = cur.fetchone()
+                if not bank_row:
+                    raise HTTPException(404, "Bank statement entry not found")
+
+                _bank_id, direction, matched_invoice_id = bank_row
+                if direction != "expense":
+                    raise HTTPException(400, "bank_statement_entry_id must be an expense row")
+                if matched_invoice_id and str(matched_invoice_id) != str(uid):
+                    raise HTTPException(409, "Bank statement entry is already linked to another bill")
+
+                cur.execute(
+                    """UPDATE public.bank_statement_entries
+                       SET matched_invoice_id = NULL
+                       WHERE matched_invoice_id = %s
+                         AND id <> %s""",
+                    (str(uid), bank_entry_id),
+                )
+                cur.execute(
+                    """UPDATE public.bank_statement_entries
+                       SET matched_invoice_id = %s
+                       WHERE id = %s""",
+                    (str(uid), bank_entry_id),
+                )
+                linked_bank_entry_id = bank_entry_id
             conn.commit()
-            cols = [d[0] for d in cur.description]
-            result = dict(zip(cols, row))
+            result = dict(zip(result_cols, row))
             # Serialize
             for k, v in result.items():
                 if isinstance(v, UUID):
                     result[k] = str(v)
                 elif isinstance(v, (date, datetime)):
                     result[k] = v.isoformat()
+            result["bank_statement_entry_id"] = linked_bank_entry_id
             return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+@router.get("/bills/payment/{bill_id}/bank-candidates")
+def bank_candidates_for_bill(bill_id: str, _admin: dict = Depends(_require_admin_role)):
+    """Return optional human-confirmed bank-row candidates for a vendor bill."""
+    try:
+        uid = UUID(bill_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(400, f"Invalid bill_id: {bill_id!r}")
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT bill_date, amount
+                   FROM public.vendor_bills
+                   WHERE id = %s
+                     AND review_status = 'confirmed'""",
+                (str(uid),),
+            )
+            bill = cur.fetchone()
+            if not bill:
+                raise HTTPException(404, "Bill not found or not confirmed")
+
+            bill_date, amount = bill
+            cur.execute(
+                """SELECT id, txn_date, description, debit, amount
+                   FROM public.bank_statement_entries
+                   WHERE direction = 'expense'
+                     AND matched_invoice_id IS NULL
+                     AND amount = %s
+                     AND txn_date >= %s
+                     AND txn_date <= %s
+                   ORDER BY txn_date ASC, description ASC
+                   LIMIT 20""",
+                (amount, bill_date, bill_date + timedelta(days=30)),
+            )
+            candidates = _rows_to_dicts(cur)
+            return {
+                "bill_id": str(uid),
+                "bill_date": bill_date.isoformat() if isinstance(bill_date, date) else bill_date,
+                "amount": float(amount),
+                "candidates": candidates,
+            }
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
