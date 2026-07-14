@@ -1275,8 +1275,34 @@ def invoice_items_monthly_by_sku(
                 branch_filter = " AND vb.branch_code = %s"
                 params.append(branch_code)
 
+            # True-cost allocation (2026-07-14, TUM decision: purchases must be
+            # comparable to slips/statement, i.e. VAT-inclusive money paid).
+            # Bills don't carry per-line VAT (fresh food is VAT-exempt, dry
+            # goods are not, and OCR captures no line-level VAT), so instead
+            # each bill's PAID amount (vendor_bills.amount, VAT-inclusive) is
+            # allocated across its lines proportionally. Guard: only when the
+            # bill's line sum is within ±10% of the paid amount (covers VAT
+            # ≤7% + small discounts/rounding). Bills outside the band have
+            # incomplete OCR line capture — their lines are NOT scaled
+            # (ratio NULL) and the SKU row is flagged has_incomplete instead
+            # of inventing numbers.
             cur.execute(
                 f"""
+                WITH bill_ratio AS (
+                    SELECT vb.id,
+                           vb.amount AS paid_amount,
+                           SUM(ii.amount) AS lines_sum,
+                           CASE WHEN SUM(ii.amount) > 0
+                                 AND vb.amount / SUM(ii.amount) BETWEEN 0.90 AND 1.10
+                                THEN vb.amount / SUM(ii.amount) END AS ratio
+                    FROM public.vendor_bills vb
+                    JOIN public.invoice_items ii ON ii.vendor_bill_id = vb.id
+                    WHERE vb.review_status = 'confirmed'
+                      AND vb.bill_date >= %s::date
+                      AND vb.bill_date <  %s::date
+                      {branch_filter}
+                    GROUP BY vb.id, vb.amount
+                )
                 SELECT
                     COALESCE(p.category, 'unclassified')              AS category,
                     ii.canonical_sku                                  AS sku,
@@ -1294,9 +1320,15 @@ def invoice_items_monthly_by_sku(
                       ORDER BY vb2.bill_date DESC NULLS LAST, ii2.id DESC
                       LIMIT 1)                                        AS latest_unit_price,
                     MAX(vb.bill_date)                                 AS latest_bill_date,
-                    COALESCE(p.sort_order, 999)                       AS sort_order
+                    COALESCE(p.sort_order, 999)                       AS sort_order,
+                    SUM(ii.amount * br.ratio)
+                        FILTER (WHERE br.ratio IS NOT NULL)::numeric(12,2) AS true_amount,
+                    SUM(ii.quantity)
+                        FILTER (WHERE br.ratio IS NOT NULL)::numeric(12,2) AS qty_tieable,
+                    BOOL_OR(br.ratio IS NULL)                         AS has_incomplete
                 FROM public.invoice_items ii
                 JOIN public.vendor_bills vb ON vb.id = ii.vendor_bill_id
+                JOIN bill_ratio br ON br.id = vb.id
                 LEFT JOIN public.products p ON p.sku = ii.canonical_sku
                 WHERE vb.review_status = 'confirmed'
                   AND vb.bill_date >= %s::date
@@ -1306,10 +1338,12 @@ def invoice_items_monthly_by_sku(
                          p.default_unit, p.sort_order
                 ORDER BY sort_order, name_th
                 """,
-                params,
+                params + params,
             )
             rows = []
             for r in cur.fetchall():
+                true_amount = float(r[10]) if r[10] is not None else None
+                qty_tieable = float(r[11]) if r[11] is not None else 0.0
                 rows.append({
                     "category":          r[0],
                     "sku":               r[1],
@@ -1320,6 +1354,10 @@ def invoice_items_monthly_by_sku(
                     "total_amount":      float(r[6]) if r[6] is not None else 0.0,
                     "latest_unit_price": float(r[7]) if r[7] is not None else None,
                     "latest_bill_date":  str(r[8]) if r[8] else None,
+                    "true_amount":       round(true_amount, 2) if true_amount is not None else None,
+                    "true_unit_price":   round(true_amount / qty_tieable, 2)
+                                         if true_amount is not None and qty_tieable > 0 else None,
+                    "has_incomplete":    bool(r[12]),
                 })
 
             # Summary
@@ -1340,8 +1378,53 @@ def invoice_items_monthly_by_sku(
             )
             row = cur.fetchone()
             total_bills = int(row[0] or 0) if row else 0
+
+            # Paid total = SUM of confirmed bills' VAT-inclusive amounts — the
+            # number that ties to slips/statement (includes bills whose OCR
+            # lines are missing entirely).
+            cur.execute(
+                f"""
+                SELECT COALESCE(SUM(vb.amount), 0), COUNT(*)::int
+                FROM public.vendor_bills vb
+                WHERE vb.review_status = 'confirmed'
+                  AND vb.bill_date >= %s::date
+                  AND vb.bill_date <  %s::date
+                  {branch_filter}
+                """,
+                params,
+            )
+            row = cur.fetchone()
+            paid_total = float(row[0] or 0) if row else 0.0
+            paid_bills = int(row[1] or 0) if row else 0
+
+            # Bills whose line capture doesn't tie (ratio outside ±10% band)
+            cur.execute(
+                f"""
+                SELECT COUNT(*) FILTER (WHERE ratio IS NULL)::int,
+                       COALESCE(SUM(paid_amount) FILTER (WHERE ratio IS NULL), 0)
+                FROM (
+                    SELECT vb.id, vb.amount AS paid_amount,
+                           CASE WHEN SUM(ii.amount) > 0
+                                 AND vb.amount / SUM(ii.amount) BETWEEN 0.90 AND 1.10
+                                THEN 1 END AS ratio
+                    FROM public.vendor_bills vb
+                    JOIN public.invoice_items ii ON ii.vendor_bill_id = vb.id
+                    WHERE vb.review_status = 'confirmed'
+                      AND vb.bill_date >= %s::date
+                      AND vb.bill_date <  %s::date
+                      {branch_filter}
+                    GROUP BY vb.id, vb.amount
+                ) t
+                """,
+                params,
+            )
+            row = cur.fetchone()
+            incomplete_bills = int(row[0] or 0) if row else 0
+            incomplete_paid_total = float(row[1] or 0) if row else 0.0
     finally:
         conn.close()
+
+    true_amount_total = sum(r["true_amount"] for r in rows if r["true_amount"] is not None)
 
     return {
         "success":   True,
@@ -1354,6 +1437,12 @@ def invoice_items_monthly_by_sku(
             "total_bills":   total_bills,
             "skus":          len(rows),
             "unclassified":  next((r["total_amount"] for r in rows if r["sku"] is None), 0.0),
+            # VAT-inclusive money actually paid (ties to slips/statement)
+            "paid_total":            round(paid_total, 2),
+            "paid_bills":            paid_bills,
+            "true_amount_total":     round(true_amount_total, 2),
+            "incomplete_bills":      incomplete_bills,
+            "incomplete_paid_total": round(incomplete_paid_total, 2),
         },
     }
 
