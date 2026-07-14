@@ -1742,6 +1742,9 @@ def _handle_reorder_list() -> str:
             sep,
             "✅ ไม่มีรายการที่ต้องสั่งครับ",
         ]
+        _legacy_n = int(summary.get("needs_max_review") or 0)
+        if _legacy_n > 0:
+            msg_lines.append(f"(ซ่อนรายการเก่า/รอตั้ง MAX {_legacy_n} รายการ — ดูในเว็บ)")
         return "\n".join(msg_lines)
 
     by_urg = {"critical": [], "high": [], "medium": [], "low": []}
@@ -1780,6 +1783,9 @@ def _handle_reorder_list() -> str:
         lines.append(f"\U0001f4b0 รวม {n} รายการ ~฿{total_cost:,.0f}")
     else:
         lines.append(f"\U0001f4e6 รวม {n} รายการ")
+    legacy_n = int(summary.get("needs_max_review") or 0)
+    if legacy_n > 0:
+        lines.append(f"(ซ่อนรายการเก่า/รอตั้ง MAX {legacy_n} รายการ — ดูในเว็บ)")
     return "\n".join(lines)
 
 

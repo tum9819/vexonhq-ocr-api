@@ -52,3 +52,25 @@ def test_reorder_summary_excludes_max_review_items_from_estimate():
     assert summary["total_items"] == 2
     assert summary["needs_max_review"] == 1
     assert summary["est_total_cost"] == valid["est_cost"]
+
+
+def test_legacy_split_moves_flagged_items_out_of_order_list():
+    # FA-006 follow-up: flagged (legacy) items must not appear in the orderable
+    # list at all — they go to legacy_items, and summary counts (incl. urgency)
+    # must be computed from active items only so frozen negatives no longer
+    # inflate the "critical" count.
+    valid = routes._build_reorder_item("น้ำ", "เครื่องดื่ม", 2, 12, 5, "ขวด")
+    legacy = routes._build_reorder_item("กุ้ง", "ไม่ระบุ", -2, 300, 15, "ชิ้น")
+
+    items, legacy_items = routes._split_legacy_reorder_items([valid, legacy])
+
+    assert items == [valid]
+    assert legacy_items == [legacy]
+
+    summary = routes._summarize_reorder_items(items)
+    summary["needs_max_review"] = len(legacy_items)
+
+    assert summary["total_items"] == 1
+    assert summary["critical"] == 0  # frozen negative no longer counted as urgent
+    assert summary["needs_max_review"] == 1
+    assert summary["est_total_cost"] == valid["est_cost"]

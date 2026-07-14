@@ -332,6 +332,18 @@ def _build_reorder_item(name: str,
     }
 
 
+def _split_legacy_reorder_items(built: list[dict]) -> tuple[list[dict], list[dict]]:
+    """FA-006 follow-up (2026-07-14): split max_needs_review items (dead legacy
+    duplicates in the POS stock master — no tag + default MAX, frozen qty) out
+    of the orderable list. TUM chose NOT to merge them in FoodStory (recipes
+    are linked there), so the system filters instead. If a legacy item comes
+    back to life its qty/tag/MAX changes in FoodStory and it re-qualifies
+    automatically."""
+    items = [i for i in built if not i.get("max_needs_review")]
+    legacy = [i for i in built if i.get("max_needs_review")]
+    return items, legacy
+
+
 def _summarize_reorder_items(items: list[dict]) -> dict:
     summary = {
         "total_items": 0,
@@ -401,17 +413,22 @@ def _compute_reorder_list(branch_code: str = DEFAULT_BRANCH,
     finally:
         conn.close()
 
-    items = [
+    built = [
         _build_reorder_item(name, t, q_cur, q_max, price, unit)
         for name, t, q_cur, q_max, price, unit in rows
         if _is_orderable_inventory_tag(t)
     ]
+    # Web renders legacy_items in a collapsed section; LINE bot omits them
+    # (see _split_legacy_reorder_items docstring).
+    items, legacy_items = _split_legacy_reorder_items(built)
     summary = _summarize_reorder_items(items)
+    summary["needs_max_review"] = len(legacy_items)
 
     return {
         "snapshot_at": snapshot_at,
         "branch_code": branch_code,
         "items":       items,
+        "legacy_items": legacy_items,
         "summary":     summary,
     }
 
