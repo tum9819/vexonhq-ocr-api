@@ -1397,7 +1397,10 @@ def invoice_items_monthly_by_sku(
             paid_total = float(row[0] or 0) if row else 0.0
             paid_bills = int(row[1] or 0) if row else 0
 
-            # Bills whose line capture doesn't tie (ratio outside ±10% band)
+            # Bills whose line capture doesn't tie (ratio outside ±10% band).
+            # LEFT JOIN so bills with ZERO OCR lines also count as incomplete
+            # (reviewer finding 2026-07-14: INNER JOIN dropped them even though
+            # their paid amount is in paid_total — 6 such bills exist in prod).
             cur.execute(
                 f"""
                 SELECT COUNT(*) FILTER (WHERE ratio IS NULL)::int,
@@ -1408,7 +1411,7 @@ def invoice_items_monthly_by_sku(
                                  AND vb.amount / SUM(ii.amount) BETWEEN 0.90 AND 1.10
                                 THEN 1 END AS ratio
                     FROM public.vendor_bills vb
-                    JOIN public.invoice_items ii ON ii.vendor_bill_id = vb.id
+                    LEFT JOIN public.invoice_items ii ON ii.vendor_bill_id = vb.id
                     WHERE vb.review_status = 'confirmed'
                       AND vb.bill_date >= %s::date
                       AND vb.bill_date <  %s::date
