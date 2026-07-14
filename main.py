@@ -679,6 +679,26 @@ class RejectRequest(BaseModel):
     reject_reason: str
 
 
+class ReocrItemsRequest(BaseModel):
+    # apply=False -> preview only (no DB writes). apply=True -> replace the
+    # bill's invoice_items with the re-OCR'd set (old set backed up first).
+    apply: bool = False
+    # force=True lets the user apply a re-OCR result that still doesn't tie
+    # to the bill amount (e.g. genuinely unreadable image, better-than-nothing).
+    force: bool = False
+    # WYSIWYG apply: the frontend passes back the exact items it previewed so
+    # the applied rows are the rows the user saw. Without this, apply would
+    # re-run vision OCR — which is non-deterministic — and could write a
+    # different set than the preview. Only valid together with apply=true.
+    items: Optional[list[dict[str, Any]]] = None
+
+
+class SingleLineRequest(BaseModel):
+    # Optional label for the single synthetic line; defaults to the bill's
+    # vendor_name. Used for slip-backed bills that have no itemized invoice.
+    product_name: Optional[str] = None
+
+
 # ============================================================
 # Invoice Review Pipeline — endpoints
 # ============================================================
@@ -911,6 +931,50 @@ def _ocr_page(
     except Exception as e:
         log.exception("vision failed")
         raise HTTPException(500, f"vision extraction failed: {e}")
+
+    # 3) Completeness self-check + ONE corrective retry (2026-07-15).
+    # When THIS page carries the bill total and the extracted lines don't tie
+    # to it (±10% band), re-run vision once telling the model what it missed —
+    # the model is far more accurate when it knows the target sum. Pages
+    # without a total (page 2+ of multi-page bills) never trigger this, and a
+    # retry failure falls back to the first parse, so this can only improve
+    # the result. Cost: one extra vision call only on out-of-band pages.
+    tie = _items_tie_state(parsed.get("amount"), parsed.get("items"), parsed.get("discount"))
+    if not tie["ok"]:
+        note = (
+            "CORRECTIVE RETRY: a previous extraction of this SAME image captured "
+            f"{tie['n_items']} line item(s) summing to {tie['items_sum']:,.2f}, but the "
+            f"bill's total amount is {tie['amount']:,.2f}. That is too far apart, so line "
+            "items were probably missed or misread. Re-read the ENTIRE items table row by "
+            "row — include every row, even small, blurry or partially printed ones. The sum "
+            "of item amounts must land close to the bill total (within ~10%) unless the "
+            "bill clearly shows a large discount."
+        )
+        try:
+            retry_parsed = _run_gpt_vision(image_bytes, mime_type, ocr_text, corrective_note=note)
+            retry_tie = _items_tie_state(
+                retry_parsed.get("amount"), retry_parsed.get("items"), retry_parsed.get("discount")
+            )
+            # Keep whichever parse ties; if neither ties, keep the one whose
+            # ratio is closer to 1 (missing-ratio = infinitely far).
+            def _tie_score(t: dict[str, Any]) -> float:
+                if t["ok"]:
+                    return 0.0
+                return abs(t["ratio"] - 1.0) if t["ratio"] is not None else float("inf")
+            if _tie_score(retry_tie) < _tie_score(tie):
+                log.info(
+                    "OCR completeness retry improved '%s': items %d→%d, sum %.2f→%.2f (amount %.2f)",
+                    file_name, tie["n_items"], retry_tie["n_items"],
+                    tie["items_sum"], retry_tie["items_sum"], tie["amount"],
+                )
+                parsed = retry_parsed
+            else:
+                log.info(
+                    "OCR completeness retry did not improve '%s' (sum %.2f vs %.2f, amount %.2f) — keeping first parse",
+                    file_name, tie["items_sum"], retry_tie["items_sum"], tie["amount"],
+                )
+        except Exception:
+            log.exception("OCR completeness retry failed for '%s' (keeping first parse)", file_name)
 
     return {
         "image_bytes": image_bytes,
@@ -2065,6 +2129,345 @@ def invoice_reject(invoice_id: str, request: Request, body: dict[str, Any] | Non
 
 
 # ============================================================
+# Invoice item repair — re-OCR from stored attachments (2026-07-15)
+# ============================================================
+def _storage_path_from_url(url: Optional[str]) -> Optional[str]:
+    """Extract the storage object path from a stored attachment URL.
+
+    Attachments store the public-style URL `.../object/public/<bucket>/<path>`
+    (written before the uploads bucket went private — the path part is still
+    the correct key for storage download). Returns None for anything that
+    doesn't resolve to our bucket.
+    """
+    if not url:
+        return None
+    for marker in ("/object/public/", "/object/sign/"):
+        if marker in url:
+            after = url.split(marker, 1)[1]
+            bucket, _, path = after.partition("/")
+            if bucket == SUPABASE_STORAGE_BUCKET and path:
+                return path.split("?", 1)[0]
+    return None
+
+
+def _load_bill_for_repair(invoice_id: str) -> tuple[dict[str, Any], float, list[dict[str, Any]]]:
+    """Shared guards for the two repair endpoints: bill exists, not rejected,
+    has a positive amount to tie against. Returns (bill, amount, old_items)."""
+    sb = get_supabase()
+    res = sb.table("vendor_bills").select("*").eq("id", invoice_id).execute()
+    if not res.data:
+        raise HTTPException(404, "invoice not found")
+    bill = res.data[0]
+    if bill.get("review_status") == "rejected":
+        raise HTTPException(409, "bill is rejected — repair a rejected bill by re-uploading it instead")
+    amount = _to_float(bill.get("amount"))
+    if amount is None or amount <= 0:
+        raise HTTPException(
+            422,
+            "bill has no positive amount to tie against — fix the amount first, then repair items",
+        )
+    old_items = (
+        sb.table("invoice_items")
+        .select("*")
+        .eq("vendor_bill_id", invoice_id)
+        .order("line_no")
+        .execute()
+        .data
+        or []
+    )
+    return bill, amount, old_items
+
+
+def _backup_items_before_repair(
+    invoice_id: str,
+    action: str,
+    old_items: list[dict[str, Any]],
+    new_items: list[dict[str, Any]],
+    old_sum: float,
+    new_sum: float,
+    actor: Optional[str],
+) -> None:
+    """Write the before/after snapshot to invoice_item_repairs BEFORE deleting
+    anything, so every repair is reversible from the log even if the re-insert
+    fails halfway."""
+    sb = get_supabase()
+    sb.table("invoice_item_repairs").insert({
+        "vendor_bill_id": invoice_id,
+        "action": action,
+        "old_items": old_items,
+        "new_items": new_items,
+        "old_sum": round(old_sum, 2),
+        "new_sum": round(new_sum, 2),
+        "created_by": actor,
+    }).execute()
+
+
+def _apply_reocr_items(
+    request: Request,
+    invoice_id: str,
+    amount: float,
+    old_items: list[dict[str, Any]],
+    new_items: list[dict[str, Any]],
+    force: bool,
+) -> dict[str, Any]:
+    """Shared apply step for /reocr-items (fresh-OCR path and WYSIWYG
+    items-payload path): tie-gate -> backup -> replace -> revalidate."""
+    sb = get_supabase()
+    old_sum = sum(_to_float(i.get("amount")) or 0.0 for i in old_items)
+    tie = _items_tie_state(amount, new_items)
+    result = {
+        "success": True,
+        "invoice_id": invoice_id,
+        "amount": amount,
+        "old_count": len(old_items),
+        "old_sum": round(old_sum, 2),
+        "new_count": tie["n_items"],
+        "new_sum": tie["items_sum"],
+        "ratio": tie["ratio"],
+        "tie_ok": tie["ok"],
+        "new_items": new_items,
+        "applied": False,
+    }
+    if not tie["ok"] and not force:
+        raise HTTPException(
+            422,
+            {
+                "code": "REOCR_NOT_TIED",
+                "message": (
+                    f"Re-OCR ได้รายการรวม {tie['items_sum']:,.2f} ยังห่างจากยอดบิล "
+                    f"{amount:,.2f} เกิน ±10% — ไม่เขียนทับรายการเดิม "
+                    "(ส่ง force=true ถ้าต้องการใช้ผลนี้ทั้งที่ไม่ tie)"
+                ),
+                "preview": {k: v for k, v in result.items() if k != "new_items"},
+            },
+        )
+    actor = _current_username(request)
+    _backup_items_before_repair(
+        invoice_id, "reocr", old_items, new_items, old_sum, tie["items_sum"], actor,
+    )
+    sb.table("invoice_items").delete().eq("vendor_bill_id", invoice_id).execute()
+    for page_no in sorted({it.get("source_page") or 1 for it in new_items}):
+        page_items = [it for it in new_items if (it.get("source_page") or 1) == page_no]
+        _insert_items(invoice_id, page_items, source_page=page_no)
+    warnings = _revalidate_bill(invoice_id)
+    result["applied"] = True
+    result["warnings"] = warnings
+    log.info(
+        "reocr applied for bill %s by %s: items %d->%d, sum %.2f->%.2f (amount %.2f, tie_ok=%s)",
+        invoice_id, actor, len(old_items), tie["n_items"], old_sum, tie["items_sum"],
+        amount, tie["ok"],
+    )
+    return result
+
+
+@app.post("/invoice/{invoice_id}/reocr-items")
+def invoice_reocr_items(
+    invoice_id: str,
+    request: Request,
+    body: ReocrItemsRequest | None = None,
+):
+    """Re-OCR ONLY the line items of an existing bill from its stored
+    attachment images, guided by the bill's known amount (repair mode).
+
+    Why this exists: 24 confirmed bills reached the books with missing/garbled
+    line items (OCR completeness gap, found 2026-07-14 during VAT true-cost).
+    Re-uploading the same file is blocked by file-hash idempotency (#59) and
+    would touch the bill header — this endpoint replaces ONLY invoice_items.
+
+    Flow: default is PREVIEW (no writes) — returns old vs new items + tie
+    check. apply=true replaces the items (old set backed up to
+    invoice_item_repairs first); a result that still doesn't tie within the
+    +/-10% band is refused unless force=true.
+
+    The bill header (amount, dates, payment status, statement links) is never
+    touched.
+    """
+    _validate_uuid_param("invoice_id", invoice_id)
+    _require_admin_request(request)
+    do_apply = bool(body.apply) if body else False
+    force = bool(body.force) if body else False
+    supplied_items = body.items if body else None
+    if supplied_items is not None and not do_apply:
+        raise HTTPException(422, "items payload is only valid together with apply=true")
+
+    bill, amount, old_items = _load_bill_for_repair(invoice_id)
+    sb = get_supabase()
+
+    if supplied_items is not None:
+        # WYSIWYG apply: use the exact items the user previewed (no second,
+        # non-deterministic OCR run). Normalize to the insert shape; unknown
+        # keys are dropped, placeholder rows are filtered by _insert_items.
+        new_items = []
+        for it in supplied_items:
+            if not isinstance(it, dict):
+                continue
+            try:
+                source_page = int(it.get("source_page") or 1)
+            except (TypeError, ValueError):
+                source_page = 1
+            new_items.append({
+                "line_no": it.get("line_no"),
+                "sku": it.get("sku"),
+                "product_name": it.get("product_name"),
+                "quantity": it.get("quantity"),
+                "unit": it.get("unit"),
+                "unit_price": it.get("unit_price"),
+                "amount": it.get("amount"),
+                "source_page": source_page,
+            })
+        return _apply_reocr_items(
+            request, invoice_id, amount, old_items, new_items, force
+        )
+
+    atts = (
+        sb.table("attachments")
+        .select("*")
+        .eq("parent_type", "vendor_bill")
+        .eq("parent_id", invoice_id)
+        .order("page_no")
+        .execute()
+        .data
+        or []
+    )
+    # Historical bills can carry duplicate attachment rows (pre-#59 retries) —
+    # OCR each distinct stored file once.
+    pages: list[tuple[int, dict[str, Any], str]] = []
+    seen_paths: set[str] = set()
+    for att in atts:
+        path = _storage_path_from_url(att.get("file_url"))
+        if not path or path in seen_paths:
+            continue
+        seen_paths.add(path)
+        pages.append((len(pages) + 1, att, path))
+    if not pages:
+        raise HTTPException(422, "no stored attachment found for this bill — cannot re-OCR")
+
+    n_pages = len(pages)
+    new_items: list[dict[str, Any]] = []
+    for page_no, att, path in pages:
+        try:
+            img_bytes = sb.storage.from_(SUPABASE_STORAGE_BUCKET).download(path)
+        except Exception as e:
+            log.exception("reocr: storage download failed for %s page %d", invoice_id, page_no)
+            raise HTTPException(502, f"storage download failed for page {page_no}: {e}")
+        try:
+            ocr_text = _run_tesseract(img_bytes)
+        except Exception as e:
+            log.warning("reocr: tesseract failed on page %d (continuing): %s", page_no, e)
+            ocr_text = ""
+        note = (
+            f"REPAIR MODE: this bill's verified total amount is {amount:,.2f} THB"
+            + (f" across {n_pages} pages; this image is page {page_no} of {n_pages}."
+               if n_pages > 1 else ".")
+            + " A previous extraction missed line items. Read the ENTIRE items table row"
+            " by row and extract EVERY line item visible on this image — include small,"
+            " blurry or partially printed rows. Do not invent rows that are not on the"
+            " image."
+            + ("" if n_pages > 1 else
+               " The sum of item amounts must land close to the total above (within ~10%)"
+               " unless the bill clearly shows a large discount.")
+        )
+        try:
+            parsed = _run_gpt_vision(
+                img_bytes, att.get("mime_type") or "image/png", ocr_text,
+                corrective_note=note,
+            )
+        except Exception as e:
+            log.exception("reocr: vision failed for %s page %d", invoice_id, page_no)
+            raise HTTPException(502, f"vision extraction failed on page {page_no}: {e}")
+        for it in parsed.get("items") or []:
+            if isinstance(it, dict):
+                new_items.append({
+                    "line_no": it.get("line_no"),
+                    "sku": it.get("sku"),
+                    "product_name": it.get("product_name"),
+                    "quantity": it.get("quantity"),
+                    "unit": it.get("unit"),
+                    "unit_price": it.get("unit_price"),
+                    "amount": it.get("amount"),
+                    "source_page": page_no,
+                })
+
+    if not do_apply:
+        old_sum = sum(_to_float(i.get("amount")) or 0.0 for i in old_items)
+        tie = _items_tie_state(amount, new_items)
+        return {
+            "success": True,
+            "invoice_id": invoice_id,
+            "amount": amount,
+            "old_count": len(old_items),
+            "old_sum": round(old_sum, 2),
+            "new_count": tie["n_items"],
+            "new_sum": tie["items_sum"],
+            "ratio": tie["ratio"],
+            "tie_ok": tie["ok"],
+            "new_items": new_items,
+            "applied": False,
+        }
+    return _apply_reocr_items(request, invoice_id, amount, old_items, new_items, force)
+
+
+@app.post("/invoice/{invoice_id}/set-single-line")
+def invoice_set_single_line(
+    invoice_id: str,
+    request: Request,
+    body: SingleLineRequest | None = None,
+):
+    """Replace a bill's line items with ONE synthetic line equal to the bill
+    amount. For slip-backed expenses that have no itemized invoice (e.g.
+    ค่านักดนตรี / ค่าเหล้า paid by transfer — TUM decision 2026-07-14): the
+    slip attachment stays as payment evidence, the single line makes the bill
+    tie 100%, and the line is inserted WITHOUT auto-classification on purpose —
+    canonical_sku stays NULL so it never pollutes per-SKU price analytics.
+    Old items (if any) are backed up to invoice_item_repairs first.
+    """
+    _validate_uuid_param("invoice_id", invoice_id)
+    _require_admin_request(request)
+
+    bill, amount, old_items = _load_bill_for_repair(invoice_id)
+    sb = get_supabase()
+
+    name = (body.product_name.strip() if body and body.product_name else "") \
+        or (bill.get("vendor_name") or "").strip() \
+        or "ค่าใช้จ่ายตามสลิป"
+    new_row = {
+        "vendor_bill_id": invoice_id,
+        "line_no": 1,
+        "product_name": name,
+        "quantity": 1,
+        "unit_price": amount,
+        "amount": amount,
+        "source_page": 1,
+    }
+    old_sum = sum(_to_float(i.get("amount")) or 0.0 for i in old_items)
+    actor = _current_username(request)
+    _backup_items_before_repair(
+        invoice_id, "single_line", old_items, [new_row], old_sum, amount, actor,
+    )
+    sb.table("invoice_items").delete().eq("vendor_bill_id", invoice_id).execute()
+    # Direct insert (NOT _insert_items): skips the AI auto-classifier so the
+    # synthetic line stays out of SKU analytics — that is the design intent.
+    sb.table("invoice_items").insert(new_row).execute()
+    warnings = _revalidate_bill(invoice_id)
+    log.info(
+        "single-line set for bill %s by %s: %d old item(s) (sum %.2f) -> 1 line = %.2f",
+        invoice_id, actor, len(old_items), old_sum, amount,
+    )
+    return {
+        "success": True,
+        "invoice_id": invoice_id,
+        "amount": amount,
+        "old_count": len(old_items),
+        "old_sum": round(old_sum, 2),
+        "new_count": 1,
+        "new_sum": amount,
+        "tie_ok": True,
+        "applied": True,
+        "warnings": warnings,
+    }
+
+
+# ============================================================
 # Helpers — PDF handling
 # ============================================================
 def _pdf_to_images(pdf_bytes: bytes, scale: float = 3.0) -> list[bytes]:
@@ -2464,7 +2867,12 @@ def _extract_makro_totals_from_text(ocr_text: str) -> dict[str, float | None]:
     return result
 
 
-def _run_gpt_vision(image_bytes: bytes, mime_type: str, ocr_hint: str) -> dict[str, Any]:
+def _run_gpt_vision(
+    image_bytes: bytes,
+    mime_type: str,
+    ocr_hint: str,
+    corrective_note: Optional[str] = None,
+) -> dict[str, Any]:
     """Send image to GPT-4 Vision and return parsed JSON.
 
     Uses Structured Outputs (strict JSON Schema) by default; falls back to plain
@@ -2473,11 +2881,18 @@ def _run_gpt_vision(image_bytes: bytes, mime_type: str, ocr_hint: str) -> dict[s
     either way (normalize_structured maps the strict result onto the same keys the
     downstream consumers — _validate_invoice / _insert_items — already expect).
 
+    `corrective_note` (2026-07-15): extra instruction appended to the prompt on
+    completeness retries / repairs — e.g. "the bill total is X but you captured
+    lines summing to Y; re-read every row". The base prompt is unchanged so the
+    first-pass behavior is identical to before.
+
     Fallback: if GPT-4o returns null for subtotal/vat/amount, try regex extraction
     from tesseract OCR text (Makro invoices have structured format)."""
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:{mime_type or 'image/jpeg'};base64,{b64}"
     prompt = VISION_PROMPT.format(ocr_hint=(ocr_hint or "(empty)")[:3000])
+    if corrective_note:
+        prompt += "\n\n" + corrective_note
     messages = [
         {
             "role": "user",
@@ -2560,7 +2975,71 @@ def _run_gpt_vision(image_bytes: bytes, mime_type: str, ocr_hint: str) -> dict[s
 # ============================================================
 # Helpers — Validation
 # ============================================================
-def _validate_invoice(parsed: dict[str, Any]) -> list[dict[str, str]]:
+
+# Band for "line items tie to the bill amount" — same band the monthly-by-sku
+# true-cost allocation uses (vb.amount / SUM(items.amount) within 0.90..1.10,
+# which absorbs VAT <=7% + small discounts/rounding). A bill outside the band
+# almost always means OCR missed or misread line items (the 24-bill backlog
+# repaired 2026-07-15 was exactly this class).
+ITEMS_TIE_LOW = 0.90
+ITEMS_TIE_HIGH = 1.10
+
+
+def _items_tie_state(
+    amount: Any,
+    items: Optional[list],
+    discount: Any = None,
+) -> dict[str, Any]:
+    """Bill-level completeness check: does SUM(line amounts) land within the
+    ITEMS_TIE band of the bill's amount?
+
+    Returns {"amount", "items_sum", "n_items", "ratio", "ok"}.
+    - ok=True when it ties, OR when there is no positive amount to tie against
+      (a missing total is MISSING_TOTAL's job, not this check's).
+    - ok=False when the bill has a positive amount but no usable lines, or the
+      amount/lines ratio falls outside the band.
+    A whole-bill discount that fully explains the gap (items_sum - discount
+    ties to amount) also counts as ok — big genuine discounts must not be
+    flagged as missing lines.
+    """
+    amt = _to_float(amount)
+    items_sum = 0.0
+    n_items = 0
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        a = _to_float(it.get("amount"))
+        if a is not None:
+            items_sum += a
+            n_items += 1
+    state: dict[str, Any] = {
+        "amount": amt,
+        "items_sum": round(items_sum, 2),
+        "n_items": n_items,
+        "ratio": None,
+        "ok": True,
+    }
+    if amt is None or amt <= 0:
+        return state
+    if items_sum <= 0:
+        state["ok"] = False
+        return state
+    ratio = amt / items_sum
+    state["ratio"] = round(ratio, 3)
+    state["ok"] = ITEMS_TIE_LOW <= ratio <= ITEMS_TIE_HIGH
+    if not state["ok"] and isinstance(discount, dict):
+        disc_amt = _to_float(discount.get("whole_bill_discount_amount"))
+        disc_pct = _to_float(discount.get("whole_bill_discount_pct"))
+        if disc_amt is None and disc_pct is not None:
+            disc_amt = items_sum * (disc_pct / 100.0)
+        if disc_amt and disc_amt > 0 and (items_sum - disc_amt) > 0:
+            ratio2 = amt / (items_sum - disc_amt)
+            if ITEMS_TIE_LOW <= ratio2 <= ITEMS_TIE_HIGH:
+                state["ok"] = True
+    return state
+
+
+def _validate_invoice(parsed: dict[str, Any], *, bill_level: bool = False) -> list[dict[str, str]]:
     """Run validation rules; return list of warnings."""
     warnings: list[dict[str, str]] = []
 
@@ -2747,6 +3226,39 @@ def _validate_invoice(parsed: dict[str, Any]) -> list[dict[str, str]]:
                     pass
     except Exception:
         pass
+
+    # Bill-level completeness gate (2026-07-15). Fired ONLY when validating the
+    # MERGED bill state (bill_level=True, i.e. from _revalidate_bill) — a single
+    # page of a multi-page bill is legitimately partial, so the per-page upload
+    # validation must not raise it. Severity "error" on purpose: the confirm
+    # endpoint blocks on error-severity warnings, so an incomplete bill can no
+    # longer be confirmed silently (TUM decision 2026-07-14: block until the
+    # user explicitly force-confirms). The old ITEMS_SUBTOTAL_MISMATCH above
+    # only ran when OCR found a subtotal and was warn-only — that blind spot is
+    # how 24 incomplete bills reached 'confirmed' unnoticed.
+    if bill_level:
+        tie = _items_tie_state(
+            parsed.get("amount"), parsed.get("items"), parsed.get("discount")
+        )
+        if not tie["ok"]:
+            if tie["n_items"] == 0 or tie["items_sum"] <= 0:
+                msg = (
+                    f"บิลนี้ไม่มีรายการสินค้า แต่ยอดบิล {tie['amount']:,.2f} บาท — "
+                    "กด Re-OCR รายการ, สร้างรายการเดียวเท่ายอด (บิลสลิป), "
+                    "หรือยืนยันแบบข้ามคำเตือน"
+                )
+            else:
+                msg = (
+                    f"ยอดรวมรายการ ({tie['items_sum']:,.2f}) ห่างจากยอดบิล "
+                    f"({tie['amount']:,.2f}) เกิน ±10% — OCR อาจจับรายการไม่ครบ "
+                    "กด Re-OCR รายการ หรือยืนยันแบบข้ามคำเตือน"
+                )
+            warnings.append({
+                "severity": "error",
+                "code": "ITEMS_TOTAL_INCOMPLETE",
+                "message": msg,
+                "field": "items",
+            })
 
     warnings.extend(_confidence_warnings(parsed))
     return warnings
@@ -3530,8 +4042,11 @@ def _revalidate_bill(invoice_id: str) -> list[dict[str, str]]:
     if ocr_json.get("invoice_no_absent") is True:
         parsed_like["invoice_no_absent"] = True
 
-    # Re-run validation against merged bill state
-    fresh_warnings = _validate_invoice(parsed_like)
+    # Re-run validation against merged bill state. bill_level=True arms the
+    # ITEMS_TOTAL_INCOMPLETE completeness gate — here the items list is the
+    # bill's FULL merged set, so "lines don't tie to amount" is meaningful
+    # (unlike per-page validation during a multi-page upload).
+    fresh_warnings = _validate_invoice(parsed_like, bill_level=True)
 
     # Delete existing UNRESOLVED warnings (preserve resolved ones — user marked done)
     try:
