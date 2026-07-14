@@ -376,11 +376,13 @@ def _compute_reorder_list(branch_code: str = DEFAULT_BRANCH,
         from stock_routes import _get_latest_snapshot_id
     except Exception as e:
         log.error("import _get_latest_snapshot_id failed: %s", e)
-        return {"snapshot_at": None, "items": [], "summary": {}}
+        return {"snapshot_at": None, "branch_code": branch_code, "items": [],
+                "legacy_items": [], "summary": {}}
 
     snapshot_id, snapshot_at = _get_latest_snapshot_id(branch_code)
     if not snapshot_id:
-        return {"snapshot_at": None, "items": [], "summary": _summarize_reorder_items([])}
+        return {"snapshot_at": None, "branch_code": branch_code, "items": [],
+                "legacy_items": [], "summary": _summarize_reorder_items([])}
 
     sql = """
         SELECT
