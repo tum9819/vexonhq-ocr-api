@@ -34,6 +34,28 @@ import urllib.request
 import jwt
 import psycopg2
 
+
+def getenv(name: str) -> str | None:
+    """os.environ first; fall back to the app process's environment.
+
+    The Coolify Terminal opens a plain `docker exec` shell that does NOT
+    inherit the env vars Coolify injects into the app's start command, so
+    JWT_SECRET/DATABASE_URL/PORT are missing there. PID 1 (the uvicorn
+    process) has them — read /proc/1/environ directly.
+    """
+    val = os.environ.get(name)
+    if val:
+        return val
+    try:
+        with open("/proc/1/environ", "rb") as f:
+            for entry in f.read().split(b"\0"):
+                k, sep, v = entry.partition(b"=")
+                if sep and k.decode(errors="replace") == name:
+                    return v.decode(errors="replace")
+    except OSError:
+        pass
+    return None
+
 FAILING_BILLS_SQL = """
 SELECT vb.id, vb.vendor_name, vb.bill_date, vb.amount,
        COALESCE(SUM(ii.amount), 0)::numeric(12,2) AS lines_sum,
@@ -51,9 +73,10 @@ ORDER BY vb.amount DESC NULLS LAST;
 
 
 def mint_admin_token() -> str:
-    secret = os.environ.get("JWT_SECRET")
+    secret = getenv("JWT_SECRET")
     if not secret:
-        sys.exit("JWT_SECRET not set — this script must run inside the backend container")
+        sys.exit("JWT_SECRET not found (checked shell env and /proc/1/environ) — "
+                 "this script must run inside the backend container")
     return jwt.encode(
         {"sub": "repair-script", "role": "admin", "exp": int(time.time()) + 2 * 3600},
         secret,
@@ -62,7 +85,7 @@ def mint_admin_token() -> str:
 
 
 def find_base_url() -> str:
-    candidates = [p for p in (os.environ.get("PORT"), "8000", "80", "3000") if p]
+    candidates = [p for p in (getenv("PORT"), "8000", "80", "3000") if p]
     for port in candidates:
         url = f"http://127.0.0.1:{port}"
         try:
@@ -93,7 +116,10 @@ def post(base: str, token: str, path: str, body: dict, timeout: int = 900) -> tu
 
 
 def fetch_failing_bills() -> list[dict]:
-    conn = psycopg2.connect(os.environ["DATABASE_URL"])
+    dsn = getenv("DATABASE_URL")
+    if not dsn:
+        sys.exit("DATABASE_URL not found (checked shell env and /proc/1/environ)")
+    conn = psycopg2.connect(dsn)
     try:
         with conn.cursor() as cur:
             cur.execute(FAILING_BILLS_SQL)
