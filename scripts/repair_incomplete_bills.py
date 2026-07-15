@@ -151,7 +151,13 @@ def main() -> None:
 
     token = mint_admin_token()
     base = find_base_url()
-    print(f"app: {base}  mode: {'APPLY' if args.apply else 'DRY-RUN (no writes)'}\n")
+    if args.single_line:
+        mode = "SINGLE-LINE (writes)"
+    elif args.apply:
+        mode = "APPLY"
+    else:
+        mode = "DRY-RUN (no writes)"
+    print(f"app: {base}  mode: {mode}\n")
 
     if args.single_line:
         for bill_id in args.single_line:
