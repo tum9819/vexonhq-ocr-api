@@ -36,24 +36,29 @@ import psycopg2
 
 
 def getenv(name: str) -> str | None:
-    """os.environ first; fall back to the app process's environment.
+    """os.environ first; fall back to scanning every process's environment.
 
-    The Coolify Terminal opens a plain `docker exec` shell that does NOT
-    inherit the env vars Coolify injects into the app's start command, so
-    JWT_SECRET/DATABASE_URL/PORT are missing there. PID 1 (the uvicorn
-    process) has them — read /proc/1/environ directly.
+    The Coolify Terminal opens a plain `docker exec` shell that may not
+    inherit the env vars the app process got, and PID 1 can be a Nixpacks
+    wrapper without them — so scan /proc/<pid>/environ across all readable
+    processes until the variable is found.
     """
     val = os.environ.get(name)
     if val:
         return val
     try:
-        with open("/proc/1/environ", "rb") as f:
-            for entry in f.read().split(b"\0"):
-                k, sep, v = entry.partition(b"=")
-                if sep and k.decode(errors="replace") == name:
-                    return v.decode(errors="replace")
+        pids = sorted((p for p in os.listdir("/proc") if p.isdigit()), key=int)
     except OSError:
-        pass
+        return None
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                for entry in f.read().split(b"\0"):
+                    k, sep, v = entry.partition(b"=")
+                    if sep and k.decode(errors="replace") == name:
+                        return v.decode(errors="replace")
+        except OSError:
+            continue
     return None
 
 FAILING_BILLS_SQL = """
@@ -73,10 +78,9 @@ ORDER BY vb.amount DESC NULLS LAST;
 
 
 def mint_admin_token() -> str:
-    secret = getenv("JWT_SECRET")
-    if not secret:
-        sys.exit("JWT_SECRET not found (checked shell env and /proc/1/environ) — "
-                 "this script must run inside the backend container")
+    # EXACTLY mirrors auth_routes.JWT_SECRET: env var if set, otherwise the
+    # module's default. Whatever secret the app verifies with, we sign with.
+    secret = getenv("JWT_SECRET") or "vexonhq-change-this-secret-key-in-production-please"
     return jwt.encode(
         {"sub": "repair-script", "role": "admin", "exp": int(time.time()) + 2 * 3600},
         secret,
