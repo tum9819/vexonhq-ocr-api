@@ -151,27 +151,43 @@ def pnl_monthly(
     try:
         with conn.cursor() as cur:
             cur.execute("""
+                WITH pnl_by_month AS (
+                    SELECT
+                        TO_CHAR(d.entry_date, 'YYYY-MM')                        AS month,
+                        COALESCE(SUM(CASE WHEN d.direction='income'
+                                          THEN d.amount ELSE 0 END), 0)         AS sales_net,
+                        COALESCE(SUM(CASE WHEN d.direction='expense'
+                                          THEN d.amount ELSE 0 END), 0)         AS expense_total,
+                        COUNT(DISTINCT CASE WHEN d.direction='expense'
+                                            THEN d.ref_id END)                  AS bill_count_expense
+                    FROM public.v_daybook d
+                    WHERE d.branch_code = %s
+                      AND EXTRACT(YEAR FROM d.entry_date) = %s
+                      AND d.source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
+                                'bank_statement', 'vendor_payment',
+                                'grab_payout', 'lineman_payout', 'payment_gateway_payout',
+                                'pos_cash_deposit', 'cash_withdrawal',
+                                'loan_in', 'loan_repayment')
+                    GROUP BY TO_CHAR(d.entry_date, 'YYYY-MM')
+                ), sales_bills_by_month AS (
+                    SELECT
+                        TO_CHAR(sales_date, 'YYYY-MM') AS month,
+                        COALESCE(SUM(bill_count), 0)::int AS bill_count_sales
+                    FROM public.pos_sales_daily
+                    WHERE branch_code = %s
+                      AND EXTRACT(YEAR FROM sales_date) = %s
+                    GROUP BY TO_CHAR(sales_date, 'YYYY-MM')
+                )
                 SELECT
-                    TO_CHAR(d.entry_date, 'YYYY-MM')                           AS month,
-                    COALESCE(SUM(CASE WHEN d.direction='income'
-                                      THEN d.amount ELSE 0 END), 0)            AS sales_net,
-                    COALESCE(SUM(CASE WHEN d.direction='expense'
-                                      THEN d.amount ELSE 0 END), 0)            AS expense_total,
-                    COUNT(DISTINCT CASE WHEN d.source='pos_sale'
-                                        THEN d.ref_id END)                     AS bill_count_sales,
-                    COUNT(DISTINCT CASE WHEN d.direction='expense'
-                                        THEN d.ref_id END)                     AS bill_count_expense
-                FROM public.v_daybook d
-                WHERE d.branch_code = %s
-                  AND EXTRACT(YEAR FROM d.entry_date) = %s
-                  AND d.source NOT IN ('owner_capital', 'owner_advance', 'transfer_error',
-                            'bank_statement', 'vendor_payment',
-                            'grab_payout', 'lineman_payout', 'payment_gateway_payout',
-                            'pos_cash_deposit', 'cash_withdrawal',
-                            'loan_in', 'loan_repayment')
-                GROUP BY TO_CHAR(d.entry_date, 'YYYY-MM')
-                ORDER BY month
-            """, (branch_code, year))
+                    p.month,
+                    p.sales_net,
+                    p.expense_total,
+                    COALESCE(s.bill_count_sales, 0) AS bill_count_sales,
+                    p.bill_count_expense
+                FROM pnl_by_month p
+                LEFT JOIN sales_bills_by_month s USING (month)
+                ORDER BY p.month
+            """, (branch_code, year, branch_code, year))
             raw = _rows_to_dicts(cur)
     finally:
         conn.close()

@@ -274,6 +274,8 @@ The best AGENTS.md grows from edge cases, not upfront planning.
 mistake the same rule would have prevented. Don't edit existing rules
 without TUM's explicit ask. Date the addition in the commit message.
 
+**73. Receipt counts and invoice discounts must use their canonical sources consistently.** (Regression 2026-07-16; external review approved 2026-07-17, pending TUM push approval.) In `/pnl/monthly`, `v_daybook` contains one `pos_sale` row per operating day, so `COUNT(DISTINCT ref_id)` counts days, not receipts; sum `public.pos_sales_daily.bill_count` by branch/year/month instead, while leaving cash-basis money totals on the existing P&L source. For invoice completeness, every path that calls `_items_tie_state` (confirm, monthly-SKU, Re-OCR preview, and Re-OCR apply) must pass the same whole-bill discount amount/percent parsed from `ocr_json.discount`; otherwise a valid bill discount over the ordinary tie band is falsely reported incomplete. The legacy monthly-SKU `paid_*` response keys are deploy-compatibility names only: values are confirmed bill totals grouped by `bill_date` and can include unpaid AP, so UI/docs must not call them paid or slip-matched amounts.
+
 **9. ai-link-ingredients: AI may return Thai text as ingredient_id.** (Session 34, 2026-05-23)
 ```python
 # Claude Haiku occasionally returns "ไม่มี ID ต้นประกอบ" or similar Thai text

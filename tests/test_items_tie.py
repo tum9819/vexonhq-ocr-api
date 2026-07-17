@@ -11,6 +11,7 @@ No network, no DB, no OpenAI.
 Run: pytest tests/test_items_tie.py -v
 """
 import os
+from unittest.mock import MagicMock
 
 os.environ.setdefault("DATABASE_URL", "postgresql://u:p@localhost:5432/d")
 os.environ.setdefault("JWT_SECRET", "testsecret")
@@ -80,6 +81,51 @@ def test_tie_pct_discount_explains_gap():
         800.0, _items(1000), {"whole_bill_discount_pct": 20}
     )
     assert s["ok"] is True
+
+
+def test_reocr_apply_uses_bill_discount_when_items_exceed_amount(monkeypatch):
+    invoice_id = "00000000-0000-0000-0000-000000000001"
+    bill = {
+        "id": invoice_id,
+        "amount": 700.0,
+        "review_status": "confirmed",
+        "ocr_json": {"discount": {"whole_bill_discount_amount": 300.0}},
+    }
+    monkeypatch.setattr(main, "_require_admin_request", lambda _request: None)
+    monkeypatch.setattr(main, "_load_bill_for_repair", lambda _id: (bill, 700.0, []))
+    monkeypatch.setattr(main, "get_supabase", lambda: MagicMock())
+    monkeypatch.setattr(main, "_backup_items_before_repair", lambda *args: None)
+    monkeypatch.setattr(main, "_insert_items", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "_revalidate_bill", lambda _id: [])
+    monkeypatch.setattr(main, "_current_username", lambda _request: "tester")
+
+    result = main.invoice_reocr_items(
+        invoice_id,
+        MagicMock(),
+        main.ReocrItemsRequest(apply=True, items=[{"amount": 1000.0}]),
+    )
+
+    assert result["applied"] is True
+    assert result["tie_ok"] is True
+    assert result["ratio"] == 0.7
+
+
+def test_monthly_sku_query_uses_same_whole_bill_discount_tie_rule(monkeypatch):
+    conn = MagicMock()
+    cur = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    cur.fetchall.return_value = []
+    cur.fetchone.side_effect = [(0,), (0, 0), (0, 0)]
+    monkeypatch.setattr(main, "get_db_conn", lambda: conn)
+
+    result = main.invoice_items_monthly_by_sku(month="2026-07")
+
+    sql = [call.args[0] for call in cur.execute.call_args_list]
+    assert "whole_bill_discount_amount" in sql[0]
+    assert "whole_bill_discount_pct" in sql[0]
+    assert "whole_bill_discount_amount" in sql[3]
+    assert "whole_bill_discount_pct" in sql[3]
+    assert result["summary"]["incomplete_bills"] == 0
 
 
 def test_tie_tolerates_garbage_amounts():

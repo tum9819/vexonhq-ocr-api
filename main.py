@@ -1339,11 +1339,12 @@ def invoice_items_monthly_by_sku(
                 branch_filter = " AND vb.branch_code = %s"
                 params.append(branch_code)
 
-            # True-cost allocation (2026-07-14, TUM decision: purchases must be
-            # comparable to slips/statement, i.e. VAT-inclusive money paid).
+            # True-cost allocation (2026-07-14): purchases use the confirmed
+            # bill's VAT-inclusive total, grouped by bill_date. This is purchase
+            # cost, not proof that cash was paid or matched to a statement.
             # Bills don't carry per-line VAT (fresh food is VAT-exempt, dry
             # goods are not, and OCR captures no line-level VAT), so instead
-            # each bill's PAID amount (vendor_bills.amount, VAT-inclusive) is
+            # each confirmed bill's total (vendor_bills.amount, VAT-inclusive) is
             # allocated across its lines proportionally. Guard: only when the
             # bill's line sum is within ±10% of the paid amount (covers VAT
             # ≤7% + small discounts/rounding). Bills outside the band have
@@ -1352,13 +1353,20 @@ def invoice_items_monthly_by_sku(
             # of inventing numbers.
             cur.execute(
                 f"""
-                WITH bill_ratio AS (
+                WITH bill_sums AS (
                     SELECT vb.id,
                            vb.amount AS paid_amount,
                            SUM(ii.amount) AS lines_sum,
-                           CASE WHEN SUM(ii.amount) > 0
-                                 AND vb.amount / SUM(ii.amount) BETWEEN 0.90 AND 1.10
-                                THEN vb.amount / SUM(ii.amount) END AS ratio
+                           CASE
+                               WHEN MAX(vb.ocr_json #>> '{{discount,whole_bill_discount_amount}}')
+                                    ~ '^[0-9]+([.][0-9]+)?$'
+                               THEN MAX(vb.ocr_json #>> '{{discount,whole_bill_discount_amount}}')::numeric
+                           END AS discount_amount,
+                           CASE
+                               WHEN MAX(vb.ocr_json #>> '{{discount,whole_bill_discount_pct}}')
+                                    ~ '^[0-9]+([.][0-9]+)?$'
+                               THEN MAX(vb.ocr_json #>> '{{discount,whole_bill_discount_pct}}')::numeric
+                           END AS discount_pct
                     FROM public.vendor_bills vb
                     JOIN public.invoice_items ii ON ii.vendor_bill_id = vb.id
                     WHERE vb.review_status = 'confirmed'
@@ -1366,6 +1374,26 @@ def invoice_items_monthly_by_sku(
                       AND vb.bill_date <  %s::date
                       {branch_filter}
                     GROUP BY vb.id, vb.amount
+                ), bill_discounts AS (
+                    SELECT *,
+                           COALESCE(
+                               discount_amount,
+                               CASE WHEN discount_pct > 0
+                                    THEN lines_sum * discount_pct / 100.0 END
+                           ) AS effective_discount
+                    FROM bill_sums
+                ), bill_ratio AS (
+                    SELECT id, paid_amount, lines_sum,
+                           CASE WHEN lines_sum > 0 AND (
+                                     paid_amount / lines_sum BETWEEN 0.90 AND 1.10
+                                     OR (
+                                         effective_discount > 0
+                                         AND lines_sum - effective_discount > 0
+                                         AND paid_amount / (lines_sum - effective_discount)
+                                             BETWEEN 0.90 AND 1.10
+                                     )
+                                ) THEN paid_amount / lines_sum END AS ratio
+                    FROM bill_discounts
                 )
                 SELECT
                     COALESCE(p.category, 'unclassified')              AS category,
@@ -1443,9 +1471,9 @@ def invoice_items_monthly_by_sku(
             row = cur.fetchone()
             total_bills = int(row[0] or 0) if row else 0
 
-            # Paid total = SUM of confirmed bills' VAT-inclusive amounts — the
-            # number that ties to slips/statement (includes bills whose OCR
-            # lines are missing entirely).
+            # Confirmed-bill total = SUM of VAT-inclusive amounts by bill_date.
+            # The `paid_*` response keys are retained for frontend deploy-order
+            # compatibility, but can include unpaid AP and zero-line bills.
             cur.execute(
                 f"""
                 SELECT COALESCE(SUM(vb.amount), 0), COUNT(*)::int
@@ -1467,13 +1495,19 @@ def invoice_items_monthly_by_sku(
             # their paid amount is in paid_total — 6 such bills exist in prod).
             cur.execute(
                 f"""
-                SELECT COUNT(*) FILTER (WHERE ratio IS NULL)::int,
-                       COALESCE(SUM(paid_amount) FILTER (WHERE ratio IS NULL), 0)
-                FROM (
+                WITH bill_sums AS (
                     SELECT vb.id, vb.amount AS paid_amount,
-                           CASE WHEN SUM(ii.amount) > 0
-                                 AND vb.amount / SUM(ii.amount) BETWEEN 0.90 AND 1.10
-                                THEN 1 END AS ratio
+                           SUM(ii.amount) AS lines_sum,
+                           CASE
+                               WHEN MAX(vb.ocr_json #>> '{{discount,whole_bill_discount_amount}}')
+                                    ~ '^[0-9]+([.][0-9]+)?$'
+                               THEN MAX(vb.ocr_json #>> '{{discount,whole_bill_discount_amount}}')::numeric
+                           END AS discount_amount,
+                           CASE
+                               WHEN MAX(vb.ocr_json #>> '{{discount,whole_bill_discount_pct}}')
+                                    ~ '^[0-9]+([.][0-9]+)?$'
+                               THEN MAX(vb.ocr_json #>> '{{discount,whole_bill_discount_pct}}')::numeric
+                           END AS discount_pct
                     FROM public.vendor_bills vb
                     LEFT JOIN public.invoice_items ii ON ii.vendor_bill_id = vb.id
                     WHERE vb.review_status = 'confirmed'
@@ -1481,7 +1515,30 @@ def invoice_items_monthly_by_sku(
                       AND vb.bill_date <  %s::date
                       {branch_filter}
                     GROUP BY vb.id, vb.amount
-                ) t
+                ), bill_discounts AS (
+                    SELECT *,
+                           COALESCE(
+                               discount_amount,
+                               CASE WHEN discount_pct > 0
+                                    THEN lines_sum * discount_pct / 100.0 END
+                           ) AS effective_discount
+                    FROM bill_sums
+                ), bill_ties AS (
+                    SELECT id, paid_amount,
+                           CASE WHEN lines_sum > 0 AND (
+                                     paid_amount / lines_sum BETWEEN 0.90 AND 1.10
+                                     OR (
+                                         effective_discount > 0
+                                         AND lines_sum - effective_discount > 0
+                                         AND paid_amount / (lines_sum - effective_discount)
+                                             BETWEEN 0.90 AND 1.10
+                                     )
+                                ) THEN 1 END AS ratio
+                    FROM bill_discounts
+                )
+                SELECT COUNT(*) FILTER (WHERE ratio IS NULL)::int,
+                       COALESCE(SUM(paid_amount) FILTER (WHERE ratio IS NULL), 0)
+                FROM bill_ties
                 """,
                 params,
             )
@@ -2209,12 +2266,13 @@ def _apply_reocr_items(
     old_items: list[dict[str, Any]],
     new_items: list[dict[str, Any]],
     force: bool,
+    discount: Any = None,
 ) -> dict[str, Any]:
     """Shared apply step for /reocr-items (fresh-OCR path and WYSIWYG
     items-payload path): tie-gate -> backup -> replace -> revalidate."""
     sb = get_supabase()
     old_sum = sum(_to_float(i.get("amount")) or 0.0 for i in old_items)
-    tie = _items_tie_state(amount, new_items)
+    tie = _items_tie_state(amount, new_items, discount)
     result = {
         "success": True,
         "invoice_id": invoice_id,
@@ -2292,6 +2350,8 @@ def invoice_reocr_items(
 
     bill, amount, old_items = _load_bill_for_repair(invoice_id)
     sb = get_supabase()
+    ocr_json = bill.get("ocr_json")
+    discount = ocr_json.get("discount") if isinstance(ocr_json, dict) else None
 
     if supplied_items is not None:
         # WYSIWYG apply: use the exact items the user previewed (no second,
@@ -2316,7 +2376,7 @@ def invoice_reocr_items(
                 "source_page": source_page,
             })
         return _apply_reocr_items(
-            request, invoice_id, amount, old_items, new_items, force
+            request, invoice_id, amount, old_items, new_items, force, discount
         )
 
     atts = (
@@ -2390,7 +2450,7 @@ def invoice_reocr_items(
 
     if not do_apply:
         old_sum = sum(_to_float(i.get("amount")) or 0.0 for i in old_items)
-        tie = _items_tie_state(amount, new_items)
+        tie = _items_tie_state(amount, new_items, discount)
         return {
             "success": True,
             "invoice_id": invoice_id,
@@ -2404,7 +2464,9 @@ def invoice_reocr_items(
             "new_items": new_items,
             "applied": False,
         }
-    return _apply_reocr_items(request, invoice_id, amount, old_items, new_items, force)
+    return _apply_reocr_items(
+        request, invoice_id, amount, old_items, new_items, force, discount
+    )
 
 
 @app.post("/invoice/{invoice_id}/set-single-line")

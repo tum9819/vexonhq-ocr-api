@@ -1,11 +1,28 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-07-13 (post-FA-022 deploy status cleanup)
+**Last updated**: 2026-07-17 (external review approved; TUM push approval pending)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
 
 ---
+
+## 🟡 2026-07-16 backend regression fixes — externally approved, local only, do not push yet
+
+- `/pnl/monthly` now sources receipt count from
+  `SUM(pos_sales_daily.bill_count)` instead of counting one aggregate POS row/day.
+- Monthly-SKU true-cost and Re-OCR preview/apply now honor the same whole-bill
+  discount amount/percent rule as confirm validation.
+- Backend comments clarify that legacy `paid_*` monthly-SKU keys are confirmed-bill
+  totals by `bill_date` and can include unpaid AP; response keys remain compatible.
+- Verification: targeted 71 passed; full 517 passed / 2 skipped; new SQL executed
+  read-only against production data; live pre-change smoke 71/71.
+- External review verdict: `APPROVE WITH NON-BLOCKING NOTES`; no backend defect
+  was found. Post-review targeted 19 passed, full 517 passed / 2 skipped, live
+  smoke 71/71, and `/health/deep` was healthy with CPU 0.0%.
+- Next: show final diff + commit message and wait for TUM's explicit approval
+  before push/deploy. No migration or data write is required.
+
 
 ## ✅ Recent audit fixes now shipped
 
