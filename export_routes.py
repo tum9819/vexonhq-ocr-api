@@ -18,7 +18,7 @@ import zipfile
 from datetime import date, datetime
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 
 import openpyxl
@@ -26,6 +26,10 @@ from openpyxl.styles import (
     Alignment, Border, Font, PatternFill, Side
 )
 from openpyxl.utils import get_column_letter
+
+from auth_routes import _require_admin_role
+from bkk import bkk_now, bkk_today
+from export_readiness import build_readiness, canonical_fingerprint
 
 try:
     from main import get_db_conn  # type: ignore
@@ -903,6 +907,321 @@ def export_summary(month: str = Query(..., description="YYYY-MM")):
             "size_bytes_est": zip_est,
         },
     }
+
+
+def _query_readiness_facts(
+    first: date,
+    last: date,
+    branch_code: str,
+) -> tuple[dict, dict]:
+    """Acquire Phase A readiness facts with six batched SELECTs plus close checks."""
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS row_count,
+                    COUNT(DISTINCT import_batch_id) AS batch_count,
+                    MIN(txn_date) AS first_observed_date,
+                    MAX(txn_date) AS last_observed_date,
+                    COUNT(*) FILTER (WHERE match_status = 'needs_review') AS review_count,
+                    COALESCE(
+                        SUM(ABS(amount)) FILTER (WHERE match_status = 'needs_review'),
+                        0
+                    ) AS review_amount
+                FROM public.bank_statement_entries
+                WHERE txn_date BETWEEN %s AND %s
+                  AND branch_code = %s
+                """,
+                (first, last, branch_code),
+            )
+            statement_stats = dict(
+                zip((column[0] for column in cur.description), cur.fetchone())
+            )
+
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) FILTER (
+                        WHERE direction = 'expense' AND category_code IS NULL
+                    ) AS uncategorized_count,
+                    COALESCE(
+                        SUM(amount) FILTER (
+                            WHERE direction = 'expense' AND category_code IS NULL
+                        ),
+                        0
+                    ) AS uncategorized_amount,
+                    COALESCE(
+                        SUM(amount) FILTER (WHERE direction = 'income'),
+                        0
+                    ) AS income_total,
+                    COALESCE(
+                        SUM(amount) FILTER (WHERE direction = 'expense'),
+                        0
+                    ) AS expense_total,
+                    COALESCE(
+                        SUM(amount) FILTER (
+                            WHERE direction = 'expense' AND category_code IS NOT NULL
+                        ),
+                        0
+                    ) AS categorized_expense
+                FROM public.v_daybook_pnl
+                WHERE entry_date BETWEEN %s AND %s
+                  AND (branch_code = %s OR branch_code IS NULL)
+                """,
+                (first, last, branch_code),
+            )
+            pnl_stats = dict(
+                zip((column[0] for column in cur.description), cur.fetchone())
+            )
+
+            cur.execute(
+                """
+                SELECT
+                    b.id::text, b.txn_date, b.description, b.debit, b.credit,
+                    b.category_code, b.source_type, b.match_status,
+                    b.matched_invoice_id::text,
+                    EXISTS (
+                      SELECT 1
+                      FROM public.slips s
+                      WHERE s.matched_statement_id = b.id
+                    ) AS has_slip
+                FROM public.bank_statement_entries b
+                WHERE b.txn_date BETWEEN %s AND %s
+                  AND b.branch_code = %s
+                ORDER BY b.txn_date, b.id
+                """,
+                (first, last, branch_code),
+            )
+            statement_rows = _rows_to_dicts(cur)
+
+            cur.execute(
+                """
+                SELECT
+                    s.id::text, s.transfer_date, s.amount, s.raw_image_url,
+                    s.matched_statement_id::text, s.matched_invoice_id::text,
+                    s.match_status
+                FROM public.slips s
+                WHERE s.transfer_date BETWEEN %s AND %s
+                ORDER BY s.transfer_date, s.id
+                """,
+                (first, last),
+            )
+            slip_rows = _rows_to_dicts(cur)
+
+            cur.execute(
+                """
+                SELECT
+                    vb.id::text, vb.bill_date, vb.amount, vb.category_code,
+                    vb.review_status, vb.payment_type, vb.payment_status,
+                    vb.attachment_url,
+                    a.id::text AS attachment_id, a.page_no, a.file_url
+                FROM public.vendor_bills vb
+                LEFT JOIN public.attachments a
+                  ON a.parent_type = 'vendor_bill' AND a.parent_id = vb.id
+                WHERE vb.bill_date BETWEEN %s AND %s
+                  AND COALESCE(vb.branch_code, %s) = %s
+                  AND COALESCE(vb.review_status, '') <> 'rejected'
+                ORDER BY vb.id, a.page_no, a.id
+                """,
+                (first, last, branch_code, branch_code),
+            )
+            bill_rows = _rows_to_dicts(cur)
+
+            cur.execute(
+                """
+                SELECT
+                    entry_date, direction, amount, category_code, source,
+                    ref_id::text, label, counterparty
+                FROM public.v_daybook_pnl
+                WHERE entry_date BETWEEN %s AND %s
+                  AND (branch_code = %s OR branch_code IS NULL)
+                ORDER BY entry_date, source, ref_id
+                """,
+                (first, last, branch_code),
+            )
+            daybook_rows = _rows_to_dicts(cur)
+
+        from monthly_close_routes import run_all_checks
+
+        detected_risks = run_all_checks(conn, first, last, branch_code)
+        danger_risks = [
+            risk for risk in detected_risks if risk.get("severity") == "danger"
+        ]
+    finally:
+        conn.close()
+
+    bill_groups: dict[str, dict] = {}
+    attachment_url_failures = 0
+    for row in bill_rows:
+        bill_id = row["id"]
+        group = bill_groups.setdefault(
+            bill_id,
+            {
+                "amount": row["amount"] or 0,
+                "review_status": row["review_status"],
+                "payment_type": row["payment_type"],
+                "payment_status": row["payment_status"],
+                "attachment_url": row["attachment_url"],
+                "has_attachment_row": False,
+                "has_page_url": False,
+            },
+        )
+        if row["attachment_id"] is not None:
+            group["has_attachment_row"] = True
+            if row["file_url"]:
+                group["has_page_url"] = True
+            else:
+                attachment_url_failures += 1
+
+    def has_invoice_page(group: dict) -> bool:
+        return bool(group["has_page_url"] or group["attachment_url"])
+
+    missing_bills = [
+        group for group in bill_groups.values() if not has_invoice_page(group)
+    ]
+    confirmed_cards = [
+        group
+        for group in bill_groups.values()
+        if group["review_status"] == "confirmed"
+        and (
+            group["payment_type"] == "credit_card"
+            or group["payment_status"] == "credit_card"
+        )
+    ]
+    missing_confirmed_cards = [
+        group for group in confirmed_cards if not has_invoice_page(group)
+    ]
+    card_bill_ids = {
+        bill_id
+        for bill_id, group in bill_groups.items()
+        if group["payment_type"] == "credit_card"
+        or group["payment_status"] == "credit_card"
+    }
+
+    daybook_expense_statement_ids = {
+        str(row["ref_id"])
+        for row in daybook_rows
+        if row["direction"] == "expense"
+        and row["source"] != "pos_cashflow"
+        and row["ref_id"] is not None
+    }
+    missing_transfer_slips = [
+        row
+        for row in statement_rows
+        if row["id"] in daybook_expense_statement_ids
+        and (row["debit"] or 0) > 0
+        and row["matched_invoice_id"] not in card_bill_ids
+        and not row["has_slip"]
+    ]
+
+    drift = (
+        (pnl_stats["expense_total"] or 0)
+        - (pnl_stats["categorized_expense"] or 0)
+        - (pnl_stats["uncategorized_amount"] or 0)
+    )
+    danger_amount = sum((risk.get("amount") or 0 for risk in danger_risks), 0)
+    missing_bill_amount = sum((group["amount"] for group in missing_bills), 0)
+    missing_card_amount = sum(
+        (group["amount"] for group in missing_confirmed_cards), 0
+    )
+    missing_transfer_amount = sum(
+        ((row["debit"] or 0) for row in missing_transfer_slips), 0
+    )
+    missing_bill_without_attachment_row = sum(
+        1
+        for group in bill_groups.values()
+        if not group["has_attachment_row"] and not group["attachment_url"]
+    )
+    image_url_failure_count = (
+        sum(1 for row in slip_rows if not row["raw_image_url"])
+        + attachment_url_failures
+        + missing_bill_without_attachment_row
+    )
+
+    facts = {
+        "statement": {
+            "row_count": int(statement_stats["row_count"] or 0),
+            "batch_count": int(statement_stats["batch_count"] or 0),
+            "first_observed_date": statement_stats["first_observed_date"],
+            "last_observed_date": statement_stats["last_observed_date"],
+            "declared_period_verified": False,
+        },
+        "statement_needs_review": {
+            "count": int(statement_stats["review_count"] or 0),
+            "amount": statement_stats["review_amount"] or 0,
+        },
+        "uncategorized": {
+            "count": int(pnl_stats["uncategorized_count"] or 0),
+            "amount": pnl_stats["uncategorized_amount"] or 0,
+        },
+        "reconciliation": {
+            "ok": abs(float(drift)) <= 0.01,
+            "drift": drift,
+        },
+        "monthly_close_dangers": {
+            "count": len(danger_risks),
+            "amount": danger_amount,
+        },
+        "transfer_evidence": {
+            "missing_slip_count": len(missing_transfer_slips),
+            "missing_slip_amount": missing_transfer_amount,
+        },
+        "invoice_evidence": {
+            "missing_page_count": len(missing_bills),
+            "missing_page_amount": missing_bill_amount,
+        },
+        "credit_cards": {
+            "confirmed_count": len(confirmed_cards),
+            "missing_invoice_page_count": len(missing_confirmed_cards),
+            "missing_invoice_page_amount": missing_card_amount,
+        },
+        "image_url_failures": {"count": image_url_failure_count},
+    }
+    fingerprint_inputs = {
+        "month": first.strftime("%Y-%m"),
+        "branch_code": branch_code,
+        "daybook_rows": daybook_rows,
+        "statement_rows": statement_rows,
+        "slip_rows": slip_rows,
+        "bills_and_pages": bill_rows,
+        "monthly_close": [
+            {
+                "risk_key": risk["risk_key"],
+                "severity": risk["severity"],
+                "amount": risk.get("amount"),
+            }
+            for risk in danger_risks
+        ],
+    }
+    return facts, fingerprint_inputs
+
+
+@router.get("/readiness")
+def export_readiness(
+    month: str = Query(..., description="YYYY-MM"),
+    branch_code: str = Query("thawi_watthana"),
+    _admin: dict = Depends(_require_admin_role),
+):
+    first, last = _month_range(month)
+    facts, fingerprint_inputs = _query_readiness_facts(first, last, branch_code)
+    payload = build_readiness(
+        month,
+        branch_code,
+        {
+            **facts,
+            "today": bkk_today(),
+            "month_start": first,
+            "month_end": last,
+        },
+    )
+    payload["generated_at"] = bkk_now().isoformat()
+    payload["source_fingerprint"] = {
+        "version": "phase-a-v1",
+        "sha256": canonical_fingerprint(fingerprint_inputs),
+    }
+    return payload
 
 
 def _assemble_audit_vouchers(vrows: list[dict], slips_by_stmt: dict, inv_by_stmt: dict,

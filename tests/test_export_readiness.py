@@ -2,7 +2,11 @@ from datetime import date
 from decimal import Decimal
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
+import export_routes
+import monthly_close_routes
 from export_readiness import build_readiness, canonical_fingerprint, package_status
 
 
@@ -33,6 +37,212 @@ def _facts(**overrides):
     }
     base.update(overrides)
     return base
+
+
+def test_readiness_requires_login():
+    app = FastAPI()
+    app.include_router(export_routes.router)
+    response = TestClient(app, raise_server_exceptions=False).get(
+        "/export/readiness?month=2026-07"
+    )
+    assert response.status_code == 401
+
+
+def test_readiness_accepts_admin_and_returns_versioned_contract(monkeypatch):
+    app = FastAPI()
+    app.include_router(export_routes.router)
+    app.dependency_overrides[export_routes._require_admin_role] = lambda: {
+        "sub": "admin-uid", "_role": "admin",
+    }
+    monkeypatch.setattr(
+        export_routes,
+        "_query_readiness_facts",
+        lambda *args: (_facts(), {"rows": []}),
+    )
+    response = TestClient(app, raise_server_exceptions=False).get(
+        "/export/readiness?month=2026-07&branch_code=thawi_watthana"
+    )
+    assert response.status_code == 200
+    assert response.json()["schema_version"] == 1
+    assert len(response.json()["source_fingerprint"]["sha256"]) == 64
+
+
+def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monkeypatch):
+    responses = [
+        (
+            [
+                "row_count", "batch_count", "first_observed_date",
+                "last_observed_date", "review_count", "review_amount",
+            ],
+            [(3, 1, date(2026, 7, 1), date(2026, 7, 31), 1, Decimal("12.00"))],
+        ),
+        (
+            [
+                "uncategorized_count", "uncategorized_amount", "income_total",
+                "expense_total", "categorized_expense",
+            ],
+            [(1, Decimal("50.00"), Decimal("400.00"), Decimal("300.00"), Decimal("250.00"))],
+        ),
+        (
+            [
+                "id", "txn_date", "description", "debit", "credit",
+                "category_code", "source_type", "match_status",
+                "matched_invoice_id", "has_slip",
+            ],
+            [
+                (
+                    "s1", date(2026, 7, 5), "transfer", Decimal("100.00"),
+                    Decimal("0"), "food_raw", "vendor_purchase", "manual", "b1", False,
+                ),
+                (
+                    "s2", date(2026, 7, 6), "card settlement", Decimal("200.00"),
+                    Decimal("0"), "food_raw", "vendor_purchase", "manual", "b2", False,
+                ),
+                (
+                    "s3", date(2026, 7, 7), "income", Decimal("0"),
+                    Decimal("400.00"), "sales", "sales", "manual", None, False,
+                ),
+            ],
+        ),
+        (
+            [
+                "id", "transfer_date", "amount", "raw_image_url",
+                "matched_statement_id", "matched_invoice_id", "match_status",
+            ],
+            [
+                (
+                    "sl1", date(2026, 7, 5), Decimal("100.00"), None,
+                    None, None, "unmatched",
+                ),
+            ],
+        ),
+        (
+            [
+                "id", "bill_date", "amount", "category_code", "review_status",
+                "payment_type", "payment_status", "attachment_url",
+                "attachment_id", "page_no", "file_url",
+            ],
+            [
+                (
+                    "b1", date(2026, 7, 5), Decimal("100.00"), "food_raw",
+                    "confirmed", "transfer", "paid", None, None, None, None,
+                ),
+                (
+                    "b2", date(2026, 7, 6), Decimal("200.00"), "food_raw",
+                    "confirmed", "credit_card", "paid", "legacy-b2", None, None, None,
+                ),
+                (
+                    "b3", date(2026, 7, 8), Decimal("50.00"), "food_raw",
+                    "pending", "cash", "unpaid", None, "a3", 1, "page-b3",
+                ),
+            ],
+        ),
+        (
+            [
+                "entry_date", "direction", "amount", "category_code",
+                "source", "ref_id", "label", "counterparty",
+            ],
+            [
+                (
+                    date(2026, 7, 5), "expense", Decimal("100.00"), "food_raw",
+                    "bank_statement", "s1", "transfer", "Vendor One",
+                ),
+                (
+                    date(2026, 7, 6), "expense", Decimal("200.00"), "food_raw",
+                    "bank_statement", "s2", "card settlement", "Vendor Two",
+                ),
+                (
+                    date(2026, 7, 7), "income", Decimal("400.00"), "sales",
+                    "pos_sales", "s3", "income", None,
+                ),
+            ],
+        ),
+    ]
+
+    class FakeCursor:
+        description = None
+
+        def __init__(self):
+            self.executions = []
+            self._rows = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params):
+            columns, rows = responses[len(self.executions)]
+            self.executions.append((sql, params))
+            self.description = [(column,) for column in columns]
+            self._rows = rows
+
+        def fetchone(self):
+            return self._rows[0]
+
+        def fetchall(self):
+            return list(self._rows)
+
+    class FakeConnection:
+        def __init__(self):
+            self.cur = FakeCursor()
+            self.closed = False
+
+        def cursor(self):
+            return self.cur
+
+        def close(self):
+            self.closed = True
+
+    conn = FakeConnection()
+    monkeypatch.setattr(export_routes, "get_db_conn", lambda: conn)
+    monkeypatch.setattr(
+        monthly_close_routes,
+        "run_all_checks",
+        lambda *_args: [
+            {"risk_key": "danger-one", "severity": "danger", "amount": Decimal("9.00")},
+            {"risk_key": "warning-one", "severity": "warning", "amount": Decimal("7.00")},
+        ],
+    )
+
+    facts, fingerprint_inputs = export_routes._query_readiness_facts(
+        date(2026, 7, 1), date(2026, 7, 31), "thawi_watthana"
+    )
+
+    assert len(conn.cur.executions) == 6
+    assert all(sql.lstrip().startswith("SELECT") for sql, _ in conn.cur.executions)
+    assert conn.closed is True
+    assert facts["statement"] == {
+        "row_count": 3,
+        "batch_count": 1,
+        "first_observed_date": date(2026, 7, 1),
+        "last_observed_date": date(2026, 7, 31),
+        "declared_period_verified": False,
+    }
+    assert facts["statement_needs_review"] == {"count": 1, "amount": Decimal("12.00")}
+    assert facts["reconciliation"] == {"ok": True, "drift": Decimal("0.00")}
+    assert facts["monthly_close_dangers"] == {"count": 1, "amount": Decimal("9.00")}
+    assert facts["transfer_evidence"] == {
+        "missing_slip_count": 1,
+        "missing_slip_amount": Decimal("100.00"),
+    }
+    assert facts["invoice_evidence"] == {
+        "missing_page_count": 1,
+        "missing_page_amount": Decimal("100.00"),
+    }
+    assert facts["credit_cards"] == {
+        "confirmed_count": 1,
+        "missing_invoice_page_count": 0,
+        "missing_invoice_page_amount": 0,
+    }
+    assert facts["image_url_failures"] == {"count": 2}
+    assert fingerprint_inputs["month"] == "2026-07"
+    assert fingerprint_inputs["branch_code"] == "thawi_watthana"
+    assert len(fingerprint_inputs["daybook_rows"]) == 3
+    assert fingerprint_inputs["monthly_close"] == [
+        {"risk_key": "danger-one", "severity": "danger", "amount": Decimal("9.00")}
+    ]
 
 
 def test_observed_to_july_15_is_preview_only_not_ready():
