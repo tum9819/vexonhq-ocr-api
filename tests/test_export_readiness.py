@@ -174,23 +174,24 @@ def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monke
             [
                 "id", "import_batch_id", "txn_date", "description", "debit",
                 "credit", "amount", "category_code", "source_type",
-                "match_status", "matched_invoice_id", "has_slip",
+                "match_status", "matched_invoice_id",
+                "matched_invoice_is_credit_card", "has_slip",
             ],
             [
                 (
                     "s1", "batch-1", date(2026, 7, 5), "transfer",
                     Decimal("100.00"), Decimal("0"), Decimal("100.00"),
-                    "food_raw", "vendor_purchase", "manual", "b1", False,
+                    "food_raw", "vendor_purchase", "manual", "b1", False, False,
                 ),
                 (
                     "s2", "batch-1", date(2026, 7, 6), "card settlement",
                     Decimal("200.00"), Decimal("0"), Decimal("200.00"),
-                    "food_raw", "vendor_purchase", "manual", "b2", False,
+                    "food_raw", "vendor_purchase", "manual", "b2", True, False,
                 ),
                 (
                     "s3", "batch-1", date(2026, 7, 7), "income",
                     Decimal("0"), Decimal("400.00"), Decimal("400.00"),
-                    "sales", "sales", "manual", None, False,
+                    "sales", "sales", "manual", None, False, False,
                 ),
             ],
         ),
@@ -333,6 +334,11 @@ def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monke
     statement_sql = conn.cur.executions[2][0]
     assert "b.import_batch_id::text" in statement_sql
     assert "b.amount" in statement_sql
+    assert "LEFT JOIN public.vendor_bills matched_vb" in statement_sql
+    assert "matched_vb.payment_type = 'credit_card'" in statement_sql
+    assert "matched_vb.payment_status = 'credit_card'" in statement_sql
+    assert "matched_vb.bill_date" not in statement_sql
+    assert "matched_invoice_is_credit_card" in statement_sql
     slip_sql = conn.cur.executions[3][0]
     assert "is_branch_linked" in slip_sql
     assert "is_month_unattributed" in slip_sql
@@ -369,6 +375,7 @@ def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monke
     assert len(fingerprint_inputs["daybook_rows"]) == 3
     assert fingerprint_inputs["statement_rows"][0]["import_batch_id"] == "batch-1"
     assert fingerprint_inputs["statement_rows"][0]["amount"] == Decimal("100.00")
+    assert fingerprint_inputs["statement_rows"][1]["matched_invoice_is_credit_card"] is True
     assert [row["id"] for row in fingerprint_inputs["branch_linked_slip_rows"]] == [
         "sl1"
     ]
@@ -512,6 +519,45 @@ def test_credit_card_missing_invoice_does_not_create_missing_transfer_slip():
     rule = next(r for r in result["packages"]["tax_evidence"]["rules"]
                 if r["code"] == "TRANSFER_SLIP_EVIDENCE")
     assert rule["count"] == 0
+
+
+def test_missing_transfer_uses_linked_bill_card_fact_independent_of_bill_month():
+    daybook_rows = [
+        {
+            "direction": "expense",
+            "source": "vendor_purchase",
+            "ref_id": statement_id,
+        }
+        for statement_id in (
+            "card-by-type", "card-by-status", "non-card", "no-bill",
+        )
+    ]
+    statement_rows = [
+        {
+            "id": "card-by-type", "debit": Decimal("100"), "has_slip": False,
+            "matched_invoice_id": "out-of-month-type",
+            "matched_invoice_is_credit_card": True,
+        },
+        {
+            "id": "card-by-status", "debit": Decimal("200"), "has_slip": False,
+            "matched_invoice_id": "out-of-month-status",
+            "matched_invoice_is_credit_card": True,
+        },
+        {
+            "id": "non-card", "debit": Decimal("300"), "has_slip": False,
+            "matched_invoice_id": "out-of-month-transfer",
+            "matched_invoice_is_credit_card": False,
+        },
+        {
+            "id": "no-bill", "debit": Decimal("400"), "has_slip": False,
+            "matched_invoice_id": None,
+            "matched_invoice_is_credit_card": False,
+        },
+    ]
+
+    missing = export_routes._missing_transfer_slips(statement_rows, daybook_rows)
+
+    assert [row["id"] for row in missing] == ["non-card", "no-bill"]
 
 
 def test_rollup_precedence():

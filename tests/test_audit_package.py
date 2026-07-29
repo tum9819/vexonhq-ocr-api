@@ -2,17 +2,34 @@
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import export_routes as routes  # noqa: E402
 from tax_routes import WHT_RULES  # noqa: E402
 
 
-def _row(date, amount, cat, ref, label="x", cp="y", name_th=None):
+_DEFAULT_STATEMENT_ID = object()
+
+
+def _row(
+    date,
+    amount,
+    cat,
+    ref,
+    label="x",
+    cp="y",
+    name_th=None,
+    *,
+    source="vendor_purchase",
+    statement_id=_DEFAULT_STATEMENT_ID,
+):
     return {
         "entry_date": date, "amount": amount, "category_code": cat,
         "category_name_th": name_th or (cat or "ไม่ระบุ"),
-        "counterparty": cp, "label": label, "ref_id": ref,
+        "counterparty": cp, "label": label, "ref_id": ref, "source": source,
+        "statement_id": ref if statement_id is _DEFAULT_STATEMENT_ID else statement_id,
     }
 
 
@@ -64,11 +81,109 @@ def test_evidence_linked_by_ref_id_and_missing_is_none():
 
 
 def test_null_ref_id_never_matches_evidence():
-    rows = [_row("2026-06-01", 100, None, None)]
+    rows = [_row("2026-06-01", 100, None, None, statement_id=None)]
     v = _assemble(rows, slips={"None": {"image_url": "boom"}})
     assert v[0]["slip"] is None
     assert v[0]["category_name_th"] == "ไม่ระบุ"
     assert v[0]["wht"] is None
+
+
+@pytest.mark.parametrize("source", ["manual", "ap_payment"])
+def test_non_statement_cash_basis_rows_keep_truthful_other_evidence(source):
+    voucher = _assemble([
+        _row(
+            "2026-07-10",
+            500,
+            "other_expense",
+            f"{source}-id",
+            source=source,
+            statement_id=None,
+        )
+    ])[0]
+
+    assert voucher["source_id"] == f"{source}-id"
+    assert voucher["statement_id"] is None
+    assert voucher["payment_method"] == "Other"
+    assert voucher["requires_slip"] is False
+    assert voucher["slip"] is None
+    assert voucher["invoice"] is None
+    assert routes._expenses_without_required_slip("2026-07", [voucher]) == []
+
+
+def test_real_statement_cash_basis_row_preserves_transfer_evidence():
+    voucher = _assemble(
+        [
+            _row(
+                "2026-07-10",
+                500,
+                "food_raw",
+                "statement-id",
+                source="vendor_purchase",
+                statement_id="statement-id",
+            )
+        ],
+        slips={"statement-id": {"image_url": "signed-slip"}},
+        invoices={"statement-id": {
+            "invoice_id": "invoice-id",
+            "payment_type": "transfer",
+            "pages": [{"page_no": 1, "image_url": "signed-invoice"}],
+        }},
+    )[0]
+
+    assert voucher["source_id"] == "statement-id"
+    assert voucher["statement_id"] == "statement-id"
+    assert voucher["payment_method"] == "Bank Transfer"
+    assert voucher["requires_slip"] is True
+    assert voucher["slip"]["image_url"] == "signed-slip"
+    assert voucher["invoice"]["invoice_id"] == "invoice-id"
+
+
+def test_audit_cash_basis_query_identifies_only_real_statement_ids():
+    class FakeCursor:
+        description = None
+
+        def execute(self, sql, params):
+            self.sql = sql
+            self.params = params
+            self.description = [
+                (name,)
+                for name in (
+                    "entry_date", "amount", "category_code", "category_name_th",
+                    "counterparty", "label", "source", "ref_id", "statement_id",
+                )
+            ]
+
+        def fetchall(self):
+            return [
+                (
+                    "2026-07-01", 100, "food_raw", "วัตถุดิบ", None,
+                    "statement", "vendor_purchase", "statement-id", "statement-id",
+                ),
+                (
+                    "2026-07-02", 200, "other_expense", "อื่นๆ", None,
+                    "manual", "manual", "manual-id", None,
+                ),
+                (
+                    "2026-07-03", 300, None, "ไม่ระบุ", "Supplier",
+                    "ap", "ap_payment", "ap-id", None,
+                ),
+            ]
+
+    cur = FakeCursor()
+    rows, statement_ids = routes._query_audit_cash_basis_rows(
+        cur, "2026-07-01", "2026-07-31"
+    )
+
+    assert [row["source"] for row in rows] == [
+        "vendor_purchase", "manual", "ap_payment",
+    ]
+    assert [row["statement_id"] for row in rows] == [
+        "statement-id", None, None,
+    ]
+    assert statement_ids == ["statement-id"]
+    assert "LEFT JOIN public.bank_statement_entries" in cur.sql
+    assert "b.id::text AS statement_id" in cur.sql
+    assert cur.params == ("2026-07-01", "2026-07-31")
 
 
 def test_counterparty_falls_back_to_label_when_null():

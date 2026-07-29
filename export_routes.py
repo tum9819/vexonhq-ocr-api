@@ -922,6 +922,27 @@ def export_summary(month: str = Query(..., description="YYYY-MM")):
     }
 
 
+def _missing_transfer_slips(
+    statement_rows: list[dict],
+    daybook_rows: list[dict],
+) -> list[dict]:
+    daybook_expense_statement_ids = {
+        str(row["ref_id"])
+        for row in daybook_rows
+        if row["direction"] == "expense"
+        and row["source"] != "pos_cashflow"
+        and row["ref_id"] is not None
+    }
+    return [
+        row
+        for row in statement_rows
+        if row["id"] in daybook_expense_statement_ids
+        and (row["debit"] or 0) > 0
+        and not row.get("matched_invoice_is_credit_card", False)
+        and not row["has_slip"]
+    ]
+
+
 def _query_readiness_facts(
     first: date,
     last: date,
@@ -997,12 +1018,19 @@ def _query_readiness_facts(
                     b.description, b.debit, b.credit, b.amount,
                     b.category_code, b.source_type, b.match_status,
                     b.matched_invoice_id::text,
+                    COALESCE(
+                        matched_vb.payment_type = 'credit_card'
+                        OR matched_vb.payment_status = 'credit_card',
+                        FALSE
+                    ) AS matched_invoice_is_credit_card,
                     EXISTS (
                       SELECT 1
                       FROM public.slips s
                       WHERE s.matched_statement_id = b.id
                     ) AS has_slip
                 FROM public.bank_statement_entries b
+                LEFT JOIN public.vendor_bills matched_vb
+                  ON matched_vb.id = b.matched_invoice_id
                 WHERE b.txn_date BETWEEN %s AND %s
                   AND b.branch_code = %s
                 ORDER BY b.txn_date, b.id
@@ -1142,28 +1170,7 @@ def _query_readiness_facts(
     missing_confirmed_cards = [
         group for group in confirmed_cards if not has_invoice_page(group)
     ]
-    card_bill_ids = {
-        bill_id
-        for bill_id, group in bill_groups.items()
-        if group["payment_type"] == "credit_card"
-        or group["payment_status"] == "credit_card"
-    }
-
-    daybook_expense_statement_ids = {
-        str(row["ref_id"])
-        for row in daybook_rows
-        if row["direction"] == "expense"
-        and row["source"] != "pos_cashflow"
-        and row["ref_id"] is not None
-    }
-    missing_transfer_slips = [
-        row
-        for row in statement_rows
-        if row["id"] in daybook_expense_statement_ids
-        and (row["debit"] or 0) > 0
-        and row["matched_invoice_id"] not in card_bill_ids
-        and not row["has_slip"]
-    ]
+    missing_transfer_slips = _missing_transfer_slips(statement_rows, daybook_rows)
     branch_linked_slip_rows = [
         row for row in slip_rows if row["is_branch_linked"]
     ]
@@ -1285,6 +1292,33 @@ def export_readiness(
 
 
 _AUDIT_BRANCH_CODE = "thawi_watthana"
+
+
+def _query_audit_cash_basis_rows(cur, first: date, last: date) -> tuple[list[dict], list[str]]:
+    """Return all non-petty cash-basis expenses and only their real Statement IDs."""
+    cur.execute(
+        """SELECT d.entry_date, d.amount, d.category_code,
+                  COALESCE(ec.name_th, d.category_code, 'ไม่ระบุ') AS category_name_th,
+                  d.counterparty, d.label, d.source,
+                  d.ref_id::text AS ref_id,
+                  b.id::text AS statement_id
+           FROM public.v_daybook_pnl d
+           LEFT JOIN public.expense_categories ec ON ec.code = d.category_code
+           LEFT JOIN public.bank_statement_entries b
+             ON b.id::text = d.ref_id::text
+           WHERE d.direction = 'expense'
+             AND d.source <> 'pos_cashflow'
+             AND d.entry_date BETWEEN %s AND %s
+           ORDER BY d.entry_date, d.source, d.ref_id""",
+        (first, last),
+    )
+    rows = _rows_to_dicts(cur)
+    statement_ids = list(dict.fromkeys(
+        str(row["statement_id"])
+        for row in rows
+        if row.get("statement_id") is not None
+    ))
+    return rows, statement_ids
 
 
 def _group_invoice_evidence(rows: list[dict], signer) -> dict[str, dict]:
@@ -1433,8 +1467,19 @@ def _assemble_audit_vouchers(
                 "rate": rule["wht_pct"],
                 "amount": round(amount * rule["wht_pct"] / 100.0, 2),
             }
+        raw_source_id = row.get("ref_id")
+        source_id = (
+            str(raw_source_id)
+            if raw_source_id is not None
+            else (
+                f"{row.get('source') or 'unknown'}:"
+                f"{row.get('entry_date')}:{row.get('amount') or 0}"
+            )
+        )
         statement_id = (
-            str(row["ref_id"]) if row.get("ref_id") is not None else None
+            str(row["statement_id"])
+            if row.get("statement_id") is not None
+            else None
         )
         invoice_source = inv_by_stmt.get(statement_id)
         payment_method = _payment_method(invoice_source, statement_id)
@@ -1442,10 +1487,10 @@ def _assemble_audit_vouchers(
         vouchers.append({
             "seq": len(vouchers) + 1,
             "source_type": "cash_basis_expense",
-            "source_id": statement_id,
+            "source_id": source_id,
             "statement_id": statement_id,
             "payment_method": payment_method,
-            "requires_slip": payment_method != "Credit Card",
+            "requires_slip": payment_method == "Bank Transfer",
             "cash_basis_included": True,
             # Schema-v1 compatibility fields consumed by the deployed frontend.
             "date": str(row["entry_date"]),
@@ -1635,31 +1680,18 @@ def export_audit_package(month: str = Query(..., description="YYYY-MM")):
             income_pnl, expense_pnl = float(_s[0] or 0), float(_s[1] or 0)
 
             # ── Voucher rows: bank-side expenses (petty cash goes to its own book) ──
-            cur.execute(
-                """SELECT d.entry_date, d.amount, d.category_code,
-                          COALESCE(ec.name_th, d.category_code, 'ไม่ระบุ') AS category_name_th,
-                          d.counterparty, d.label, d.ref_id::text AS ref_id
-                   FROM public.v_daybook_pnl d
-                   LEFT JOIN public.expense_categories ec ON ec.code = d.category_code
-                   WHERE d.direction = 'expense'
-                     AND d.source <> 'pos_cashflow'
-                     AND d.entry_date BETWEEN %s AND %s
-                   ORDER BY d.entry_date, d.ref_id""",
-                (first, last),
-            )
-            vrows = _rows_to_dicts(cur)
-            ref_ids = [r["ref_id"] for r in vrows if r["ref_id"]]
+            vrows, statement_ids = _query_audit_cash_basis_rows(cur, first, last)
 
             # ── Evidence: slips matched to those statement rows ──
             slips_by_stmt: dict = {}
-            if ref_ids:
+            if statement_ids:
                 cur.execute(
                     """SELECT matched_statement_id::text AS stmt_id, raw_image_url, ref_no,
                               transfer_date, transfer_time
                        FROM public.slips
                        WHERE matched_statement_id::text = ANY(%s)
                        ORDER BY matched_statement_id, transfer_date, id""",
-                    (ref_ids,),
+                    (statement_ids,),
                 )
                 for s in _rows_to_dicts(cur):
                     slips_by_stmt[s["stmt_id"]] = {
@@ -1671,7 +1703,7 @@ def export_audit_package(month: str = Query(..., description="YYYY-MM")):
 
             # ── Evidence: every invoice page linked to those statement rows ──
             linked_invoice_rows: list[dict] = []
-            if ref_ids:
+            if statement_ids:
                 cur.execute(
                     """SELECT
                            b.id::text AS stmt_id, vb.id::text AS invoice_id,
@@ -1684,7 +1716,7 @@ def export_audit_package(month: str = Query(..., description="YYYY-MM")):
                          ON a.parent_type = 'vendor_bill' AND a.parent_id = vb.id
                        WHERE b.id::text = ANY(%s)
                        ORDER BY b.id, a.page_no, a.id""",
-                    (ref_ids,),
+                    (statement_ids,),
                 )
                 linked_invoice_rows = _rows_to_dicts(cur)
             inv_by_stmt = _group_invoice_evidence(
