@@ -1381,6 +1381,37 @@ def _payment_method(invoice: dict | None, statement_id: str | None) -> str:
     return "Other"
 
 
+def _public_invoice_evidence(
+    invoice: dict | None,
+    *,
+    invoice_id: str | None = None,
+    invoice_no=None,
+    vendor_name=None,
+) -> dict | None:
+    """Return only fields in the public schema-v2 invoice evidence contract."""
+    if invoice is None and invoice_id is None:
+        return None
+    source = invoice or {}
+    pages = [
+        {
+            "page_no": page.get("page_no"),
+            "image_url": page.get("image_url"),
+        }
+        for page in (source.get("pages") or [])
+    ]
+    image_url = source.get("image_url")
+    if image_url is None and pages:
+        image_url = pages[0]["image_url"]
+    return {
+        "invoice_id": source.get("invoice_id") or invoice_id,
+        "invoice_no": source.get("invoice_no") or invoice_no,
+        "vendor_name": source.get("vendor_name") or vendor_name,
+        "pages": pages,
+        # Deployed schema-v1 frontend reads this primary-image alias.
+        "image_url": image_url,
+    }
+
+
 def _assemble_audit_vouchers(
     *,
     transfer_rows: list[dict],
@@ -1405,8 +1436,8 @@ def _assemble_audit_vouchers(
         statement_id = (
             str(row["ref_id"]) if row.get("ref_id") is not None else None
         )
-        invoice = inv_by_stmt.get(statement_id)
-        payment_method = _payment_method(invoice, statement_id)
+        invoice_source = inv_by_stmt.get(statement_id)
+        payment_method = _payment_method(invoice_source, statement_id)
         label = row.get("label") or ""
         vouchers.append({
             "seq": len(vouchers) + 1,
@@ -1429,24 +1460,21 @@ def _assemble_audit_vouchers(
                 if payment_method == "Credit Card"
                 else slips_by_stmt.get(statement_id)
             ),
-            "invoice": invoice,
+            "invoice": _public_invoice_evidence(invoice_source),
         })
 
     for row in card_rows:
         source_id = str(row["source_id"])
-        invoice = dict(card_invoices.get(source_id) or {})
-        invoice.setdefault("invoice_id", source_id)
-        invoice.setdefault("invoice_no", row.get("invoice_no"))
-        invoice.setdefault("vendor_name", row.get("vendor_name"))
-        invoice.setdefault("pages", [])
-        invoice.setdefault(
-            "image_url",
-            invoice["pages"][0]["image_url"] if invoice["pages"] else None,
+        invoice = _public_invoice_evidence(
+            card_invoices.get(source_id),
+            invoice_id=source_id,
+            invoice_no=row.get("invoice_no"),
+            vendor_name=row.get("vendor_name"),
         )
         amount = float(row.get("amount") or 0)
         vouchers.append({
             "seq": len(vouchers) + 1,
-            "source_type": "supplementary_credit_card",
+            "source_type": "credit_card_invoice",
             "source_id": source_id,
             "statement_id": None,
             "payment_method": "Credit Card",
@@ -1504,7 +1532,9 @@ def _audit_summary(
     expense_pnl = round(float(cash_basis_expense), 2)
     return {
         "expense_pnl": expense_pnl,
-        "voucher_count": len(vouchers),
+        # Deployed schema-v1 frontend treats vouchers as cash-basis bank payments.
+        "voucher_count": len(cash_basis_vouchers),
+        "evidence_voucher_count": len(vouchers),
         "cash_basis_voucher_count": len(cash_basis_vouchers),
         "cash_basis_voucher_total": cash_basis_total,
         "supplementary_credit_card_count": len(supplementary_cards),
@@ -1531,7 +1561,12 @@ def _build_audit_package_payload(
     petty_total = round(
         sum(float(row["amount"]) for row in petty_cash), 2
     )
-    expenses_without_slip = _expenses_without_required_slip(month, vouchers)
+    cash_basis_vouchers = [
+        voucher for voucher in vouchers if voucher["cash_basis_included"]
+    ]
+    expenses_without_slip = _expenses_without_required_slip(
+        month, cash_basis_vouchers
+    )
     summary = _audit_summary(
         cash_basis_expense=expense_pnl,
         petty_total=petty_total,
@@ -1553,7 +1588,9 @@ def _build_audit_package_payload(
         "month_label_th": _month_label_th(month),
         "generated_at": generated_at,
         "summary": summary,
-        "vouchers": vouchers,
+        # Backend-first compatibility: legacy collection stays cash-basis-only.
+        "vouchers": cash_basis_vouchers,
+        "evidence_vouchers": vouchers,
         "petty_cash": petty_cash,
         "missing": {
             "expenses_without_slip": expenses_without_slip,

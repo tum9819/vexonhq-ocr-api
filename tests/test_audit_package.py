@@ -209,6 +209,45 @@ def test_card_identity_fields_are_not_exposed():
     assert "1111" not in repr(voucher)
 
 
+def test_nested_invoice_evidence_is_limited_to_public_contract_fields():
+    voucher = _assemble(
+        [],
+        card_rows=[{
+            "source_id": "i1", "entry_date": "2026-07-10", "amount": 500,
+            "vendor_name": "Makro", "invoice_no": "M-1",
+            "category_code": "food_raw", "category_name_th": "วัตถุดิบ",
+        }],
+        card_invoices={"i1": {
+            "invoice_id": "i1", "invoice_no": "M-1", "vendor_name": "Makro",
+            "pages": [{"page_no": 1, "image_url": "p1"}], "image_url": "p1",
+            "issuer": "Never expose", "account": "Never expose",
+            "card_number": "4111111111111111", "last4": "1111",
+        }},
+    )[0]
+    assert set(voucher["invoice"]) == {
+        "invoice_id", "invoice_no", "vendor_name", "pages", "image_url",
+    }
+    assert "1111" not in repr(voucher["invoice"])
+
+
+def test_every_v2_evidence_source_type_uses_the_two_value_contract():
+    vouchers = _assemble(
+        [_row("2026-07-09", 800, "food_raw", "s1")],
+        card_rows=[{
+            "source_id": "i1", "entry_date": "2026-07-10", "amount": 500,
+            "vendor_name": "Makro", "invoice_no": "M-1",
+            "category_code": "food_raw", "category_name_th": "วัตถุดิบ",
+        }],
+        card_invoices={"i1": {"invoice_id": "i1", "pages": []}},
+    )
+    assert [voucher["source_type"] for voucher in vouchers] == [
+        "cash_basis_expense", "credit_card_invoice",
+    ]
+    assert {voucher["source_type"] for voucher in vouchers} <= {
+        "cash_basis_expense", "credit_card_invoice",
+    }
+
+
 def test_missing_slip_excludes_credit_card():
     vouchers = [
         {
@@ -252,19 +291,30 @@ def test_summary_returns_factual_cash_basis_drift_without_altering_expense():
 
 
 def test_schema_v2_payload_keeps_current_frontend_compatibility_fields():
-    vouchers = [{
-        "seq": 1, "date": "2026-07-10", "counterparty": "Makro",
-        "description": "วัตถุดิบ", "category_code": "food_raw",
-        "category_name_th": "วัตถุดิบ", "amount": 500, "wht": None,
-        "slip": None,
-        "invoice": {
-            "invoice_id": "i1", "invoice_no": "M-1", "vendor_name": "Makro",
-            "image_url": "p1", "pages": [{"page_no": 1, "image_url": "p1"}],
+    vouchers = [
+        {
+            "seq": 1, "date": "2026-07-09", "counterparty": "Supplier",
+            "description": "วัตถุดิบ", "category_code": "food_raw",
+            "category_name_th": "วัตถุดิบ", "amount": 800, "wht": None,
+            "slip": {"image_url": "s1"}, "invoice": None,
+            "source_type": "cash_basis_expense", "source_id": "s1",
+            "statement_id": "s1", "payment_method": "Bank Transfer",
+            "requires_slip": True, "cash_basis_included": True,
         },
-        "source_type": "supplementary_credit_card", "source_id": "i1",
-        "statement_id": None, "payment_method": "Credit Card",
-        "requires_slip": False, "cash_basis_included": False,
-    }]
+        {
+            "seq": 2, "date": "2026-07-10", "counterparty": "Makro",
+            "description": "วัตถุดิบ", "category_code": "food_raw",
+            "category_name_th": "วัตถุดิบ", "amount": 500, "wht": None,
+            "slip": None,
+            "invoice": {
+                "invoice_id": "i1", "invoice_no": "M-1", "vendor_name": "Makro",
+                "image_url": "p1", "pages": [{"page_no": 1, "image_url": "p1"}],
+            },
+            "source_type": "credit_card_invoice", "source_id": "i1",
+            "statement_id": None, "payment_method": "Credit Card",
+            "requires_slip": False, "cash_basis_included": False,
+        },
+    ]
     payload = routes._build_audit_package_payload(
         month="2026-07",
         generated_at="2026-07-31T12:00:00+07:00",
@@ -278,15 +328,22 @@ def test_schema_v2_payload_keeps_current_frontend_compatibility_fields():
     assert payload["schema_version"] == 2
     assert {
         "month", "month_label_th", "generated_at", "summary", "vouchers",
-        "petty_cash", "missing",
+        "evidence_vouchers", "petty_cash", "missing",
     } <= payload.keys()
     assert {
         "income_pnl", "expense_pnl", "voucher_count", "voucher_total",
         "petty_count", "petty_total", "missing_counts",
     } <= payload["summary"].keys()
+    assert len(payload["vouchers"]) == 1
+    assert payload["vouchers"][0]["source_type"] == "cash_basis_expense"
+    assert payload["summary"]["voucher_count"] == 1
+    assert payload["summary"]["voucher_total"] == 800
+    assert len(payload["evidence_vouchers"]) == 2
+    assert payload["summary"]["evidence_voucher_count"] == 2
+    assert payload["evidence_vouchers"][1]["source_type"] == "credit_card_invoice"
     assert {"date", "counterparty", "description", "category_code",
-            "category_name_th", "amount", "wht", "slip", "invoice"} <= vouchers[0].keys()
-    assert {"image_url", "invoice_no", "vendor_name"} <= vouchers[0]["invoice"].keys()
+            "category_name_th", "amount", "wht", "slip", "invoice"} <= payload["evidence_vouchers"][1].keys()
+    assert {"image_url", "invoice_no", "vendor_name"} <= payload["evidence_vouchers"][1]["invoice"].keys()
     assert {
         "expenses_without_slip", "bills_without_attachment", "unmatched_slips",
     } <= payload["missing"].keys()
