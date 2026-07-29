@@ -1019,8 +1019,11 @@ def _query_readiness_facts(
                     b.category_code, b.source_type, b.match_status,
                     b.matched_invoice_id::text,
                     COALESCE(
-                        matched_vb.payment_type = 'credit_card'
-                        OR matched_vb.payment_status = 'credit_card',
+                        matched_vb.review_status = 'confirmed'
+                        AND (
+                            matched_vb.payment_type = 'credit_card'
+                            OR matched_vb.payment_status = 'credit_card'
+                        ),
                         FALSE
                     ) AS matched_invoice_is_credit_card,
                     EXISTS (

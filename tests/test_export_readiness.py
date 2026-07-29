@@ -335,8 +335,12 @@ def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monke
     assert "b.import_batch_id::text" in statement_sql
     assert "b.amount" in statement_sql
     assert "LEFT JOIN public.vendor_bills matched_vb" in statement_sql
-    assert "matched_vb.payment_type = 'credit_card'" in statement_sql
-    assert "matched_vb.payment_status = 'credit_card'" in statement_sql
+    normalized_statement_sql = " ".join(statement_sql.split())
+    assert (
+        "matched_vb.review_status = 'confirmed' AND ( "
+        "matched_vb.payment_type = 'credit_card' OR "
+        "matched_vb.payment_status = 'credit_card' )"
+    ) in normalized_statement_sql
     assert "matched_vb.bill_date" not in statement_sql
     assert "matched_invoice_is_credit_card" in statement_sql
     slip_sql = conn.cur.executions[3][0]
@@ -521,7 +525,7 @@ def test_credit_card_missing_invoice_does_not_create_missing_transfer_slip():
     assert rule["count"] == 0
 
 
-def test_missing_transfer_uses_linked_bill_card_fact_independent_of_bill_month():
+def test_missing_transfer_waives_only_confirmed_linked_card_evidence():
     daybook_rows = [
         {
             "direction": "expense",
@@ -529,27 +533,57 @@ def test_missing_transfer_uses_linked_bill_card_fact_independent_of_bill_month()
             "ref_id": statement_id,
         }
         for statement_id in (
-            "card-by-type", "card-by-status", "non-card", "no-bill",
+            "confirmed-cross-month-type",
+            "confirmed-cross-month-status",
+            "rejected-type",
+            "rejected-status",
+            "pending-type",
+            "null-review-status",
+            "non-card",
+            "no-bill",
         )
     ]
     statement_rows = [
         {
-            "id": "card-by-type", "debit": Decimal("100"), "has_slip": False,
+            "id": "confirmed-cross-month-type",
+            "debit": Decimal("100"), "has_slip": False,
             "matched_invoice_id": "out-of-month-type",
             "matched_invoice_is_credit_card": True,
         },
         {
-            "id": "card-by-status", "debit": Decimal("200"), "has_slip": False,
+            "id": "confirmed-cross-month-status",
+            "debit": Decimal("200"), "has_slip": False,
             "matched_invoice_id": "out-of-month-status",
             "matched_invoice_is_credit_card": True,
         },
         {
-            "id": "non-card", "debit": Decimal("300"), "has_slip": False,
+            "id": "rejected-type", "debit": Decimal("300"), "has_slip": False,
+            "matched_invoice_id": "rejected-type-bill",
+            "matched_invoice_is_credit_card": False,
+        },
+        {
+            "id": "rejected-status", "debit": Decimal("400"), "has_slip": False,
+            "matched_invoice_id": "rejected-status-bill",
+            "matched_invoice_is_credit_card": False,
+        },
+        {
+            "id": "pending-type", "debit": Decimal("500"), "has_slip": False,
+            "matched_invoice_id": "pending-bill",
+            "matched_invoice_is_credit_card": False,
+        },
+        {
+            "id": "null-review-status",
+            "debit": Decimal("600"), "has_slip": False,
+            "matched_invoice_id": "null-review-bill",
+            "matched_invoice_is_credit_card": False,
+        },
+        {
+            "id": "non-card", "debit": Decimal("700"), "has_slip": False,
             "matched_invoice_id": "out-of-month-transfer",
             "matched_invoice_is_credit_card": False,
         },
         {
-            "id": "no-bill", "debit": Decimal("400"), "has_slip": False,
+            "id": "no-bill", "debit": Decimal("800"), "has_slip": False,
             "matched_invoice_id": None,
             "matched_invoice_is_credit_card": False,
         },
@@ -557,7 +591,14 @@ def test_missing_transfer_uses_linked_bill_card_fact_independent_of_bill_month()
 
     missing = export_routes._missing_transfer_slips(statement_rows, daybook_rows)
 
-    assert [row["id"] for row in missing] == ["non-card", "no-bill"]
+    assert [row["id"] for row in missing] == [
+        "rejected-type",
+        "rejected-status",
+        "pending-type",
+        "null-review-status",
+        "non-card",
+        "no-bill",
+    ]
 
 
 def test_rollup_precedence():
