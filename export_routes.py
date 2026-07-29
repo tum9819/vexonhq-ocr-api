@@ -14,9 +14,10 @@ import calendar
 import io
 import logging
 import os
+import re
 import zipfile
 from datetime import date, datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
@@ -88,6 +89,18 @@ def _month_range(month: str) -> tuple[date, date]:
         raise HTTPException(400, f"month must be YYYY-MM, got: {month!r}")
     last = calendar.monthrange(y, m)[1]
     return date(y, m, 1), date(y, m, last)
+
+
+def _readiness_month_range(month: str) -> tuple[date, date]:
+    """Strict YYYY-MM parser for the readiness contract only."""
+    if re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", month) is None:
+        raise HTTPException(400, f"month must be YYYY-MM, got: {month!r}")
+    y, m = int(month[:4]), int(month[5:7])
+    try:
+        first = date(y, m, 1)
+    except ValueError:
+        raise HTTPException(400, f"month must be YYYY-MM, got: {month!r}")
+    return first, date(y, m, calendar.monthrange(y, m)[1])
 
 
 def _month_label_th(month: str) -> str:
@@ -917,6 +930,7 @@ def _query_readiness_facts(
     """Acquire Phase A readiness facts with six batched SELECTs plus close checks."""
     conn = get_db_conn()
     try:
+        conn.set_session(readonly=True, isolation_level="REPEATABLE READ")
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -979,7 +993,8 @@ def _query_readiness_facts(
             cur.execute(
                 """
                 SELECT
-                    b.id::text, b.txn_date, b.description, b.debit, b.credit,
+                    b.id::text, b.import_batch_id::text, b.txn_date,
+                    b.description, b.debit, b.credit, b.amount,
                     b.category_code, b.source_type, b.match_status,
                     b.matched_invoice_id::text,
                     EXISTS (
@@ -999,14 +1014,48 @@ def _query_readiness_facts(
             cur.execute(
                 """
                 SELECT
-                    s.id::text, s.transfer_date, s.amount, s.raw_image_url,
-                    s.matched_statement_id::text, s.matched_invoice_id::text,
-                    s.match_status
-                FROM public.slips s
-                WHERE s.transfer_date BETWEEN %s AND %s
-                ORDER BY s.transfer_date, s.id
+                    scoped.id, scoped.transfer_date, scoped.amount,
+                    scoped.raw_image_url, scoped.matched_statement_id,
+                    scoped.matched_invoice_id, scoped.match_status,
+                    scoped.is_branch_linked, scoped.is_month_unattributed
+                FROM (
+                    SELECT
+                        s.id::text, s.transfer_date, s.amount, s.raw_image_url,
+                        s.matched_statement_id::text,
+                        s.matched_invoice_id::text,
+                        s.match_status,
+                        (
+                            EXISTS (
+                                SELECT 1
+                                FROM public.bank_statement_entries b
+                                WHERE b.id = s.matched_statement_id
+                                  AND b.txn_date BETWEEN %s AND %s
+                                  AND b.branch_code = %s
+                            )
+                            OR EXISTS (
+                                SELECT 1
+                                FROM public.vendor_bills vb
+                                WHERE vb.id = s.matched_invoice_id
+                                  AND vb.bill_date BETWEEN %s AND %s
+                                  AND COALESCE(vb.branch_code, %s) = %s
+                                  AND COALESCE(vb.review_status, '') <> 'rejected'
+                            )
+                        ) AS is_branch_linked,
+                        (
+                            s.matched_statement_id IS NULL
+                            AND s.matched_invoice_id IS NULL
+                            AND s.transfer_date BETWEEN %s AND %s
+                        ) AS is_month_unattributed
+                    FROM public.slips s
+                ) AS scoped
+                WHERE scoped.is_branch_linked OR scoped.is_month_unattributed
+                ORDER BY scoped.transfer_date, scoped.id
                 """,
-                (first, last),
+                (
+                    first, last, branch_code,
+                    first, last, "thawi_watthana", branch_code,
+                    first, last,
+                ),
             )
             slip_rows = _rows_to_dicts(cur)
 
@@ -1025,7 +1074,7 @@ def _query_readiness_facts(
                   AND COALESCE(vb.review_status, '') <> 'rejected'
                 ORDER BY vb.id, a.page_no, a.id
                 """,
-                (first, last, branch_code, branch_code),
+                (first, last, "thawi_watthana", branch_code),
             )
             bill_rows = _rows_to_dicts(cur)
 
@@ -1115,6 +1164,12 @@ def _query_readiness_facts(
         and row["matched_invoice_id"] not in card_bill_ids
         and not row["has_slip"]
     ]
+    branch_linked_slip_rows = [
+        row for row in slip_rows if row["is_branch_linked"]
+    ]
+    month_unattributed_slip_rows = [
+        row for row in slip_rows if row["is_month_unattributed"]
+    ]
 
     drift = (
         (pnl_stats["expense_total"] or 0)
@@ -1135,7 +1190,7 @@ def _query_readiness_facts(
         if not group["has_attachment_row"] and not group["attachment_url"]
     )
     image_url_failure_count = (
-        sum(1 for row in slip_rows if not row["raw_image_url"])
+        sum(1 for row in branch_linked_slip_rows if not row["raw_image_url"])
         + attachment_url_failures
         + missing_bill_without_attachment_row
     )
@@ -1157,8 +1212,12 @@ def _query_readiness_facts(
             "amount": pnl_stats["uncategorized_amount"] or 0,
         },
         "reconciliation": {
-            "ok": abs(float(drift)) <= 0.01,
-            "drift": drift,
+            "verified": False,
+            "basis": "no_independent_comparator",
+            "internal_partition": {
+                "ok": abs(float(drift)) <= 0.01,
+                "drift": drift,
+            },
         },
         "monthly_close_dangers": {
             "count": len(danger_risks),
@@ -1184,7 +1243,8 @@ def _query_readiness_facts(
         "branch_code": branch_code,
         "daybook_rows": daybook_rows,
         "statement_rows": statement_rows,
-        "slip_rows": slip_rows,
+        "branch_linked_slip_rows": branch_linked_slip_rows,
+        "month_unattributed_slip_rows": month_unattributed_slip_rows,
         "bills_and_pages": bill_rows,
         "monthly_close": [
             {
@@ -1201,10 +1261,10 @@ def _query_readiness_facts(
 @router.get("/readiness")
 def export_readiness(
     month: str = Query(..., description="YYYY-MM"),
-    branch_code: str = Query("thawi_watthana"),
+    branch_code: Literal["thawi_watthana"] = Query("thawi_watthana"),
     _admin: dict = Depends(_require_admin_role),
 ):
-    first, last = _month_range(month)
+    first, last = _readiness_month_range(month)
     facts, fingerprint_inputs = _query_readiness_facts(first, last, branch_code)
     payload = build_readiness(
         month,

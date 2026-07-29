@@ -116,6 +116,40 @@ def build_readiness(month: str, branch_code: str, facts: dict[str, Any]) -> dict
     image_url_failures = facts["image_url_failures"]
     wht_candidates = facts.get("wht_candidates", {"count": 0, "amount": 0})
 
+    reconciliation_verified = reconciliation["verified"] is True
+    if reconciliation_verified:
+        reconciliation_drift = abs(reconciliation["drift"])
+        reconciliation_ok = reconciliation["ok"] and reconciliation_drift <= 0.01
+        reconciliation_rule = _rule(
+            "DAYBOOK_RECONCILES",
+            _rule_outcome(reconciliation_ok, "action_required"),
+            "Daybook กระทบยอดแล้ว"
+            if reconciliation_ok
+            else "Daybook ยังไม่กระทบยอด",
+            0 if reconciliation_ok else 1,
+            reconciliation_drift,
+            {
+                "verified": True,
+                "basis": reconciliation["basis"],
+                "ok": reconciliation["ok"],
+                "drift": reconciliation["drift"],
+                "internal_partition": reconciliation["internal_partition"],
+            },
+        )
+    else:
+        reconciliation_rule = _rule(
+            "DAYBOOK_RECONCILES",
+            "preview_only",
+            "ยังไม่มีแหล่งเทียบอิสระสำหรับยืนยันการกระทบยอด",
+            0,
+            None,
+            {
+                "verified": False,
+                "basis": reconciliation["basis"],
+                "internal_partition": reconciliation["internal_partition"],
+            },
+        )
+
     rules: dict[str, dict[str, Any]] = {
         "MONTH_ENDED": _rule(
             "MONTH_ENDED",
@@ -157,16 +191,7 @@ def build_readiness(month: str, branch_code: str, facts: dict[str, Any]) -> dict
             uncategorized["amount"],
             {},
         ),
-        "DAYBOOK_RECONCILES": _rule(
-            "DAYBOOK_RECONCILES",
-            _rule_outcome(abs(reconciliation["drift"]) <= 0.01, "action_required"),
-            "Daybook กระทบยอดแล้ว"
-            if abs(reconciliation["drift"]) <= 0.01
-            else "Daybook ยังไม่กระทบยอด",
-            0 if abs(reconciliation["drift"]) <= 0.01 else 1,
-            abs(reconciliation["drift"]),
-            {"ok": reconciliation["ok"], "drift": reconciliation["drift"]},
-        ),
+        "DAYBOOK_RECONCILES": reconciliation_rule,
         "MONTHLY_CLOSE_DANGER_CLEAR": _rule(
             "MONTHLY_CLOSE_DANGER_CLEAR",
             _rule_outcome(monthly_close["count"] == 0, "action_required"),

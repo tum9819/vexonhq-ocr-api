@@ -1,3 +1,4 @@
+from copy import deepcopy
 from datetime import date
 from decimal import Decimal
 
@@ -5,6 +6,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import auth_routes
 import export_routes
 import monthly_close_routes
 from export_readiness import build_readiness, canonical_fingerprint, package_status
@@ -24,7 +26,11 @@ def _facts(**overrides):
         },
         "statement_needs_review": {"count": 0, "amount": 0},
         "uncategorized": {"count": 0, "amount": 0},
-        "reconciliation": {"ok": True, "drift": 0},
+        "reconciliation": {
+            "verified": False,
+            "basis": "no_independent_comparator",
+            "internal_partition": {"ok": True, "drift": 0},
+        },
         "monthly_close_dangers": {"count": 0, "amount": 0},
         "transfer_evidence": {"missing_slip_count": 0, "missing_slip_amount": 0},
         "invoice_evidence": {"missing_page_count": 0, "missing_page_amount": 0},
@@ -67,6 +73,87 @@ def test_readiness_accepts_admin_and_returns_versioned_contract(monkeypatch):
     assert len(response.json()["source_fingerprint"]["sha256"]) == 64
 
 
+def test_readiness_rejects_staff_through_real_auth_dependency(monkeypatch):
+    app = FastAPI()
+    app.include_router(export_routes.router)
+    monkeypatch.setattr(
+        auth_routes,
+        "verify_token",
+        lambda _token: {"sub": "staff-uid", "_role": "staff"},
+    )
+    response = TestClient(app, raise_server_exceptions=False).get(
+        "/export/readiness?month=2026-07",
+        headers={"Authorization": "Bearer STAFF"},
+    )
+    assert response.status_code == 403
+
+
+def test_readiness_rejects_unsupported_branch_without_querying(monkeypatch):
+    app = FastAPI()
+    app.include_router(export_routes.router)
+    app.dependency_overrides[export_routes._require_admin_role] = lambda: {
+        "sub": "admin-uid", "_role": "admin",
+    }
+    query_calls = []
+    monkeypatch.setattr(
+        export_routes,
+        "_query_readiness_facts",
+        lambda *args: query_calls.append(args) or (_facts(), {"rows": []}),
+    )
+
+    response = TestClient(app, raise_server_exceptions=False).get(
+        "/export/readiness?month=2026-07&branch_code=future_branch"
+    )
+
+    assert response.status_code == 422
+    assert query_calls == []
+
+
+@pytest.mark.parametrize(
+    "month",
+    [
+        "2026/07", "2026-7", "2026-07x", "2026-070", "2026-00", "2026-13",
+        "0000-01", "\u0662\u0660\u0662\u0666-07",
+    ],
+)
+def test_readiness_rejects_non_exact_or_invalid_month_without_querying(monkeypatch, month):
+    app = FastAPI()
+    app.include_router(export_routes.router)
+    app.dependency_overrides[export_routes._require_admin_role] = lambda: {
+        "sub": "admin-uid", "_role": "admin",
+    }
+    query_calls = []
+    monkeypatch.setattr(
+        export_routes,
+        "_query_readiness_facts",
+        lambda *args: query_calls.append(args) or (_facts(), {"rows": []}),
+    )
+
+    response = TestClient(app, raise_server_exceptions=False).get(
+        f"/export/readiness?month={month}"
+    )
+
+    assert response.status_code == 400
+    assert query_calls == []
+
+
+def test_same_view_partition_keeps_reconciliation_preview_only():
+    result = build_readiness("2026-07", "thawi_watthana", _facts())
+    rule = next(
+        rule
+        for rule in result["packages"]["common_accounting"]["rules"]
+        if rule["code"] == "DAYBOOK_RECONCILES"
+    )
+
+    assert rule["outcome"] == "preview_only"
+    assert rule["amount"] is None
+    assert rule["evidence"] == {
+        "verified": False,
+        "basis": "no_independent_comparator",
+        "internal_partition": {"ok": True, "drift": 0},
+    }
+
+
 def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monkeypatch):
     responses = [
         (
@@ -85,22 +172,25 @@ def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monke
         ),
         (
             [
-                "id", "txn_date", "description", "debit", "credit",
-                "category_code", "source_type", "match_status",
-                "matched_invoice_id", "has_slip",
+                "id", "import_batch_id", "txn_date", "description", "debit",
+                "credit", "amount", "category_code", "source_type",
+                "match_status", "matched_invoice_id", "has_slip",
             ],
             [
                 (
-                    "s1", date(2026, 7, 5), "transfer", Decimal("100.00"),
-                    Decimal("0"), "food_raw", "vendor_purchase", "manual", "b1", False,
+                    "s1", "batch-1", date(2026, 7, 5), "transfer",
+                    Decimal("100.00"), Decimal("0"), Decimal("100.00"),
+                    "food_raw", "vendor_purchase", "manual", "b1", False,
                 ),
                 (
-                    "s2", date(2026, 7, 6), "card settlement", Decimal("200.00"),
-                    Decimal("0"), "food_raw", "vendor_purchase", "manual", "b2", False,
+                    "s2", "batch-1", date(2026, 7, 6), "card settlement",
+                    Decimal("200.00"), Decimal("0"), Decimal("200.00"),
+                    "food_raw", "vendor_purchase", "manual", "b2", False,
                 ),
                 (
-                    "s3", date(2026, 7, 7), "income", Decimal("0"),
-                    Decimal("400.00"), "sales", "sales", "manual", None, False,
+                    "s3", "batch-1", date(2026, 7, 7), "income",
+                    Decimal("0"), Decimal("400.00"), Decimal("400.00"),
+                    "sales", "sales", "manual", None, False,
                 ),
             ],
         ),
@@ -108,11 +198,16 @@ def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monke
             [
                 "id", "transfer_date", "amount", "raw_image_url",
                 "matched_statement_id", "matched_invoice_id", "match_status",
+                "is_branch_linked", "is_month_unattributed",
             ],
             [
                 (
-                    "sl1", date(2026, 7, 5), Decimal("100.00"), None,
-                    None, None, "unmatched",
+                    "sl1", date(2026, 6, 30), Decimal("100.00"), None,
+                    None, "b3", "matched_full", True, False,
+                ),
+                (
+                    "sl2", date(2026, 7, 10), Decimal("55.00"), None,
+                    None, None, "unmatched", False, True,
                 ),
             ],
         ),
@@ -188,6 +283,10 @@ def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monke
         def __init__(self):
             self.cur = FakeCursor()
             self.closed = False
+            self.session_calls = []
+
+        def set_session(self, **kwargs):
+            self.session_calls.append(kwargs)
 
         def cursor(self):
             return self.cur
@@ -207,12 +306,36 @@ def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monke
     )
 
     facts, fingerprint_inputs = export_routes._query_readiness_facts(
-        date(2026, 7, 1), date(2026, 7, 31), "thawi_watthana"
+        date(2026, 7, 1), date(2026, 7, 31), "future_branch"
     )
 
     assert len(conn.cur.executions) == 6
     assert all(sql.lstrip().startswith("SELECT") for sql, _ in conn.cur.executions)
+    assert conn.session_calls == [
+        {"readonly": True, "isolation_level": "REPEATABLE READ"}
+    ]
     assert conn.closed is True
+    assert [params for _, params in conn.cur.executions] == [
+        (date(2026, 7, 1), date(2026, 7, 31), "future_branch"),
+        (date(2026, 7, 1), date(2026, 7, 31), "future_branch"),
+        (date(2026, 7, 1), date(2026, 7, 31), "future_branch"),
+        (
+            date(2026, 7, 1), date(2026, 7, 31), "future_branch",
+            date(2026, 7, 1), date(2026, 7, 31), "thawi_watthana",
+            "future_branch", date(2026, 7, 1), date(2026, 7, 31),
+        ),
+        (
+            date(2026, 7, 1), date(2026, 7, 31),
+            "thawi_watthana", "future_branch",
+        ),
+        (date(2026, 7, 1), date(2026, 7, 31), "future_branch"),
+    ]
+    statement_sql = conn.cur.executions[2][0]
+    assert "b.import_batch_id::text" in statement_sql
+    assert "b.amount" in statement_sql
+    slip_sql = conn.cur.executions[3][0]
+    assert "is_branch_linked" in slip_sql
+    assert "is_month_unattributed" in slip_sql
     assert facts["statement"] == {
         "row_count": 3,
         "batch_count": 1,
@@ -221,7 +344,11 @@ def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monke
         "declared_period_verified": False,
     }
     assert facts["statement_needs_review"] == {"count": 1, "amount": Decimal("12.00")}
-    assert facts["reconciliation"] == {"ok": True, "drift": Decimal("0.00")}
+    assert facts["reconciliation"] == {
+        "verified": False,
+        "basis": "no_independent_comparator",
+        "internal_partition": {"ok": True, "drift": Decimal("0.00")},
+    }
     assert facts["monthly_close_dangers"] == {"count": 1, "amount": Decimal("9.00")}
     assert facts["transfer_evidence"] == {
         "missing_slip_count": 1,
@@ -238,11 +365,70 @@ def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monke
     }
     assert facts["image_url_failures"] == {"count": 2}
     assert fingerprint_inputs["month"] == "2026-07"
-    assert fingerprint_inputs["branch_code"] == "thawi_watthana"
+    assert fingerprint_inputs["branch_code"] == "future_branch"
     assert len(fingerprint_inputs["daybook_rows"]) == 3
+    assert fingerprint_inputs["statement_rows"][0]["import_batch_id"] == "batch-1"
+    assert fingerprint_inputs["statement_rows"][0]["amount"] == Decimal("100.00")
+    assert [row["id"] for row in fingerprint_inputs["branch_linked_slip_rows"]] == [
+        "sl1"
+    ]
+    assert [
+        row["id"] for row in fingerprint_inputs["month_unattributed_slip_rows"]
+    ] == ["sl2"]
     assert fingerprint_inputs["monthly_close"] == [
         {"risk_key": "danger-one", "severity": "danger", "amount": Decimal("9.00")}
     ]
+
+    base_hash = canonical_fingerprint(fingerprint_inputs)
+    changed_batch = deepcopy(fingerprint_inputs)
+    changed_batch["statement_rows"][0]["import_batch_id"] = "batch-2"
+    changed_amount = deepcopy(fingerprint_inputs)
+    changed_amount["statement_rows"][0]["amount"] = Decimal("101.00")
+    assert canonical_fingerprint(changed_batch) != base_hash
+    assert canonical_fingerprint(changed_amount) != base_hash
+
+
+def test_query_readiness_facts_closes_repeatable_read_connection_after_exception(
+    monkeypatch,
+):
+    class RaisingCursor:
+        description = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, _sql, _params):
+            raise RuntimeError("database read failed")
+
+    class RaisingConnection:
+        def __init__(self):
+            self.closed = False
+            self.session_calls = []
+
+        def set_session(self, **kwargs):
+            self.session_calls.append(kwargs)
+
+        def cursor(self):
+            return RaisingCursor()
+
+        def close(self):
+            self.closed = True
+
+    conn = RaisingConnection()
+    monkeypatch.setattr(export_routes, "get_db_conn", lambda: conn)
+
+    with pytest.raises(RuntimeError, match="database read failed"):
+        export_routes._query_readiness_facts(
+            date(2026, 7, 1), date(2026, 7, 31), "thawi_watthana"
+        )
+
+    assert conn.session_calls == [
+        {"readonly": True, "isolation_level": "REPEATABLE READ"}
+    ]
+    assert conn.closed is True
 
 
 def test_observed_to_july_15_is_preview_only_not_ready():
@@ -269,7 +455,7 @@ def test_missing_statement_requires_action():
     assert result["packages"]["common_accounting"]["status"] == "action_required"
 
 
-def test_declared_period_and_all_common_rules_can_be_ready():
+def test_declared_period_still_preview_only_without_independent_reconciliation():
     facts = _facts(statement={
         "row_count": 120,
         "batch_count": 1,
@@ -277,6 +463,27 @@ def test_declared_period_and_all_common_rules_can_be_ready():
         "last_observed_date": date(2026, 7, 31),
         "declared_period_verified": True,
     })
+    result = build_readiness("2026-07", "thawi_watthana", facts)
+    assert result["packages"]["common_accounting"]["status"] == "preview_only"
+
+
+def test_independently_verified_reconciliation_can_make_common_rules_ready():
+    facts = _facts(
+        statement={
+            "row_count": 120,
+            "batch_count": 1,
+            "first_observed_date": date(2026, 7, 1),
+            "last_observed_date": date(2026, 7, 31),
+            "declared_period_verified": True,
+        },
+        reconciliation={
+            "verified": True,
+            "basis": "independent_comparator",
+            "ok": True,
+            "drift": 0,
+            "internal_partition": {"ok": True, "drift": 0},
+        },
+    )
     result = build_readiness("2026-07", "thawi_watthana", facts)
     assert result["packages"]["common_accounting"]["status"] == "ready"
 
@@ -329,7 +536,7 @@ def test_fingerprint_is_order_independent_but_value_sensitive():
         ("STATEMENT_PERIOD_UNVERIFIED", "pass", 120, None, "/bank-statement"),
         ("STATEMENT_REVIEW_CLEAR", "pass", 0, 0, "/bank-statement"),
         ("UNCATEGORIZED_CLEAR", "pass", 0, 0, "/ai-review"),
-        ("DAYBOOK_RECONCILES", "pass", 0, 0, None),
+        ("DAYBOOK_RECONCILES", "preview_only", 0, None, None),
         ("MONTHLY_CLOSE_DANGER_CLEAR", "pass", 0, 0, "/alerts"),
         ("TRANSFER_SLIP_EVIDENCE", "pass", 0, 0, "/slips"),
         ("INVOICE_ATTACHMENT_EVIDENCE", "pass", 0, 0, "/invoices"),
@@ -377,7 +584,13 @@ def test_each_stable_rule_exposes_its_pass_or_phase_blocker_details(
         ("statement period unverified", {}, "STATEMENT_PERIOD_UNVERIFIED", "preview_only", 81, None, "/bank-statement"),
         ("statement review remains", {"statement_needs_review": {"count": 3, "amount": 450}}, "STATEMENT_REVIEW_CLEAR", "action_required", 3, 450, "/bank-statement"),
         ("uncategorized expense remains", {"uncategorized": {"count": 2, "amount": 80}}, "UNCATEGORIZED_CLEAR", "action_required", 2, 80, "/ai-review"),
-        ("daybook drift exceeds tolerance", {"reconciliation": {"ok": False, "drift": -0.02}}, "DAYBOOK_RECONCILES", "action_required", 1, 0.02, None),
+        ("daybook drift exceeds tolerance", {"reconciliation": {
+            "verified": True,
+            "basis": "independent_comparator",
+            "ok": False,
+            "drift": -0.02,
+            "internal_partition": {"ok": True, "drift": 0},
+        }}, "DAYBOOK_RECONCILES", "action_required", 1, 0.02, None),
         ("monthly close danger remains", {"monthly_close_dangers": {"count": 4, "amount": 1200}}, "MONTHLY_CLOSE_DANGER_CLEAR", "action_required", 4, 1200, "/alerts"),
         ("transfer slip is missing", {"transfer_evidence": {"missing_slip_count": 5, "missing_slip_amount": 700}}, "TRANSFER_SLIP_EVIDENCE", "action_required", 5, 700, "/slips"),
         ("invoice page is missing", {"invoice_evidence": {"missing_page_count": 6, "missing_page_amount": 800}}, "INVOICE_ATTACHMENT_EVIDENCE", "action_required", 6, 800, "/invoices"),
@@ -410,13 +623,22 @@ def test_each_blocking_rule_keeps_its_action_details(
 
 
 def test_packages_keep_the_approved_ordered_rule_composition_and_statuses():
-    result = build_readiness("2026-07", "thawi_watthana", _facts(statement={
-        "row_count": 120,
-        "batch_count": 1,
-        "first_observed_date": date(2026, 7, 1),
-        "last_observed_date": date(2026, 7, 31),
-        "declared_period_verified": True,
-    }))
+    result = build_readiness("2026-07", "thawi_watthana", _facts(
+        statement={
+            "row_count": 120,
+            "batch_count": 1,
+            "first_observed_date": date(2026, 7, 1),
+            "last_observed_date": date(2026, 7, 31),
+            "declared_period_verified": True,
+        },
+        reconciliation={
+            "verified": True,
+            "basis": "independent_comparator",
+            "ok": True,
+            "drift": 0,
+            "internal_partition": {"ok": True, "drift": 0},
+        },
+    ))
 
     assert [rule["code"] for rule in result["packages"]["common_accounting"]["rules"]] == [
         "MONTH_ENDED", "STATEMENT_MISSING", "STATEMENT_PERIOD_UNVERIFIED",
