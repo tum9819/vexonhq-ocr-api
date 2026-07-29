@@ -1,11 +1,35 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-07-17 (external review approved; TUM push approval pending)
+**Last updated**: 2026-07-29 (Export Center Phase A implemented locally; not pushed)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
 
 ---
+
+## 🟡 Export Center Phase A backend — local verification complete, external audit pending
+
+- Local range: `6d983cbaf15eb962e60cfbd54dd4ee79dc0fc698...02ec412ebc919862eca630487af307563e72e61f`. Nothing in this range has been pushed or deployed.
+- Added admin-only, read-only `GET /export/readiness` for the owner-confirmed `thawi_watthana` branch. Legacy NULL bill branches use that fixed authority only. Observed Statement transaction dates do not prove the PDF-declared period, and same-view reconciliation remains Preview-only until an independent comparator is approved.
+- All readiness facts and Monthly Close checks share one read-only `REPEATABLE READ` snapshot; fact-affecting rows feed the source fingerprint. Phase A does not write transaction data, run a second matcher, or add a migration.
+- Audit schema v2 adds complete ordered `evidence_vouchers` while legacy `vouchers` and summary voucher fields remain cash-basis-only. Invoice attachments are ordered; card evidence says exactly `Credit Card`, exposes no card identity, and never requires a slip.
+- Final self-review fixes are included: only a real `bank_statement_entries` join makes a voucher a bank transfer; manual/AP/non-Statement rows remain `Other` without a slip requirement. A linked bill can waive missing-slip across bill months only when `review_status='confirmed'` and either payment type or payment status is `credit_card`. Existing same-day PV numbering order is preserved.
+- Fresh final verification: focused readiness/Audit/Monthly Close suite `117 passed` with one pre-existing Starlette/httpx warning; `verify.ps1` compileall passed and reported `590 passed, 2 skipped, 1 warning`.
+- Complete-range write/auto-match/raw-`v_daybook` scans and `git diff --check` passed. Final bounded `review.ps1` returned two Low notes: defer float-tolerance refinement until an independent comparator exists; fixed `thawi_watthana` is the approved Phase A boundary rather than a multi-branch implementation.
+- `scripts/overwrite_menu_watermarks.py` remains untouched and untracked.
+
+### Next actions
+
+1. External audit-only review of the complete backend and frontend ranges; verify every finding against code/test evidence.
+2. Wait for TUM's explicit production push approval. Do not push, tag, or deploy from this local handoff.
+3. After approval, push/deploy backend first; verify the new commit, authenticated readiness schema v1, existing summary/Audit endpoints, `/health/deep`, and settled CPU before frontend deployment.
+4. Authenticated visual/print/tab-order smoke and a real confirmed Makro/CP Axtra `Credit Card` case remain pending. No live PostgreSQL performance claim was made.
+
+### Later phases — not implemented
+
+- Phase B Statement declared-period metadata and tax identity/Format V2/PDF work.
+- Phase C shareholder package/redaction.
+- Phase D private immutable Final snapshots/history.
 
 ## 🟡 2026-07-16 backend regression fixes — externally approved, local only, do not push yet
 
