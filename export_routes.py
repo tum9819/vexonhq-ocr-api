@@ -1284,45 +1284,290 @@ def export_readiness(
     return payload
 
 
-def _assemble_audit_vouchers(vrows: list[dict], slips_by_stmt: dict, inv_by_stmt: dict,
-                             wht_rules: dict) -> list[dict]:
-    """Pure voucher assembly (no DB) so ordering/WHT/evidence-linking are unit-testable.
-    `vrows` must already be sorted (entry_date, ref_id); seq is assigned here."""
-    vouchers = []
-    for i, r in enumerate(vrows, 1):
-        cat = r.get("category_code")
-        rule = wht_rules.get(cat) if cat else None
-        amount = float(r["amount"] or 0)
+_AUDIT_BRANCH_CODE = "thawi_watthana"
+
+
+def _group_invoice_evidence(rows: list[dict], signer) -> dict[str, dict]:
+    """Group and sign invoice pages without downloading storage objects."""
+    groups: dict[str, dict] = {}
+    for row in rows:
+        group_key = row.get("stmt_id") or row.get("source_id")
+        if group_key is None:
+            continue
+        key = str(group_key)
+        group = groups.setdefault(
+            key,
+            {
+                "invoice_id": str(row.get("invoice_id") or row.get("source_id") or ""),
+                "invoice_no": row.get("invoice_no"),
+                "vendor_name": row.get("vendor_name"),
+                "payment_type": row.get("payment_type"),
+                "payment_status": row.get("payment_status"),
+                "attachment_url": row.get("attachment_url"),
+                "_has_attachment_row": False,
+                "_attachments": [],
+            },
+        )
+        for field in (
+            "invoice_id", "invoice_no", "vendor_name", "payment_type",
+            "payment_status", "attachment_url",
+        ):
+            if not group.get(field) and row.get(field):
+                group[field] = str(row[field]) if field == "invoice_id" else row[field]
+
+        has_attachment_row = (
+            row.get("attachment_id") is not None
+            or row.get("page_no") is not None
+            or row.get("file_url") is not None
+        )
+        if has_attachment_row:
+            group["_has_attachment_row"] = True
+        if row.get("file_url"):
+            group["_attachments"].append(
+                (row.get("page_no"), str(row.get("attachment_id") or ""), row["file_url"])
+            )
+
+    for group in groups.values():
+        ordered = sorted(
+            group.pop("_attachments"),
+            key=lambda item: (
+                item[0] is None,
+                int(item[0]) if item[0] is not None else 0,
+                item[1],
+            ),
+        )
+        pages = []
+        seen_urls = set()
+        next_page = max(
+            (int(page_no) for page_no, _, _ in ordered if page_no is not None),
+            default=0,
+        ) + 1
+        for page_no, _, raw_url in ordered:
+            if raw_url in seen_urls:
+                continue
+            seen_urls.add(raw_url)
+            normalized_page = int(page_no) if page_no is not None else next_page
+            if page_no is None:
+                next_page += 1
+            pages.append({"page_no": normalized_page, "image_url": signer(raw_url)})
+        if (
+            not group.pop("_has_attachment_row")
+            and group.get("attachment_url")
+            and group["attachment_url"] not in seen_urls
+        ):
+            pages.append({
+                "page_no": 1,
+                "image_url": signer(group["attachment_url"]),
+            })
+        group.pop("attachment_url", None)
+        group["pages"] = pages
+        # Deployed schema-v1 frontend reads this primary-image alias.
+        group["image_url"] = pages[0]["image_url"] if pages else None
+    return groups
+
+
+def _payment_method(invoice: dict | None, statement_id: str | None) -> str:
+    if invoice and (
+        invoice.get("payment_type") == "credit_card"
+        or invoice.get("payment_status") == "credit_card"
+    ):
+        return "Credit Card"
+    if statement_id is not None:
+        return "Bank Transfer"
+    if invoice and invoice.get("payment_type") == "transfer":
+        return "Bank Transfer"
+    if invoice and invoice.get("payment_type") == "cash":
+        return "Cash"
+    return "Other"
+
+
+def _assemble_audit_vouchers(
+    *,
+    transfer_rows: list[dict],
+    card_rows: list[dict],
+    slips_by_stmt: dict,
+    inv_by_stmt: dict,
+    card_invoices: dict,
+    wht_rules: dict,
+) -> list[dict]:
+    """Assemble cash-basis vouchers first, then supplementary card evidence."""
+    vouchers: list[dict] = []
+    for row in transfer_rows:
+        category_code = row.get("category_code")
+        rule = wht_rules.get(category_code) if category_code else None
+        amount = float(row.get("amount") or 0)
         wht = None
         if rule:
-            wht = {"rate": rule["wht_pct"], "amount": round(amount * rule["wht_pct"] / 100.0, 2)}
-        ref = str(r["ref_id"]) if r.get("ref_id") is not None else None
-        label = r.get("label") or ""
-        # v_daybook_pnl.counterparty is NULL for bank-sourced rows (payroll/rent/
-        # vendor_purchase/...) — the payee name lives inside `label` instead
-        # (e.g. "K PLUS โอนไป SCB X0060 นาย ศาตราวุธ ..."). Fall back to it so the
-        # printed voucher never shows a blank "จ่ายให้" for a real transaction.
+            wht = {
+                "rate": rule["wht_pct"],
+                "amount": round(amount * rule["wht_pct"] / 100.0, 2),
+            }
+        statement_id = (
+            str(row["ref_id"]) if row.get("ref_id") is not None else None
+        )
+        invoice = inv_by_stmt.get(statement_id)
+        payment_method = _payment_method(invoice, statement_id)
+        label = row.get("label") or ""
         vouchers.append({
-            "seq": i,
-            "date": str(r["entry_date"]),
-            "counterparty": r.get("counterparty") or label or "",
+            "seq": len(vouchers) + 1,
+            "source_type": "cash_basis_expense",
+            "source_id": statement_id,
+            "statement_id": statement_id,
+            "payment_method": payment_method,
+            "requires_slip": payment_method != "Credit Card",
+            "cash_basis_included": True,
+            # Schema-v1 compatibility fields consumed by the deployed frontend.
+            "date": str(row["entry_date"]),
+            "counterparty": row.get("counterparty") or label or "",
             "description": label,
-            "category_code": cat,
-            "category_name_th": r.get("category_name_th") or "ไม่ระบุ",
+            "category_code": category_code,
+            "category_name_th": row.get("category_name_th") or "ไม่ระบุ",
             "amount": round(amount, 2),
             "wht": wht,
-            "slip": slips_by_stmt.get(ref),
-            "invoice": inv_by_stmt.get(ref),
+            "slip": (
+                None
+                if payment_method == "Credit Card"
+                else slips_by_stmt.get(statement_id)
+            ),
+            "invoice": invoice,
+        })
+
+    for row in card_rows:
+        source_id = str(row["source_id"])
+        invoice = dict(card_invoices.get(source_id) or {})
+        invoice.setdefault("invoice_id", source_id)
+        invoice.setdefault("invoice_no", row.get("invoice_no"))
+        invoice.setdefault("vendor_name", row.get("vendor_name"))
+        invoice.setdefault("pages", [])
+        invoice.setdefault(
+            "image_url",
+            invoice["pages"][0]["image_url"] if invoice["pages"] else None,
+        )
+        amount = float(row.get("amount") or 0)
+        vouchers.append({
+            "seq": len(vouchers) + 1,
+            "source_type": "supplementary_credit_card",
+            "source_id": source_id,
+            "statement_id": None,
+            "payment_method": "Credit Card",
+            "requires_slip": False,
+            "cash_basis_included": False,
+            # Schema-v1 compatibility fields consumed by the deployed frontend.
+            "date": str(row["entry_date"]),
+            "counterparty": row.get("vendor_name") or "",
+            "description": row.get("label") or row.get("vendor_name") or "",
+            "category_code": row.get("category_code"),
+            "category_name_th": row.get("category_name_th") or "ไม่ระบุ",
+            "amount": round(amount, 2),
+            "wht": None,
+            "slip": None,
+            "invoice": invoice,
         })
     return vouchers
+
+
+def _expenses_without_required_slip(month: str, vouchers: list[dict]) -> list[dict]:
+    return [
+        {
+            "pv": f"PV-{month.replace('-', '')}-{voucher['seq']:03d}",
+            "date": voucher["date"],
+            "counterparty": voucher["counterparty"],
+            "description": voucher["description"],
+            "amount": voucher["amount"],
+        }
+        for voucher in vouchers
+        if voucher["requires_slip"] and voucher["slip"] is None
+    ]
+
+
+def _audit_summary(
+    *,
+    cash_basis_expense: float,
+    petty_total: float,
+    vouchers: list[dict],
+) -> dict:
+    cash_basis_vouchers = [
+        voucher for voucher in vouchers if voucher["cash_basis_included"]
+    ]
+    supplementary_cards = [
+        voucher
+        for voucher in vouchers
+        if not voucher["cash_basis_included"]
+        and voucher["payment_method"] == "Credit Card"
+    ]
+    cash_basis_total = round(
+        sum(float(voucher["amount"]) for voucher in cash_basis_vouchers), 2
+    )
+    supplementary_total = round(
+        sum(float(voucher["amount"]) for voucher in supplementary_cards), 2
+    )
+    expense_pnl = round(float(cash_basis_expense), 2)
+    return {
+        "expense_pnl": expense_pnl,
+        "voucher_count": len(vouchers),
+        "cash_basis_voucher_count": len(cash_basis_vouchers),
+        "cash_basis_voucher_total": cash_basis_total,
+        "supplementary_credit_card_count": len(supplementary_cards),
+        "supplementary_credit_card_total": supplementary_total,
+        "cash_basis_reconciliation_drift": round(
+            cash_basis_total + float(petty_total) - expense_pnl, 2
+        ),
+        # Deployed schema-v1 frontend expects voucher_total to reconcile to P&L.
+        "voucher_total": cash_basis_total,
+    }
+
+
+def _build_audit_package_payload(
+    *,
+    month: str,
+    generated_at: str,
+    income_pnl: float,
+    expense_pnl: float,
+    vouchers: list[dict],
+    petty_cash: list[dict],
+    bills_without_attachment: list[dict],
+    unmatched_slips: list[dict],
+) -> dict:
+    petty_total = round(
+        sum(float(row["amount"]) for row in petty_cash), 2
+    )
+    expenses_without_slip = _expenses_without_required_slip(month, vouchers)
+    summary = _audit_summary(
+        cash_basis_expense=expense_pnl,
+        petty_total=petty_total,
+        vouchers=vouchers,
+    )
+    summary.update({
+        "income_pnl": round(float(income_pnl), 2),
+        "petty_count": len(petty_cash),
+        "petty_total": petty_total,
+        "missing_counts": {
+            "no_slip": len(expenses_without_slip),
+            "no_invoice_attachment": len(bills_without_attachment),
+            "unmatched_slips": len(unmatched_slips),
+        },
+    })
+    return {
+        "schema_version": 2,
+        "month": month,
+        "month_label_th": _month_label_th(month),
+        "generated_at": generated_at,
+        "summary": summary,
+        "vouchers": vouchers,
+        "petty_cash": petty_cash,
+        "missing": {
+            "expenses_without_slip": expenses_without_slip,
+            "bills_without_attachment": bills_without_attachment,
+            "unmatched_slips": unmatched_slips,
+        },
+    }
 
 
 @router.get("/audit-package")
 def export_audit_package(month: str = Query(..., description="YYYY-MM")):
     """ชุดเอกสารตรวจสอบรายเดือน (ใบสำคัญจ่าย + เงินสดย่อย + รายการรอเอกสาร).
 
-    Read-only JSON bundle for the printable A4 audit-package page. Evidence images
-    are public Supabase storage URLs already used elsewhere in the app.
+    Read-only JSON bundle for the printable A4 audit-package page.
     Voucher numbering is stateless (PV-YYYYMM-### by entry_date,ref_id) — the
     printed/archived PDF is the immutable snapshot (design review 2026-07-13, 5b)."""
     from tax_routes import WHT_RULES  # noqa: PLC0415 — single source of WHT rates
@@ -1339,6 +1584,7 @@ def export_audit_package(month: str = Query(..., description="YYYY-MM")):
     first, last = _month_range(month)
     conn = get_db_conn()
     try:
+        conn.set_session(readonly=True)
         with conn.cursor() as cur:
             # ── Summary (same P&L basis as daybook export) ──
             cur.execute(
@@ -1374,7 +1620,8 @@ def export_audit_package(month: str = Query(..., description="YYYY-MM")):
                     """SELECT matched_statement_id::text AS stmt_id, raw_image_url, ref_no,
                               transfer_date, transfer_time
                        FROM public.slips
-                       WHERE matched_statement_id::text = ANY(%s)""",
+                       WHERE matched_statement_id::text = ANY(%s)
+                       ORDER BY matched_statement_id, transfer_date, id""",
                     (ref_ids,),
                 )
                 for s in _rows_to_dicts(cur):
@@ -1385,24 +1632,77 @@ def export_audit_package(month: str = Query(..., description="YYYY-MM")):
                         "transfer_time": str(s["transfer_time"]) if s["transfer_time"] else None,
                     }
 
-            # ── Evidence: invoices linked via bank_statement_entries.matched_invoice_id ──
-            inv_by_stmt: dict = {}
+            # ── Evidence: every invoice page linked to those statement rows ──
+            linked_invoice_rows: list[dict] = []
             if ref_ids:
                 cur.execute(
-                    """SELECT b.id::text AS stmt_id, vb.attachment_url, vb.invoice_no, vb.vendor_name
+                    """SELECT
+                           b.id::text AS stmt_id, vb.id::text AS invoice_id,
+                           vb.attachment_url, vb.invoice_no, vb.vendor_name,
+                           vb.payment_type, vb.payment_status,
+                           a.id::text AS attachment_id, a.page_no, a.file_url
                        FROM public.bank_statement_entries b
                        JOIN public.vendor_bills vb ON vb.id = b.matched_invoice_id
-                       WHERE b.id::text = ANY(%s)""",
+                       LEFT JOIN public.attachments a
+                         ON a.parent_type = 'vendor_bill' AND a.parent_id = vb.id
+                       WHERE b.id::text = ANY(%s)
+                       ORDER BY b.id, a.page_no, a.id""",
                     (ref_ids,),
                 )
-                for v in _rows_to_dicts(cur):
-                    inv_by_stmt[v["stmt_id"]] = {
-                        "image_url": _sign_uploads_url(v["attachment_url"]),
-                        "invoice_no": v["invoice_no"],
-                        "vendor_name": v["vendor_name"],
-                    }
+                linked_invoice_rows = _rows_to_dicts(cur)
+            inv_by_stmt = _group_invoice_evidence(
+                linked_invoice_rows, signer=_sign_uploads_url
+            )
 
-            vouchers = _assemble_audit_vouchers(vrows, slips_by_stmt, inv_by_stmt, WHT_RULES)
+            # ── Supplementary evidence: confirmed card bills not already linked
+            #    to an in-scope Statement. One batched query includes every page.
+            cur.execute(
+                """SELECT
+                       vb.id::text AS source_id, vb.bill_date AS entry_date,
+                       vb.vendor_name, vb.invoice_no, vb.amount, vb.category_code,
+                       COALESCE(ec.name_th, vb.category_code, 'ไม่ระบุ') AS category_name_th,
+                       vb.attachment_url, a.id::text AS attachment_id,
+                       a.page_no, a.file_url
+                   FROM public.vendor_bills vb
+                   LEFT JOIN public.expense_categories ec ON ec.code=vb.category_code
+                   LEFT JOIN public.attachments a
+                     ON a.parent_type='vendor_bill' AND a.parent_id=vb.id
+                   WHERE vb.review_status='confirmed'
+                     AND vb.bill_date BETWEEN %s AND %s
+                     AND COALESCE(vb.branch_code, %s) = %s
+                     AND (vb.payment_type='credit_card' OR vb.payment_status='credit_card')
+                     AND NOT EXISTS (
+                         SELECT 1 FROM public.bank_statement_entries b
+                         WHERE b.matched_invoice_id=vb.id
+                           AND b.txn_date BETWEEN %s AND %s
+                           AND b.branch_code=%s
+                     )
+                   ORDER BY vb.bill_date, vb.id, a.page_no, a.id""",
+                (
+                    first, last, _AUDIT_BRANCH_CODE, _AUDIT_BRANCH_CODE,
+                    first, last, _AUDIT_BRANCH_CODE,
+                ),
+            )
+            card_page_rows = _rows_to_dicts(cur)
+            card_invoices = _group_invoice_evidence(
+                card_page_rows, signer=_sign_uploads_url
+            )
+            card_rows: list[dict] = []
+            seen_card_ids: set[str] = set()
+            for row in card_page_rows:
+                source_id = str(row["source_id"])
+                if source_id not in seen_card_ids:
+                    seen_card_ids.add(source_id)
+                    card_rows.append(row)
+
+            vouchers = _assemble_audit_vouchers(
+                transfer_rows=vrows,
+                card_rows=card_rows,
+                slips_by_stmt=slips_by_stmt,
+                inv_by_stmt=inv_by_stmt,
+                card_invoices=card_invoices,
+                wht_rules=WHT_RULES,
+            )
 
             # ── Petty cash book (pos_cashflow) ──
             cur.execute(
@@ -1422,22 +1722,23 @@ def export_audit_package(month: str = Query(..., description="YYYY-MM")):
                  "category_name_th": p["category_name_th"], "amount": round(float(p["amount"] or 0), 2)}
                 for p in _rows_to_dicts(cur)
             ]
-            petty_total = round(sum(p["amount"] for p in petty), 2)
-
             # ── Missing-documents schedule (3 explicit types — design review risk #2) ──
-            expenses_without_slip = [
-                {"pv": f"PV-{month.replace('-', '')}-{v['seq']:03d}", "date": v["date"],
-                 "counterparty": v["counterparty"], "description": v["description"], "amount": v["amount"]}
-                for v in vouchers if v["slip"] is None
-            ]
             cur.execute(
                 """SELECT bill_date, vendor_name, invoice_no, amount
-                   FROM public.vendor_bills
-                   WHERE COALESCE(review_status, '') <> 'rejected'
-                     AND attachment_url IS NULL
-                     AND bill_date BETWEEN %s AND %s
-                   ORDER BY bill_date""",
-                (first, last),
+                   FROM public.vendor_bills vb
+                   WHERE COALESCE(vb.review_status, '') <> 'rejected'
+                     AND vb.attachment_url IS NULL
+                     AND NOT EXISTS (
+                         SELECT 1
+                         FROM public.attachments a
+                         WHERE a.parent_type='vendor_bill'
+                           AND a.parent_id=vb.id
+                           AND a.file_url IS NOT NULL
+                     )
+                     AND vb.bill_date BETWEEN %s AND %s
+                     AND COALESCE(vb.branch_code, %s) = %s
+                   ORDER BY vb.bill_date, vb.id""",
+                (first, last, _AUDIT_BRANCH_CODE, _AUDIT_BRANCH_CODE),
             )
             bills_without_attachment = [
                 {"date": str(b["bill_date"]), "vendor_name": b["vendor_name"],
@@ -1449,7 +1750,7 @@ def export_audit_package(month: str = Query(..., description="YYYY-MM")):
                    FROM public.slips
                    WHERE matched_statement_id IS NULL
                      AND transfer_date BETWEEN %s AND %s
-                   ORDER BY transfer_date""",
+                   ORDER BY transfer_date, id""",
                 (first, last),
             )
             unmatched_slips = [
@@ -1460,31 +1761,16 @@ def export_audit_package(month: str = Query(..., description="YYYY-MM")):
     finally:
         conn.close()
 
-    return {
-        "month": month,
-        "month_label_th": _month_label_th(month),
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "summary": {
-            "income_pnl": round(income_pnl, 2),
-            "expense_pnl": round(expense_pnl, 2),
-            "voucher_count": len(vouchers),
-            "voucher_total": round(sum(v["amount"] for v in vouchers), 2),
-            "petty_count": len(petty),
-            "petty_total": petty_total,
-            "missing_counts": {
-                "no_slip": len(expenses_without_slip),
-                "no_invoice_attachment": len(bills_without_attachment),
-                "unmatched_slips": len(unmatched_slips),
-            },
-        },
-        "vouchers": vouchers,
-        "petty_cash": petty,
-        "missing": {
-            "expenses_without_slip": expenses_without_slip,
-            "bills_without_attachment": bills_without_attachment,
-            "unmatched_slips": unmatched_slips,
-        },
-    }
+    return _build_audit_package_payload(
+        month=month,
+        generated_at=bkk_now().isoformat(timespec="seconds"),
+        income_pnl=income_pnl,
+        expense_pnl=expense_pnl,
+        vouchers=vouchers,
+        petty_cash=petty,
+        bills_without_attachment=bills_without_attachment,
+        unmatched_slips=unmatched_slips,
+    )
 
 
 @router.get("/health")
