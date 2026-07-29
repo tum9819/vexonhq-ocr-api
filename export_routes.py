@@ -1309,7 +1309,7 @@ def _query_audit_cash_basis_rows(cur, first: date, last: date) -> tuple[list[dic
            WHERE d.direction = 'expense'
              AND d.source <> 'pos_cashflow'
              AND d.entry_date BETWEEN %s AND %s
-           ORDER BY d.entry_date, d.source, d.ref_id""",
+           ORDER BY d.entry_date, d.ref_id""",
         (first, last),
     )
     rows = _rows_to_dicts(cur)

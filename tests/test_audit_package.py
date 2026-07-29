@@ -186,6 +186,51 @@ def test_audit_cash_basis_query_identifies_only_real_statement_ids():
     assert cur.params == ("2026-07-01", "2026-07-31")
 
 
+def test_audit_cash_basis_query_preserves_public_voucher_numbering_order():
+    """Same-day PV numbering is the legacy (entry_date, ref_id) contract."""
+    class FakeCursor:
+        description = None
+
+        def execute(self, sql, params):
+            self.sql = sql
+            self.params = params
+            self.description = [
+                (name,)
+                for name in (
+                    "entry_date", "amount", "category_code", "category_name_th",
+                    "counterparty", "label", "source", "ref_id", "statement_id",
+                )
+            ]
+
+        def fetchall(self):
+            # ref_id order deliberately conflicts with source order:
+            # source-first would return z-ref before a-ref and renumber both PVs.
+            return [
+                (
+                    "2026-07-10", 100, "other_expense", "อื่นๆ", None,
+                    "manual A", "manual", "a-ref", None,
+                ),
+                (
+                    "2026-07-10", 200, "other_expense", "อื่นๆ", "Supplier",
+                    "AP Z", "ap_payment", "z-ref", None,
+                ),
+            ]
+
+    cur = FakeCursor()
+    rows, statement_ids = routes._query_audit_cash_basis_rows(
+        cur, "2026-07-01", "2026-07-31"
+    )
+    vouchers = _assemble(rows)
+
+    assert "ORDER BY d.entry_date, d.ref_id" in cur.sql
+    assert "ORDER BY d.entry_date, d.source, d.ref_id" not in cur.sql
+    assert statement_ids == []
+    assert [
+        (voucher["seq"], voucher["source_id"])
+        for voucher in vouchers
+    ] == [(1, "a-ref"), (2, "z-ref")]
+
+
 def test_counterparty_falls_back_to_label_when_null():
     """v_daybook_pnl.counterparty is NULL for bank-sourced rows (payroll/rent/
     vendor_purchase); the payee name lives in `label` instead — the printed
