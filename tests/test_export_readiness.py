@@ -154,6 +154,73 @@ def test_same_view_partition_keeps_reconciliation_preview_only():
     }
 
 
+def test_bill_evidence_rollup_includes_cross_month_card_without_double_counting():
+    bill_rows = [
+        {
+            "id": "monthly-transfer", "amount": Decimal("100.00"),
+            "review_status": "confirmed", "payment_type": "transfer",
+            "payment_status": "paid", "attachment_url": None,
+            "attachment_id": None, "file_url": None,
+            "is_month_bill": True, "is_linked_statement_card": False,
+        },
+        {
+            "id": "monthly-linked-card", "amount": Decimal("200.00"),
+            "review_status": "confirmed", "payment_type": "credit_card",
+            "payment_status": "paid", "attachment_url": "legacy-card-page",
+            "attachment_id": None, "file_url": None,
+            "is_month_bill": True, "is_linked_statement_card": True,
+        },
+        {
+            "id": "cross-month-linked-card", "amount": Decimal("250.00"),
+            "review_status": "confirmed", "payment_type": "other",
+            "payment_status": "credit_card", "attachment_url": None,
+            "attachment_id": None, "file_url": None,
+            "is_month_bill": False, "is_linked_statement_card": True,
+        },
+    ]
+
+    summary = export_routes._summarize_readiness_bill_evidence(bill_rows)
+
+    assert summary == {
+        "missing_invoice_count": 1,
+        "missing_invoice_amount": Decimal("100.00"),
+        "confirmed_card_count": 2,
+        "missing_card_count": 1,
+        "missing_card_amount": Decimal("250.00"),
+        "image_url_failure_count": 2,
+    }
+
+
+def test_wht_candidate_facts_use_supplied_rules_and_scoped_daybook_rows():
+    daybook_rows = [
+        {
+            "direction": "expense", "category_code": "musician_fee",
+            "amount": Decimal("600.00"), "ref_id": "m1",
+        },
+        {
+            "direction": "expense", "category_code": "rent",
+            "amount": Decimal("800.00"), "ref_id": "r1",
+        },
+        {
+            "direction": "income", "category_code": "rent",
+            "amount": Decimal("999.00"), "ref_id": "income-rent",
+        },
+        {
+            "direction": "expense", "category_code": "food_raw",
+            "amount": Decimal("100.00"), "ref_id": "food",
+        },
+    ]
+
+    facts, candidate_rows, category_codes = export_routes._wht_candidate_facts(
+        daybook_rows,
+        {"musician_fee": {"wht_pct": 3}, "rent": {"wht_pct": 5}},
+    )
+
+    assert facts == {"count": 2, "amount": Decimal("1400.00")}
+    assert [row["ref_id"] for row in candidate_rows] == ["m1", "r1"]
+    assert category_codes == ["musician_fee", "rent"]
+
+
 def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monkeypatch):
     responses = [
         (
@@ -161,7 +228,7 @@ def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monke
                 "row_count", "batch_count", "first_observed_date",
                 "last_observed_date", "review_count", "review_amount",
             ],
-            [(3, 1, date(2026, 7, 1), date(2026, 7, 31), 1, Decimal("12.00"))],
+            [(4, 1, date(2026, 7, 1), date(2026, 7, 31), 1, Decimal("12.00"))],
         ),
         (
             [
@@ -193,6 +260,11 @@ def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monke
                     Decimal("0"), Decimal("400.00"), Decimal("400.00"),
                     "sales", "sales", "manual", None, False, False,
                 ),
+                (
+                    "s4", "batch-1", date(2026, 7, 8), "cross-month card",
+                    Decimal("250.00"), Decimal("0"), Decimal("250.00"),
+                    "food_raw", "vendor_purchase", "manual", "b4", True, False,
+                ),
             ],
         ),
         (
@@ -217,19 +289,28 @@ def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monke
                 "id", "bill_date", "amount", "category_code", "review_status",
                 "payment_type", "payment_status", "attachment_url",
                 "attachment_id", "page_no", "file_url",
+                "is_month_bill", "is_linked_statement_card",
             ],
             [
                 (
                     "b1", date(2026, 7, 5), Decimal("100.00"), "food_raw",
                     "confirmed", "transfer", "paid", None, None, None, None,
+                    True, False,
                 ),
                 (
                     "b2", date(2026, 7, 6), Decimal("200.00"), "food_raw",
                     "confirmed", "credit_card", "paid", "legacy-b2", None, None, None,
+                    True, True,
                 ),
                 (
                     "b3", date(2026, 7, 8), Decimal("50.00"), "food_raw",
                     "pending", "cash", "unpaid", None, "a3", 1, "page-b3",
+                    True, False,
+                ),
+                (
+                    "b4", date(2026, 6, 30), Decimal("250.00"), "food_raw",
+                    "confirmed", "other", "credit_card", None, None, None, None,
+                    False, True,
                 ),
             ],
         ),
@@ -250,6 +331,14 @@ def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monke
                 (
                     date(2026, 7, 7), "income", Decimal("400.00"), "sales",
                     "pos_sales", "s3", "income", None,
+                ),
+                (
+                    date(2026, 7, 8), "expense", Decimal("250.00"), "food_raw",
+                    "bank_statement", "s4", "cross-month card", "Vendor Four",
+                ),
+                (
+                    date(2026, 7, 9), "expense", Decimal("600.00"), "musician_fee",
+                    "pos_cashflow", "p1", "ค่าดนตรี", "Musician",
                 ),
             ],
         ),
@@ -328,6 +417,7 @@ def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monke
         (
             date(2026, 7, 1), date(2026, 7, 31),
             "thawi_watthana", "future_branch",
+            date(2026, 7, 1), date(2026, 7, 31), "future_branch",
         ),
         (date(2026, 7, 1), date(2026, 7, 31), "future_branch"),
     ]
@@ -346,8 +436,11 @@ def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monke
     slip_sql = conn.cur.executions[3][0]
     assert "is_branch_linked" in slip_sql
     assert "is_month_unattributed" in slip_sql
+    bill_sql = conn.cur.executions[4][0]
+    assert "is_month_bill" in bill_sql
+    assert "is_linked_statement_card" in bill_sql
     assert facts["statement"] == {
-        "row_count": 3,
+        "row_count": 4,
         "batch_count": 1,
         "first_observed_date": date(2026, 7, 1),
         "last_observed_date": date(2026, 7, 31),
@@ -369,17 +462,27 @@ def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monke
         "missing_page_amount": Decimal("100.00"),
     }
     assert facts["credit_cards"] == {
-        "confirmed_count": 1,
-        "missing_invoice_page_count": 0,
-        "missing_invoice_page_amount": 0,
+        "confirmed_count": 2,
+        "missing_invoice_page_count": 1,
+        "missing_invoice_page_amount": Decimal("250.00"),
     }
-    assert facts["image_url_failures"] == {"count": 2}
+    assert facts["image_url_failures"] == {"count": 3}
+    assert facts["wht_candidates"] == {
+        "count": 1,
+        "amount": Decimal("600.00"),
+    }
     assert fingerprint_inputs["month"] == "2026-07"
     assert fingerprint_inputs["branch_code"] == "future_branch"
-    assert len(fingerprint_inputs["daybook_rows"]) == 3
+    assert len(fingerprint_inputs["daybook_rows"]) == 5
     assert fingerprint_inputs["statement_rows"][0]["import_batch_id"] == "batch-1"
     assert fingerprint_inputs["statement_rows"][0]["amount"] == Decimal("100.00")
     assert fingerprint_inputs["statement_rows"][1]["matched_invoice_is_credit_card"] is True
+    assert fingerprint_inputs["bills_and_pages"][-1]["id"] == "b4"
+    assert fingerprint_inputs["bills_and_pages"][-1]["is_month_bill"] is False
+    assert fingerprint_inputs["bills_and_pages"][-1]["is_linked_statement_card"] is True
+    assert [row["ref_id"] for row in fingerprint_inputs["wht_candidate_rows"]] == [
+        "p1"
+    ]
     assert [row["id"] for row in fingerprint_inputs["branch_linked_slip_rows"]] == [
         "sl1"
     ]
@@ -512,6 +615,12 @@ def test_current_month_is_preview_only_even_with_verified_coverage():
     )
     result = build_readiness("2026-07", "thawi_watthana", facts)
     assert result["packages"]["common_accounting"]["status"] == "preview_only"
+    month_rule = next(
+        rule
+        for rule in result["packages"]["common_accounting"]["rules"]
+        if rule["code"] == "MONTH_ENDED"
+    )
+    assert month_rule["message_th"] == "เดือนบัญชียังไม่สิ้นสุด"
 
 
 def test_credit_card_missing_invoice_does_not_create_missing_transfer_slip():

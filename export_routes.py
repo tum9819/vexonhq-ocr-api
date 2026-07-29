@@ -943,6 +943,99 @@ def _missing_transfer_slips(
     ]
 
 
+def _summarize_readiness_bill_evidence(bill_rows: list[dict]) -> dict:
+    bill_groups: dict[str, dict] = {}
+    attachment_url_failures = 0
+    for row in bill_rows:
+        bill_id = row["id"]
+        group = bill_groups.setdefault(
+            bill_id,
+            {
+                "amount": row["amount"] or 0,
+                "review_status": row["review_status"],
+                "payment_type": row["payment_type"],
+                "payment_status": row["payment_status"],
+                "attachment_url": row["attachment_url"],
+                "is_month_bill": False,
+                "is_linked_statement_card": False,
+                "has_attachment_row": False,
+                "has_page_url": False,
+            },
+        )
+        group["is_month_bill"] = (
+            group["is_month_bill"] or bool(row["is_month_bill"])
+        )
+        group["is_linked_statement_card"] = (
+            group["is_linked_statement_card"]
+            or bool(row["is_linked_statement_card"])
+        )
+        if row["attachment_id"] is not None:
+            group["has_attachment_row"] = True
+            if row["file_url"]:
+                group["has_page_url"] = True
+            else:
+                attachment_url_failures += 1
+
+    def has_invoice_page(group: dict) -> bool:
+        return bool(group["has_page_url"] or group["attachment_url"])
+
+    missing_invoices = [
+        group
+        for group in bill_groups.values()
+        if group["is_month_bill"] and not has_invoice_page(group)
+    ]
+    confirmed_cards = [
+        group
+        for group in bill_groups.values()
+        if group["review_status"] == "confirmed"
+        and (
+            group["payment_type"] == "credit_card"
+            or group["payment_status"] == "credit_card"
+        )
+    ]
+    missing_cards = [
+        group for group in confirmed_cards if not has_invoice_page(group)
+    ]
+    missing_without_attachment_row = sum(
+        1
+        for group in bill_groups.values()
+        if not group["has_attachment_row"] and not group["attachment_url"]
+    )
+    return {
+        "missing_invoice_count": len(missing_invoices),
+        "missing_invoice_amount": sum(
+            (group["amount"] for group in missing_invoices), 0
+        ),
+        "confirmed_card_count": len(confirmed_cards),
+        "missing_card_count": len(missing_cards),
+        "missing_card_amount": sum(
+            (group["amount"] for group in missing_cards), 0
+        ),
+        "image_url_failure_count": (
+            attachment_url_failures + missing_without_attachment_row
+        ),
+    }
+
+
+def _wht_candidate_facts(
+    daybook_rows: list[dict],
+    wht_rules: dict,
+) -> tuple[dict, list[dict], list[str]]:
+    category_codes = sorted(wht_rules)
+    candidate_codes = set(category_codes)
+    candidate_rows = [
+        row
+        for row in daybook_rows
+        if row["direction"] == "expense"
+        and row["category_code"] in candidate_codes
+    ]
+    facts = {
+        "count": len(candidate_rows),
+        "amount": sum((row["amount"] or 0 for row in candidate_rows), 0),
+    }
+    return facts, candidate_rows, category_codes
+
+
 def _query_readiness_facts(
     first: date,
     last: date,
@@ -1093,19 +1186,45 @@ def _query_readiness_facts(
             cur.execute(
                 """
                 SELECT
-                    vb.id::text, vb.bill_date, vb.amount, vb.category_code,
-                    vb.review_status, vb.payment_type, vb.payment_status,
-                    vb.attachment_url,
-                    a.id::text AS attachment_id, a.page_no, a.file_url
-                FROM public.vendor_bills vb
+                    scoped.id::text, scoped.bill_date, scoped.amount,
+                    scoped.category_code, scoped.review_status,
+                    scoped.payment_type, scoped.payment_status,
+                    scoped.attachment_url,
+                    a.id::text AS attachment_id, a.page_no, a.file_url,
+                    scoped.is_month_bill, scoped.is_linked_statement_card
+                FROM (
+                    SELECT
+                        vb.*,
+                        (
+                            vb.bill_date BETWEEN %s AND %s
+                            AND COALESCE(vb.branch_code, %s) = %s
+                            AND COALESCE(vb.review_status, '') <> 'rejected'
+                        ) AS is_month_bill,
+                        (
+                            vb.review_status = 'confirmed'
+                            AND (
+                                vb.payment_type = 'credit_card'
+                                OR vb.payment_status = 'credit_card'
+                            )
+                            AND EXISTS (
+                                SELECT 1
+                                FROM public.bank_statement_entries b
+                                WHERE b.matched_invoice_id = vb.id
+                                  AND b.txn_date BETWEEN %s AND %s
+                                  AND b.branch_code = %s
+                            )
+                        ) AS is_linked_statement_card
+                    FROM public.vendor_bills vb
+                ) AS scoped
                 LEFT JOIN public.attachments a
-                  ON a.parent_type = 'vendor_bill' AND a.parent_id = vb.id
-                WHERE vb.bill_date BETWEEN %s AND %s
-                  AND COALESCE(vb.branch_code, %s) = %s
-                  AND COALESCE(vb.review_status, '') <> 'rejected'
-                ORDER BY vb.id, a.page_no, a.id
+                  ON a.parent_type = 'vendor_bill' AND a.parent_id = scoped.id
+                WHERE scoped.is_month_bill OR scoped.is_linked_statement_card
+                ORDER BY scoped.id, a.page_no, a.id
                 """,
-                (first, last, "thawi_watthana", branch_code),
+                (
+                    first, last, "thawi_watthana", branch_code,
+                    first, last, branch_code,
+                ),
             )
             bill_rows = _rows_to_dicts(cur)
 
@@ -1132,47 +1251,7 @@ def _query_readiness_facts(
     finally:
         conn.close()
 
-    bill_groups: dict[str, dict] = {}
-    attachment_url_failures = 0
-    for row in bill_rows:
-        bill_id = row["id"]
-        group = bill_groups.setdefault(
-            bill_id,
-            {
-                "amount": row["amount"] or 0,
-                "review_status": row["review_status"],
-                "payment_type": row["payment_type"],
-                "payment_status": row["payment_status"],
-                "attachment_url": row["attachment_url"],
-                "has_attachment_row": False,
-                "has_page_url": False,
-            },
-        )
-        if row["attachment_id"] is not None:
-            group["has_attachment_row"] = True
-            if row["file_url"]:
-                group["has_page_url"] = True
-            else:
-                attachment_url_failures += 1
-
-    def has_invoice_page(group: dict) -> bool:
-        return bool(group["has_page_url"] or group["attachment_url"])
-
-    missing_bills = [
-        group for group in bill_groups.values() if not has_invoice_page(group)
-    ]
-    confirmed_cards = [
-        group
-        for group in bill_groups.values()
-        if group["review_status"] == "confirmed"
-        and (
-            group["payment_type"] == "credit_card"
-            or group["payment_status"] == "credit_card"
-        )
-    ]
-    missing_confirmed_cards = [
-        group for group in confirmed_cards if not has_invoice_page(group)
-    ]
+    bill_evidence = _summarize_readiness_bill_evidence(bill_rows)
     missing_transfer_slips = _missing_transfer_slips(statement_rows, daybook_rows)
     branch_linked_slip_rows = [
         row for row in slip_rows if row["is_branch_linked"]
@@ -1180,6 +1259,16 @@ def _query_readiness_facts(
     month_unattributed_slip_rows = [
         row for row in slip_rows if row["is_month_unattributed"]
     ]
+    from tax_routes import WHT_RULES
+
+    (
+        wht_candidates,
+        wht_candidate_rows,
+        wht_candidate_category_codes,
+    ) = _wht_candidate_facts(
+        daybook_rows,
+        WHT_RULES,
+    )
 
     drift = (
         (pnl_stats["expense_total"] or 0)
@@ -1187,22 +1276,12 @@ def _query_readiness_facts(
         - (pnl_stats["uncategorized_amount"] or 0)
     )
     danger_amount = sum((risk.get("amount") or 0 for risk in danger_risks), 0)
-    missing_bill_amount = sum((group["amount"] for group in missing_bills), 0)
-    missing_card_amount = sum(
-        (group["amount"] for group in missing_confirmed_cards), 0
-    )
     missing_transfer_amount = sum(
         ((row["debit"] or 0) for row in missing_transfer_slips), 0
     )
-    missing_bill_without_attachment_row = sum(
-        1
-        for group in bill_groups.values()
-        if not group["has_attachment_row"] and not group["attachment_url"]
-    )
     image_url_failure_count = (
         sum(1 for row in branch_linked_slip_rows if not row["raw_image_url"])
-        + attachment_url_failures
-        + missing_bill_without_attachment_row
+        + bill_evidence["image_url_failure_count"]
     )
 
     facts = {
@@ -1238,15 +1317,16 @@ def _query_readiness_facts(
             "missing_slip_amount": missing_transfer_amount,
         },
         "invoice_evidence": {
-            "missing_page_count": len(missing_bills),
-            "missing_page_amount": missing_bill_amount,
+            "missing_page_count": bill_evidence["missing_invoice_count"],
+            "missing_page_amount": bill_evidence["missing_invoice_amount"],
         },
         "credit_cards": {
-            "confirmed_count": len(confirmed_cards),
-            "missing_invoice_page_count": len(missing_confirmed_cards),
-            "missing_invoice_page_amount": missing_card_amount,
+            "confirmed_count": bill_evidence["confirmed_card_count"],
+            "missing_invoice_page_count": bill_evidence["missing_card_count"],
+            "missing_invoice_page_amount": bill_evidence["missing_card_amount"],
         },
         "image_url_failures": {"count": image_url_failure_count},
+        "wht_candidates": wht_candidates,
     }
     fingerprint_inputs = {
         "month": first.strftime("%Y-%m"),
@@ -1256,6 +1336,8 @@ def _query_readiness_facts(
         "branch_linked_slip_rows": branch_linked_slip_rows,
         "month_unattributed_slip_rows": month_unattributed_slip_rows,
         "bills_and_pages": bill_rows,
+        "wht_candidate_rows": wht_candidate_rows,
+        "wht_candidate_category_codes": wht_candidate_category_codes,
         "monthly_close": [
             {
                 "risk_key": risk["risk_key"],
@@ -1324,6 +1406,29 @@ def _query_audit_cash_basis_rows(cur, first: date, last: date) -> tuple[list[dic
     return rows, statement_ids
 
 
+def _query_linked_invoice_evidence_rows(
+    cur,
+    statement_ids: list[str],
+) -> list[dict]:
+    if not statement_ids:
+        return []
+    cur.execute(
+        """SELECT
+               b.id::text AS stmt_id, vb.id::text AS invoice_id,
+               vb.attachment_url, vb.invoice_no, vb.vendor_name,
+               vb.review_status, vb.payment_type, vb.payment_status,
+               a.id::text AS attachment_id, a.page_no, a.file_url
+           FROM public.bank_statement_entries b
+           JOIN public.vendor_bills vb ON vb.id = b.matched_invoice_id
+           LEFT JOIN public.attachments a
+             ON a.parent_type = 'vendor_bill' AND a.parent_id = vb.id
+           WHERE b.id::text = ANY(%s)
+           ORDER BY b.id, a.page_no, a.id""",
+        (statement_ids,),
+    )
+    return _rows_to_dicts(cur)
+
+
 def _group_invoice_evidence(rows: list[dict], signer) -> dict[str, dict]:
     """Group and sign invoice pages without downloading storage objects."""
     groups: dict[str, dict] = {}
@@ -1338,6 +1443,7 @@ def _group_invoice_evidence(rows: list[dict], signer) -> dict[str, dict]:
                 "invoice_id": str(row.get("invoice_id") or row.get("source_id") or ""),
                 "invoice_no": row.get("invoice_no"),
                 "vendor_name": row.get("vendor_name"),
+                "review_status": row.get("review_status"),
                 "payment_type": row.get("payment_type"),
                 "payment_status": row.get("payment_status"),
                 "attachment_url": row.get("attachment_url"),
@@ -1346,8 +1452,8 @@ def _group_invoice_evidence(rows: list[dict], signer) -> dict[str, dict]:
             },
         )
         for field in (
-            "invoice_id", "invoice_no", "vendor_name", "payment_type",
-            "payment_status", "attachment_url",
+            "invoice_id", "invoice_no", "vendor_name", "review_status",
+            "payment_type", "payment_status", "attachment_url",
         ):
             if not group.get(field) and row.get(field):
                 group[field] = str(row[field]) if field == "invoice_id" else row[field]
@@ -1404,7 +1510,7 @@ def _group_invoice_evidence(rows: list[dict], signer) -> dict[str, dict]:
 
 
 def _payment_method(invoice: dict | None, statement_id: str | None) -> str:
-    if invoice and (
+    if invoice and invoice.get("review_status") == "confirmed" and (
         invoice.get("payment_type") == "credit_card"
         or invoice.get("payment_status") == "credit_card"
     ):
@@ -1705,23 +1811,9 @@ def export_audit_package(month: str = Query(..., description="YYYY-MM")):
                     }
 
             # ── Evidence: every invoice page linked to those statement rows ──
-            linked_invoice_rows: list[dict] = []
-            if statement_ids:
-                cur.execute(
-                    """SELECT
-                           b.id::text AS stmt_id, vb.id::text AS invoice_id,
-                           vb.attachment_url, vb.invoice_no, vb.vendor_name,
-                           vb.payment_type, vb.payment_status,
-                           a.id::text AS attachment_id, a.page_no, a.file_url
-                       FROM public.bank_statement_entries b
-                       JOIN public.vendor_bills vb ON vb.id = b.matched_invoice_id
-                       LEFT JOIN public.attachments a
-                         ON a.parent_type = 'vendor_bill' AND a.parent_id = vb.id
-                       WHERE b.id::text = ANY(%s)
-                       ORDER BY b.id, a.page_no, a.id""",
-                    (statement_ids,),
-                )
-                linked_invoice_rows = _rows_to_dicts(cur)
+            linked_invoice_rows = _query_linked_invoice_evidence_rows(
+                cur, statement_ids
+            )
             inv_by_stmt = _group_invoice_evidence(
                 linked_invoice_rows, signer=_sign_uploads_url
             )

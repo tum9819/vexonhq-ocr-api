@@ -154,7 +154,9 @@ def build_readiness(month: str, branch_code: str, facts: dict[str, Any]) -> dict
         "MONTH_ENDED": _rule(
             "MONTH_ENDED",
             _rule_outcome(facts["today"] > month_end, "preview_only"),
-            "เดือนบัญชีสิ้นสุดแล้ว",
+            "เดือนบัญชีสิ้นสุดแล้ว"
+            if facts["today"] > month_end
+            else "เดือนบัญชียังไม่สิ้นสุด",
             0,
             None,
             {"today": facts["today"], "month_end": month_end},

@@ -292,15 +292,81 @@ def test_invoice_fallback_is_used_only_when_no_attachment_row_exists():
 
 def test_payment_method_precedence_is_evidence_derived():
     assert routes._payment_method(
-        {"payment_type": "other", "payment_status": "credit_card"}, "s1"
+        {
+            "review_status": "confirmed",
+            "payment_type": "other",
+            "payment_status": "credit_card",
+        },
+        "s1",
     ) == "Credit Card"
     assert routes._payment_method(
-        {"payment_type": "credit_card", "payment_status": "paid"}, "s1"
+        {
+            "review_status": "confirmed",
+            "payment_type": "credit_card",
+            "payment_status": "paid",
+        },
+        "s1",
     ) == "Credit Card"
     assert routes._payment_method(None, "s1") == "Bank Transfer"
     assert routes._payment_method({"payment_type": "transfer"}, None) == "Bank Transfer"
     assert routes._payment_method({"payment_type": "cash"}, None) == "Cash"
     assert routes._payment_method({"payment_type": "other"}, None) == "Other"
+
+
+@pytest.mark.parametrize("review_status", ["pending", "rejected", None])
+@pytest.mark.parametrize("card_field", ["payment_type", "payment_status"])
+def test_linked_nonconfirmed_card_label_does_not_waive_statement_slip(
+    review_status,
+    card_field,
+):
+    invoice = {
+        "invoice_id": "invoice-id",
+        "review_status": review_status,
+        "payment_type": "other",
+        "payment_status": "paid",
+        "pages": [{"page_no": 1, "image_url": "signed-invoice"}],
+    }
+    invoice[card_field] = "credit_card"
+
+    voucher = _assemble(
+        [_row("2026-07-10", 500, "food_raw", "s1")],
+        invoices={"s1": invoice},
+    )[0]
+
+    assert voucher["payment_method"] == "Bank Transfer"
+    assert voucher["requires_slip"] is True
+    assert voucher["slip"] is None
+
+
+def test_linked_invoice_query_and_group_carry_review_status():
+    class FakeCursor:
+        description = None
+
+        def execute(self, sql, params):
+            self.sql = sql
+            self.params = params
+            self.description = [
+                (name,)
+                for name in (
+                    "stmt_id", "invoice_id", "attachment_url", "invoice_no",
+                    "vendor_name", "review_status", "payment_type",
+                    "payment_status", "attachment_id", "page_no", "file_url",
+                )
+            ]
+
+        def fetchall(self):
+            return [(
+                "s1", "i1", None, "INV-1", "Vendor", "pending",
+                "credit_card", "paid", "a1", 1, "page-1",
+            )]
+
+    cur = FakeCursor()
+    rows = routes._query_linked_invoice_evidence_rows(cur, ["s1"])
+    grouped = routes._group_invoice_evidence(rows, signer=lambda value: value)
+
+    assert "vb.review_status" in cur.sql
+    assert cur.params == (["s1"],)
+    assert grouped["s1"]["review_status"] == "pending"
 
 
 def test_credit_card_never_requires_slip():
@@ -328,6 +394,7 @@ def test_linked_credit_card_keeps_cash_basis_but_never_requires_slip():
         [_row("2026-07-10", 500, "food_raw", "s1")],
         invoices={"s1": {
             "invoice_id": "i1",
+            "review_status": "confirmed",
             "payment_status": "credit_card",
             "payment_type": "other",
             "pages": [{"page_no": 1, "image_url": "p1"}],
