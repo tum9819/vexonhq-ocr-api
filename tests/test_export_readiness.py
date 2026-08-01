@@ -187,8 +187,38 @@ def test_bill_evidence_rollup_includes_cross_month_card_without_double_counting(
         "confirmed_card_count": 2,
         "missing_card_count": 1,
         "missing_card_amount": Decimal("250.00"),
-        "image_url_failure_count": 2,
+        # Bills that were never uploaded are reported by the invoice/card rules,
+        # not as image failures.
+        "image_url_failure_count": 0,
     }
+
+
+def test_never_uploaded_bill_is_not_an_image_failure_but_empty_file_url_is():
+    never_uploaded = {
+        "id": "never-uploaded", "amount": Decimal("100.00"),
+        "review_status": "confirmed", "payment_type": "transfer",
+        "payment_status": "paid", "attachment_url": None,
+        "attachment_id": None, "file_url": None,
+        "is_month_bill": True, "is_linked_statement_card": False,
+    }
+    broken_page = {
+        "id": "stored-but-empty-url", "amount": Decimal("200.00"),
+        "review_status": "confirmed", "payment_type": "transfer",
+        "payment_status": "paid", "attachment_url": None,
+        "attachment_id": "att-1", "page_no": 1, "file_url": None,
+        "is_month_bill": True, "is_linked_statement_card": False,
+    }
+
+    assert export_routes._summarize_readiness_bill_evidence(
+        [never_uploaded]
+    )["image_url_failure_count"] == 0
+    assert export_routes._summarize_readiness_bill_evidence(
+        [broken_page]
+    )["image_url_failure_count"] == 1
+    # Both still surface as a missing invoice page.
+    assert export_routes._summarize_readiness_bill_evidence(
+        [never_uploaded, broken_page]
+    )["missing_invoice_count"] == 2
 
 
 def test_wht_candidate_facts_use_supplied_rules_and_scoped_daybook_rows():
@@ -466,7 +496,10 @@ def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monke
         "missing_invoice_page_count": 1,
         "missing_invoice_page_amount": Decimal("250.00"),
     }
-    assert facts["image_url_failures"] == {"count": 3}
+    # Only the branch-linked slip with an empty raw_image_url is a real image
+    # failure. The two bills that were never uploaded belong to
+    # invoice_evidence / credit_cards instead.
+    assert facts["image_url_failures"] == {"count": 1}
     assert facts["wht_candidates"] == {
         "count": 1,
         "amount": Decimal("600.00"),

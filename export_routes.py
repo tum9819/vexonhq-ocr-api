@@ -996,11 +996,6 @@ def _summarize_readiness_bill_evidence(bill_rows: list[dict]) -> dict:
     missing_cards = [
         group for group in confirmed_cards if not has_invoice_page(group)
     ]
-    missing_without_attachment_row = sum(
-        1
-        for group in bill_groups.values()
-        if not group["has_attachment_row"] and not group["attachment_url"]
-    )
     return {
         "missing_invoice_count": len(missing_invoices),
         "missing_invoice_amount": sum(
@@ -1011,9 +1006,11 @@ def _summarize_readiness_bill_evidence(bill_rows: list[dict]) -> dict:
         "missing_card_amount": sum(
             (group["amount"] for group in missing_cards), 0
         ),
-        "image_url_failure_count": (
-            attachment_url_failures + missing_without_attachment_row
-        ),
+        # A bill with no attachment row and no attachment_url has nothing to
+        # fetch, so it is a "not uploaded yet" case owned by
+        # INVOICE_ATTACHMENT_EVIDENCE / CREDIT_CARD_INVOICE_EVIDENCE. Only a
+        # stored attachment row whose file_url is empty is a real image failure.
+        "image_url_failure_count": attachment_url_failures,
     }
 
 
