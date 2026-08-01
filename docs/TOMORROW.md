@@ -528,3 +528,34 @@ Then the nightly job (or `POST /slip/reconcile`) re-matches slips + pushes memo 
 ## Backups
 - `bank_statement_entries_bak_20260530` (1033 rows) — pre-reimport snapshot, drop when confident.
 - Backup tags pushed before each Session-46 commit (`backup-pre-*-2026-05-30`).
+
+## External review round 1 — 2026-08-01 (one finding, accepted with corrected severity)
+
+- Reviewer flagged `_summarize_readiness_bill_evidence()` counting bills that were
+  never uploaded into `image_url_failure_count`, and rated it High / must-fix.
+- Verified against the code and production before acting:
+  - Substance CONFIRMED. `attachments` currently holds zero rows with a NULL
+    `file_url`, so `IMAGE_URLS_PRESENT` was an exact duplicate of
+    `INVOICE_ATTACHMENT_EVIDENCE` (2026-05: both reported the same 4 bills
+    totalling 11,037.00) and carried no independent signal.
+  - Severity and impact REJECTED as stated. The rule's message is
+    "มี URL รูปภาพที่ขาดหาย", not a corruption/broken-link claim, so no user-facing
+    statement was false. It was redundancy, not a defect, and not a push blocker.
+  - The old behaviour also matched the approved plan's own rule table
+    ("missing URL count") and was locked by a deliberate test, so this is an
+    approved deviation from the Phase A plan, not a bug fix. TUM approved it
+    explicitly on 2026-08-01.
+- Change (`aa17ff2`): `image_url_failure_count` now returns only
+  `attachment_url_failures`, i.e. a stored attachment row whose `file_url` is
+  empty. Bills with nothing uploaded remain covered by
+  `INVOICE_ATTACHMENT_EVIDENCE` and `CREDIT_CARD_INVOICE_EVIDENCE`; slips with no
+  `raw_image_url` still count. No coverage was lost.
+- New regression `test_never_uploaded_bill_is_not_an_image_failure_but_empty_file_url_is`
+  locks both directions. Endpoint fixture expectation moved 3 -> 1.
+- Re-verified read-only against production: `IMAGE_URLS_PRESENT` now passes in
+  2026-04 through 2026-07, while `INVOICE_ATTACHMENT_EVIDENCE` still reports the
+  real 4 bills / 11,037.00 in 2026-05.
+- Every other review area (read-only snapshot, Credit Card handling, multi-page
+  invoice ordering, print gating, schema-v2 backward compatibility, admin gate,
+  fixed-authority `COALESCE` binding) was confirmed by both the reviewer and the
+  local self-review. No other blocking finding.
