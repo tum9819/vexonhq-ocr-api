@@ -31,7 +31,12 @@
 - Phase C shareholder package/redaction.
 - Phase D private immutable Final snapshots/history.
 
-## 🟡 2026-07-16 backend regression fixes — externally approved, local only, do not push yet
+## ✅ 2026-07-16 backend regression fixes — SHIPPED (banner corrected 2026-08-01)
+
+> STATUS CORRECTION 2026-08-01: this work is live. `6d983cb` is contained in
+> `origin/main` and is the base of the Export Center Phase A range. The
+> "do not push yet" banner below was never cleared after the deploy and is stale.
+> Kept for history only — do not treat it as pending work.
 
 - `/pnl/monthly` now sources receipt count from
   `SUM(pos_sales_daily.bill_count)` instead of counting one aggregate POS row/day.
