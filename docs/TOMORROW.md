@@ -23,7 +23,7 @@
 1. External audit-only review of the complete backend and frontend ranges; verify every finding against code/test evidence.
 2. Wait for TUM's explicit production push approval. Do not push, tag, or deploy from this local handoff.
 3. After approval, push/deploy backend first; verify the new commit, authenticated readiness schema v1, existing summary/Audit endpoints, `/health/deep`, and settled CPU before frontend deployment.
-4. Authenticated visual/print/tab-order smoke and a real confirmed Makro/CP Axtra `Credit Card` case remain pending. No live PostgreSQL performance claim was made.
+4. Authenticated visual/print/tab-order smoke remains pending. No live PostgreSQL performance claim was made. CORRECTED 2026-08-01: real confirmed CP Axtra `Credit Card` cases do exist (10 bills, 2026-04-21 to 2026-06-16, each with 2-6 attachment pages, none Statement-linked), so the card acceptance smoke can use real data in 2026-04, 2026-05, or 2026-06.
 
 ### Later phases — not implemented
 
