@@ -102,6 +102,11 @@ class BillPaymentPatch(BaseModel):
     bank_statement_entry_id: Optional[str] = None
 
 
+class BillBankLink(BaseModel):
+    """Link/unlink only. Deliberately carries no vendor_bills field."""
+    bank_statement_entry_id: Optional[str] = None
+
+
 # ─────────────────────────────────────────────────────────
 # GET /bills/payment
 # ─────────────────────────────────────────────────────────
@@ -146,7 +151,16 @@ def list_bills_payment(
                     vb.payment_status,
                     vb.paid_date,
                     vb.review_status,
-                    vb.notes
+                    vb.notes,
+                    -- Additive field: lets the UI show which bills still need a
+                    -- bank link. Older clients ignore it.
+                    (
+                        SELECT b.id::text
+                        FROM public.bank_statement_entries b
+                        WHERE b.matched_invoice_id = vb.id
+                        ORDER BY b.txn_date, b.id
+                        LIMIT 1
+                    ) AS bank_statement_entry_id
                 FROM public.vendor_bills vb
                 LEFT JOIN public.expense_categories ec ON ec.code = vb.category_code
                 WHERE vb.review_status = 'confirmed'
@@ -278,6 +292,116 @@ def update_bill_payment(bill_id: str, body: BillPaymentPatch, _admin: dict = Dep
                     result[k] = v.isoformat()
             result["bank_statement_entry_id"] = linked_bank_entry_id
             return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────────────────
+# PUT /bills/payment/{id}/bank-link
+# ─────────────────────────────────────────────────────────
+
+LINKABLE_STATUSES = ("paid", "credit_card")
+
+
+@router.put("/bills/payment/{bill_id}/bank-link")
+def link_bill_bank_entry(
+    bill_id: str,
+    body: BillBankLink,
+    _admin: dict = Depends(_require_admin_role),
+):
+    """Attach an already-paid bill to a bank expense row, or detach it.
+
+    PATCH /bills/payment/{id} can only link while the status is being CHANGED to
+    paid/credit_card, so a bill that is already paid could never be linked
+    afterwards. Re-running that PATCH would also rewrite paid_date to today.
+    This route therefore writes `bank_statement_entries.matched_invoice_id` only
+    and never touches `public.vendor_bills`.
+    """
+    try:
+        uid = UUID(bill_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(400, f"Invalid bill_id: {bill_id!r}")
+
+    bank_entry_id: str | None = None
+    if body.bank_statement_entry_id:
+        try:
+            bank_entry_id = str(UUID(body.bank_statement_entry_id))
+        except (ValueError, AttributeError):
+            raise HTTPException(
+                400, f"Invalid bank_statement_entry_id: {body.bank_statement_entry_id!r}"
+            )
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, payment_status
+                   FROM public.vendor_bills
+                   WHERE id = %s
+                     AND review_status = 'confirmed'
+                   FOR UPDATE""",
+                (str(uid),),
+            )
+            bill = cur.fetchone()
+            if not bill:
+                raise HTTPException(404, "Bill not found or not confirmed")
+
+            payment_status = bill[1]
+            if payment_status not in LINKABLE_STATUSES:
+                raise HTTPException(
+                    400,
+                    "Only a bill already marked paid or credit_card can be linked; "
+                    f"this bill is {payment_status!r}",
+                )
+
+            if bank_entry_id is None:
+                cur.execute(
+                    """UPDATE public.bank_statement_entries
+                       SET matched_invoice_id = NULL
+                       WHERE matched_invoice_id = %s""",
+                    (str(uid),),
+                )
+            else:
+                cur.execute(
+                    """SELECT id, direction, matched_invoice_id
+                       FROM public.bank_statement_entries
+                       WHERE id = %s
+                       FOR UPDATE""",
+                    (bank_entry_id,),
+                )
+                bank_row = cur.fetchone()
+                if not bank_row:
+                    raise HTTPException(404, "Bank statement entry not found")
+
+                _bank_id, direction, matched_invoice_id = bank_row
+                if direction != "expense":
+                    raise HTTPException(400, "bank_statement_entry_id must be an expense row")
+                if matched_invoice_id and str(matched_invoice_id) != str(uid):
+                    raise HTTPException(409, "Bank statement entry is already linked to another bill")
+
+                # Keep one bill to at most one bank row, matching the PATCH route.
+                cur.execute(
+                    """UPDATE public.bank_statement_entries
+                       SET matched_invoice_id = NULL
+                       WHERE matched_invoice_id = %s
+                         AND id <> %s""",
+                    (str(uid), bank_entry_id),
+                )
+                cur.execute(
+                    """UPDATE public.bank_statement_entries
+                       SET matched_invoice_id = %s
+                       WHERE id = %s""",
+                    (str(uid), bank_entry_id),
+                )
+            conn.commit()
+            return {
+                "bill_id": str(uid),
+                "payment_status": payment_status,
+                "bank_statement_entry_id": bank_entry_id,
+            }
     except Exception:
         conn.rollback()
         raise
