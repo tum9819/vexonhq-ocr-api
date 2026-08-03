@@ -429,6 +429,30 @@ def test_bank_link_locks_both_rows_before_writing(monkeypatch):
     assert "public.bank_statement_entries" in locks[1]
 
 
+def test_moving_a_bill_locks_both_transfers_in_id_order(monkeypatch):
+    """Two admins swapping bills between the same pair of transfers must not
+    deadlock, so every call locks the transfers it touches in sorted id order.
+    Here the previous transfer sorts AFTER the target one."""
+    later_entry = "99999999-9999-9999-9999-999999999999"
+    cursor = LinkCursor([
+        (UUID(BILL_ID), "paid"),
+        (later_entry,),
+        (UUID(BANK_ID), "expense"),   # BANK_ID starts with 2, so it locks first
+        (UUID(later_entry), "expense"),
+    ])
+    conn = FakeConn(cursor)
+    monkeypatch.setattr(routes, "get_db_conn", lambda: conn)
+
+    routes.link_bill_bank_entry(
+        BILL_ID, routes.BillBankLink(bank_statement_entry_id=BANK_ID), ADMIN)
+
+    bank_locks = [p[0] for s, p in cursor.queries
+                  if "FOR UPDATE" in s and "public.bank_statement_entries" in s]
+    assert bank_locks == sorted([BANK_ID, later_entry])
+    # Mirrors are refreshed in that same stable order.
+    assert _mirror_targets(cursor) == sorted([BANK_ID, later_entry])
+
+
 def test_mirror_query_picks_the_earliest_link():
     cursor = LinkCursor([])
     routes._refresh_bank_entry_mirror(cursor, BANK_ID)

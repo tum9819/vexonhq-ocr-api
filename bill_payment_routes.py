@@ -397,18 +397,30 @@ def link_bill_bank_entry(
             previous = cur.fetchone()
             previous_entry_id = previous[0] if previous else None
 
-            if bank_entry_id is not None:
+            # Lock EVERY transfer this call can touch, always in the same id
+            # order. Moving a bill rewrites the mirror on both the old and the
+            # new transfer, so two admins swapping bills between the same pair
+            # would otherwise grab those rows in opposite order and deadlock.
+            touched_entries = sorted(
+                {e for e in (previous_entry_id, bank_entry_id) if e}
+            )
+            directions: dict[str, str] = {}
+            for entry_id in touched_entries:
                 cur.execute(
                     """SELECT id, direction
                        FROM public.bank_statement_entries
                        WHERE id = %s
                        FOR UPDATE""",
-                    (bank_entry_id,),
+                    (entry_id,),
                 )
-                bank_row = cur.fetchone()
-                if not bank_row:
+                row = cur.fetchone()
+                if row:
+                    directions[entry_id] = row[1]
+
+            if bank_entry_id is not None:
+                if bank_entry_id not in directions:
                     raise HTTPException(404, "Bank statement entry not found")
-                if bank_row[1] != "expense":
+                if directions[bank_entry_id] != "expense":
                     raise HTTPException(400, "bank_statement_entry_id must be an expense row")
 
             # A bill has at most one transfer, so drop whatever it had first.
@@ -425,7 +437,8 @@ def link_bill_bank_entry(
                     (bank_entry_id, str(uid), _admin.get("sub")),
                 )
 
-            for entry_id in {e for e in (previous_entry_id, bank_entry_id) if e}:
+            # Same stable order as the locks above.
+            for entry_id in touched_entries:
                 _refresh_bank_entry_mirror(cur, entry_id)
 
             conn.commit()
