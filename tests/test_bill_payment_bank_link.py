@@ -481,8 +481,35 @@ def test_combined_candidates_expose_remaining_and_exclude_this_bill(monkeypatch)
 
     sql = _sqls(cursor)[-1]
     assert "l.vendor_bill_id <> %s" in sql
-    assert "COALESCE(alloc.bill_count, 0) > 0" in sql
     assert "b.direction = 'expense'" in sql
+
+
+def test_combined_candidates_also_offer_a_transfer_with_no_links_yet(monkeypatch):
+    """Regression: the FIRST bill of a combined group must be attachable.
+
+    The 21,729.99 invoice is too small to match the 27,039.97 transfer exactly
+    and that transfer has no links yet, so if the combined list required
+    bill_count > 0 neither list would show it and no group could ever start.
+    """
+    cursor = CandCursor([
+        (date(2025, 10, 24), 21729.99),
+        [],
+        [(UUID(BANK_ID), date(2025, 11, 4), "transfer to SINGHA", 27039.97,
+          27039.97, 27039.97, 0, 0)],
+    ])
+    conn = FakeConn(cursor)
+    monkeypatch.setattr(routes, "get_db_conn", lambda: conn)
+
+    result = routes.bank_candidates_for_bill(BILL_ID, ADMIN)
+
+    assert [c["id"] for c in result["combined_candidates"]] == [BANK_ID]
+    assert result["combined_candidates"][0]["linked_bill_count"] == 0
+
+    sql = _sqls(cursor)[-1]
+    assert "COALESCE(alloc.bill_count, 0) > 0" not in sql
+    # An untouched transfer of the same amount belongs to the exact list only.
+    assert "abs(b.amount - %s) <= 1" in sql
+    assert "b.matched_invoice_id IS NULL" in sql
 
 
 def test_combined_candidates_are_additive_and_leave_the_exact_list_alone(monkeypatch):

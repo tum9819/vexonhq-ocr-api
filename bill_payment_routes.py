@@ -478,9 +478,13 @@ def bank_candidates_for_bill(bill_id: str, _admin: dict = Depends(_require_admin
             )
             candidates = _rows_to_dicts(cur)
 
-            # Additive: transfers that already carry other bills but still have
-            # enough unallocated money left for this one. This is how a single
-            # supplier transfer that settles several invoices gets found.
+            # Additive: transfers with enough unallocated money left for this
+            # bill. This is how a single supplier transfer that settles several
+            # invoices gets found. It must also cover a transfer that has NO
+            # links yet, otherwise the FIRST bill of a combined group could
+            # never be attached and the feature would be unusable. Rows that
+            # the exact-amount list above already offers are excluded so the
+            # two lists never show the same transfer twice.
             cur.execute(
                 """SELECT b.id, b.txn_date, b.description, b.debit, b.amount,
                           (b.amount - COALESCE(alloc.allocated, 0)) AS remaining,
@@ -497,11 +501,18 @@ def bank_candidates_for_bill(bill_id: str, _admin: dict = Depends(_require_admin
                    WHERE b.direction = 'expense'
                      AND b.txn_date >= %s
                      AND b.txn_date <= %s
-                     AND COALESCE(alloc.bill_count, 0) > 0
                      AND (b.amount - COALESCE(alloc.allocated, 0)) >= %s - 1
+                     AND NOT (
+                         COALESCE(alloc.bill_count, 0) = 0
+                         AND b.matched_invoice_id IS NULL
+                         AND abs(b.amount - %s) <= 1
+                     )
                    ORDER BY abs((b.amount - COALESCE(alloc.allocated, 0)) - %s), b.txn_date
                    LIMIT 20""",
-                (str(uid), bill_date, bill_date + timedelta(days=30), amount, amount),
+                (
+                    str(uid), bill_date, bill_date + timedelta(days=30),
+                    amount, amount, amount,
+                ),
             )
             combined = _rows_to_dicts(cur)
 
