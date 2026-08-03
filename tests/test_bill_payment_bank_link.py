@@ -196,6 +196,8 @@ def test_bank_candidates_return_only_unmatched_matching_expense_rows(monkeypatch
         [
             (UUID(BANK_ID), date(2026, 7, 5), "โอน Supplier", 1234.0, 1234.0),
         ],
+        # The combined-transfer list runs after the exact-amount list.
+        [],
     ])
     conn = FakeConn(cursor)
     monkeypatch.setattr(routes, "get_db_conn", lambda: conn)
@@ -205,7 +207,8 @@ def test_bank_candidates_return_only_unmatched_matching_expense_rows(monkeypatch
     assert result["bill_id"] == BILL_ID
     assert len(result["candidates"]) == 1
     assert result["candidates"][0]["id"] == BANK_ID
-    sql = " ".join(cursor.queries[-1][0].split())
+    # Index 1 is the exact-amount query; index 2 is the additive combined query.
+    sql = " ".join(cursor.queries[1][0].split())
     assert "direction = 'expense'" in sql
     assert "matched_invoice_id IS NULL" in sql
     assert "amount = %s" in sql
@@ -215,7 +218,9 @@ def test_bank_candidates_return_only_unmatched_matching_expense_rows(monkeypatch
 
 # ─────────────────────────────────────────────────────────
 # PUT /bills/payment/{bill_id}/bank-link
-# Links an ALREADY-paid bill without touching vendor_bills.
+#
+# Writes public.bank_entry_bill_links only — never public.vendor_bills.
+# One transfer may settle several bills; one bill has at most one transfer.
 # ─────────────────────────────────────────────────────────
 
 
@@ -225,124 +230,137 @@ class LinkCursor(FakeCursor):
         compact = " ".join(sql.split()).upper()
         if compact.startswith("SELECT ID, PAYMENT_STATUS"):
             self.description = [("id",), ("payment_status",)]
-        elif compact.startswith("SELECT ID, DIRECTION, MATCHED_INVOICE_ID"):
-            self.description = [("id",), ("direction",), ("matched_invoice_id",)]
+        elif compact.startswith("SELECT BANK_ENTRY_ID"):
+            self.description = [("bank_entry_id",)]
+        elif compact.startswith("SELECT ID, DIRECTION"):
+            self.description = [("id",), ("direction",)]
         else:
             self.description = None
 
 
+def _sqls(cursor):
+    return [" ".join(s.split()) for s, _ in cursor.queries]
+
+
 def _vendor_bill_writes(cursor):
-    return [
-        sql for sql, _ in cursor.queries
-        if "UPDATE PUBLIC.VENDOR_BILLS" in " ".join(sql.split()).upper()
-    ]
+    return [s for s in _sqls(cursor) if s.upper().startswith("UPDATE PUBLIC.VENDOR_BILLS")]
 
 
-def test_bank_link_sets_match_without_touching_vendor_bills(monkeypatch):
-    cursor = LinkCursor([
-        (UUID(BILL_ID), "paid"),
-        (UUID(BANK_ID), "expense", None),
-    ])
+def _mirror_targets(cursor):
+    return [p[0] for s, p in cursor.queries if "SET matched_invoice_id = (" in s]
+
+
+ADMIN = {"_role": "admin", "sub": "admin-uid"}
+OTHER_ENTRY_ID = "44444444-4444-4444-4444-444444444444"
+
+
+def test_bank_link_writes_link_row_and_never_touches_vendor_bills(monkeypatch):
+    cursor = LinkCursor([(UUID(BILL_ID), "paid"), None, (UUID(BANK_ID), "expense")])
     conn = FakeConn(cursor)
     monkeypatch.setattr(routes, "get_db_conn", lambda: conn)
 
     result = routes.link_bill_bank_entry(
-        BILL_ID,
-        routes.BillBankLink(bank_statement_entry_id=BANK_ID),
-        {"_role": "admin"},
-    )
+        BILL_ID, routes.BillBankLink(bank_statement_entry_id=BANK_ID), ADMIN)
 
-    assert result["bill_id"] == BILL_ID
-    assert result["bank_statement_entry_id"] == BANK_ID
-    assert result["payment_status"] == "paid"
+    assert result == {"bill_id": BILL_ID, "payment_status": "paid",
+                      "bank_statement_entry_id": BANK_ID}
     assert conn.commits == 1
-    # paid_date and payment_status must be untouched by construction.
     assert _vendor_bill_writes(cursor) == []
-    sets = [
-        (sql, params) for sql, params in cursor.queries
-        if "SET matched_invoice_id = %s" in sql
-    ]
-    assert len(sets) == 1
-    assert sets[0][1] == (BILL_ID, BANK_ID)
+    inserts = [p for s, p in cursor.queries
+               if "INSERT INTO public.bank_entry_bill_links" in s]
+    assert inserts == [(BANK_ID, BILL_ID, "admin-uid")]
 
 
-def test_bank_link_clears_other_rows_pointing_at_the_same_bill(monkeypatch):
+def test_second_bill_may_join_a_transfer_that_already_carries_bills(monkeypatch):
+    """The old 409 is gone on purpose: a transfer can settle several invoices."""
+    cursor = LinkCursor([(UUID(BILL_ID), "paid"), None, (UUID(BANK_ID), "expense")])
+    conn = FakeConn(cursor)
+    monkeypatch.setattr(routes, "get_db_conn", lambda: conn)
+
+    routes.link_bill_bank_entry(
+        BILL_ID, routes.BillBankLink(bank_statement_entry_id=BANK_ID), ADMIN)
+
+    assert conn.commits == 1
+    assert not any("already linked to another bill" in s for s in _sqls(cursor))
+
+
+def test_moving_a_bill_refreshes_the_old_and_the_new_transfer_mirror(monkeypatch):
     cursor = LinkCursor([
-        (UUID(BILL_ID), "credit_card"),
-        (UUID(BANK_ID), "expense", None),
+        (UUID(BILL_ID), "paid"),
+        (OTHER_ENTRY_ID,),
+        (UUID(BANK_ID), "expense"),
     ])
     conn = FakeConn(cursor)
     monkeypatch.setattr(routes, "get_db_conn", lambda: conn)
 
     routes.link_bill_bank_entry(
-        BILL_ID,
-        routes.BillBankLink(bank_statement_entry_id=BANK_ID),
-        {"_role": "admin"},
-    )
+        BILL_ID, routes.BillBankLink(bank_statement_entry_id=BANK_ID), ADMIN)
 
-    clears = [
-        (sql, params) for sql, params in cursor.queries
-        if "SET matched_invoice_id = NULL" in sql
-    ]
-    assert len(clears) == 1
-    assert clears[0][1] == (BILL_ID, BANK_ID)
+    assert [p for s, p in cursor.queries
+            if "DELETE FROM public.bank_entry_bill_links" in s] == [(BILL_ID,)]
+    assert set(_mirror_targets(cursor)) == {OTHER_ENTRY_ID, BANK_ID}
 
 
-def test_bank_link_is_idempotent_when_row_already_points_at_this_bill(monkeypatch):
+def test_relinking_to_the_same_transfer_is_idempotent(monkeypatch):
     cursor = LinkCursor([
         (UUID(BILL_ID), "paid"),
-        (UUID(BANK_ID), "expense", UUID(BILL_ID)),
+        (BANK_ID,),
+        (UUID(BANK_ID), "expense"),
     ])
     conn = FakeConn(cursor)
     monkeypatch.setattr(routes, "get_db_conn", lambda: conn)
 
     result = routes.link_bill_bank_entry(
-        BILL_ID,
-        routes.BillBankLink(bank_statement_entry_id=BANK_ID),
-        {"_role": "admin"},
-    )
+        BILL_ID, routes.BillBankLink(bank_statement_entry_id=BANK_ID), ADMIN)
 
     assert result["bank_statement_entry_id"] == BANK_ID
+    assert _mirror_targets(cursor) == [BANK_ID]
     assert conn.commits == 1
 
 
-def test_bank_link_rejects_row_matched_to_another_bill(monkeypatch):
-    cursor = LinkCursor([
-        (UUID(BILL_ID), "paid"),
-        (UUID(BANK_ID), "expense", UUID(OTHER_BILL_ID)),
-    ])
+def test_unlink_deletes_the_row_and_refreshes_only_that_transfer(monkeypatch):
+    cursor = LinkCursor([(UUID(BILL_ID), "paid"), (BANK_ID,)])
     conn = FakeConn(cursor)
     monkeypatch.setattr(routes, "get_db_conn", lambda: conn)
 
-    with pytest.raises(HTTPException) as exc:
-        routes.link_bill_bank_entry(
-            BILL_ID,
-            routes.BillBankLink(bank_statement_entry_id=BANK_ID),
-            {"_role": "admin"},
-        )
+    result = routes.link_bill_bank_entry(
+        BILL_ID, routes.BillBankLink(bank_statement_entry_id=None), ADMIN)
 
-    assert exc.value.status_code == 409
-    assert conn.commits == 0
-    assert conn.rollbacks == 1
+    assert result["bank_statement_entry_id"] is None
+    assert [p for s, p in cursor.queries
+            if "DELETE FROM public.bank_entry_bill_links" in s] == [(BILL_ID,)]
+    assert _mirror_targets(cursor) == [BANK_ID]
+    assert _vendor_bill_writes(cursor) == []
+    assert conn.commits == 1
+
+
+def test_unlink_on_an_already_unlinked_bill_touches_no_mirror(monkeypatch):
+    cursor = LinkCursor([(UUID(BILL_ID), "paid"), None])
+    conn = FakeConn(cursor)
+    monkeypatch.setattr(routes, "get_db_conn", lambda: conn)
+
+    routes.link_bill_bank_entry(
+        BILL_ID, routes.BillBankLink(bank_statement_entry_id=None), ADMIN)
+
+    assert _mirror_targets(cursor) == []
+    assert conn.commits == 1
 
 
 def test_bank_link_rejects_income_row(monkeypatch):
-    cursor = LinkCursor([
-        (UUID(BILL_ID), "paid"),
-        (UUID(BANK_ID), "income", None),
-    ])
+    cursor = LinkCursor([(UUID(BILL_ID), "paid"), None, (UUID(BANK_ID), "income")])
     conn = FakeConn(cursor)
     monkeypatch.setattr(routes, "get_db_conn", lambda: conn)
 
     with pytest.raises(HTTPException) as exc:
         routes.link_bill_bank_entry(
-            BILL_ID,
-            routes.BillBankLink(bank_statement_entry_id=BANK_ID),
-            {"_role": "admin"},
-        )
+            BILL_ID, routes.BillBankLink(bank_statement_entry_id=BANK_ID), ADMIN)
 
     assert exc.value.status_code == 400
     assert conn.commits == 0
+    assert conn.rollbacks == 1
+    # Nothing may be written before the direction check passes.
+    assert not any("INSERT INTO public.bank_entry_bill_links" in s for s in _sqls(cursor))
+    assert not any("DELETE FROM public.bank_entry_bill_links" in s for s in _sqls(cursor))
 
 
 def test_bank_link_rejects_unpaid_bill(monkeypatch):
@@ -352,10 +370,7 @@ def test_bank_link_rejects_unpaid_bill(monkeypatch):
 
     with pytest.raises(HTTPException) as exc:
         routes.link_bill_bank_entry(
-            BILL_ID,
-            routes.BillBankLink(bank_statement_entry_id=BANK_ID),
-            {"_role": "admin"},
-        )
+            BILL_ID, routes.BillBankLink(bank_statement_entry_id=BANK_ID), ADMIN)
 
     assert exc.value.status_code == 400
     assert conn.commits == 0
@@ -368,120 +383,121 @@ def test_bank_link_404_when_bill_missing_or_not_confirmed(monkeypatch):
 
     with pytest.raises(HTTPException) as exc:
         routes.link_bill_bank_entry(
-            BILL_ID,
-            routes.BillBankLink(bank_statement_entry_id=BANK_ID),
-            {"_role": "admin"},
-        )
+            BILL_ID, routes.BillBankLink(bank_statement_entry_id=BANK_ID), ADMIN)
 
     assert exc.value.status_code == 404
     assert conn.commits == 0
 
 
 def test_bank_link_404_when_bank_row_missing(monkeypatch):
-    cursor = LinkCursor([(UUID(BILL_ID), "paid"), None])
+    cursor = LinkCursor([(UUID(BILL_ID), "paid"), None, None])
     conn = FakeConn(cursor)
     monkeypatch.setattr(routes, "get_db_conn", lambda: conn)
 
     with pytest.raises(HTTPException) as exc:
         routes.link_bill_bank_entry(
-            BILL_ID,
-            routes.BillBankLink(bank_statement_entry_id=BANK_ID),
-            {"_role": "admin"},
-        )
+            BILL_ID, routes.BillBankLink(bank_statement_entry_id=BANK_ID), ADMIN)
 
     assert exc.value.status_code == 404
     assert conn.commits == 0
 
 
-def test_bank_link_null_unlinks_only_this_bill(monkeypatch):
-    cursor = LinkCursor([(UUID(BILL_ID), "paid")])
-    conn = FakeConn(cursor)
-    monkeypatch.setattr(routes, "get_db_conn", lambda: conn)
-
-    result = routes.link_bill_bank_entry(
-        BILL_ID,
-        routes.BillBankLink(bank_statement_entry_id=None),
-        {"_role": "admin"},
-    )
-
-    assert result["bank_statement_entry_id"] is None
-    clears = [
-        (sql, params) for sql, params in cursor.queries
-        if "SET matched_invoice_id = NULL" in sql
-    ]
-    assert len(clears) == 1
-    assert clears[0][1] == (BILL_ID,)
-    assert _vendor_bill_writes(cursor) == []
-    assert conn.commits == 1
-
-
 def test_bank_link_rejects_malformed_ids(monkeypatch):
-    monkeypatch.setattr(routes, "get_db_conn", lambda: pytest.fail("must not open a connection"))
+    monkeypatch.setattr(routes, "get_db_conn",
+                        lambda: pytest.fail("must not open a connection"))
 
-    with pytest.raises(HTTPException) as exc:
-        routes.link_bill_bank_entry(
-            "not-a-uuid",
-            routes.BillBankLink(bank_statement_entry_id=BANK_ID),
-            {"_role": "admin"},
-        )
-    assert exc.value.status_code == 400
-
-    with pytest.raises(HTTPException) as exc:
-        routes.link_bill_bank_entry(
-            BILL_ID,
-            routes.BillBankLink(bank_statement_entry_id="nope"),
-            {"_role": "admin"},
-        )
-    assert exc.value.status_code == 400
+    for bill, bank in (("not-a-uuid", BANK_ID), (BILL_ID, "nope")):
+        with pytest.raises(HTTPException) as exc:
+            routes.link_bill_bank_entry(
+                bill, routes.BillBankLink(bank_statement_entry_id=bank), ADMIN)
+        assert exc.value.status_code == 400
 
 
-def test_bank_link_row_is_locked_for_update(monkeypatch):
-    cursor = LinkCursor([
-        (UUID(BILL_ID), "paid"),
-        (UUID(BANK_ID), "expense", None),
-    ])
+def test_bank_link_locks_both_rows_before_writing(monkeypatch):
+    cursor = LinkCursor([(UUID(BILL_ID), "paid"), None, (UUID(BANK_ID), "expense")])
     conn = FakeConn(cursor)
     monkeypatch.setattr(routes, "get_db_conn", lambda: conn)
 
     routes.link_bill_bank_entry(
-        BILL_ID,
-        routes.BillBankLink(bank_statement_entry_id=BANK_ID),
-        {"_role": "admin"},
-    )
+        BILL_ID, routes.BillBankLink(bank_statement_entry_id=BANK_ID), ADMIN)
 
-    selects = [
-        " ".join(sql.split()) for sql, _ in cursor.queries
-        if "FROM public.bank_statement_entries" in sql and sql.lstrip().upper().startswith("SELECT")
-    ]
-    assert any("FOR UPDATE" in sql for sql in selects)
+    locks = [s for s in _sqls(cursor) if "FOR UPDATE" in s]
+    assert len(locks) == 2
+    # vendor_bills is locked first, exactly like update_bill_payment, so the two
+    # routes can never deadlock against each other.
+    assert "public.vendor_bills" in locks[0]
+    assert "public.bank_statement_entries" in locks[1]
 
 
-def test_list_bills_exposes_existing_bank_link(monkeypatch):
-    class ListCursor(FakeCursor):
-        def execute(self, sql, params=None):
-            self.queries.append((sql, params))
-            self.description = [
-                ("id",), ("vendor_name",), ("invoice_no",), ("bill_date",),
-                ("due_date",), ("amount",), ("category_code",), ("category_name",),
-                ("payment_status",), ("paid_date",), ("review_status",), ("notes",),
-                ("bank_statement_entry_id",),
-            ]
+def test_mirror_query_picks_the_earliest_link():
+    cursor = LinkCursor([])
+    routes._refresh_bank_entry_mirror(cursor, BANK_ID)
+    sql = _sqls(cursor)[0]
+    assert "ORDER BY l.created_at, l.id" in sql
+    assert "LIMIT 1" in sql
+    assert cursor.queries[0][1] == (BANK_ID, BANK_ID)
 
-    cursor = ListCursor([[
-        (UUID(BILL_ID), "Vendor A", "INV-1", date(2026, 5, 4), None, 1234.0,
-         "food_raw", "วัตถุดิบ", "paid", date(2026, 5, 6), "confirmed", None, BANK_ID),
-        (UUID(OTHER_BILL_ID), "Vendor B", "INV-2", date(2026, 5, 5), None, 50.0,
-         "food_raw", "วัตถุดิบ", "paid", date(2026, 5, 7), "confirmed", None, None),
-    ]])
+
+# ─────────────────────────────────────────────────────────
+# GET /bills/payment/{bill_id}/bank-candidates — combined transfers
+# ─────────────────────────────────────────────────────────
+
+
+class CandCursor(FakeCursor):
+    def execute(self, sql, params=None):
+        self.queries.append((sql, params))
+        c = " ".join(sql.split()).upper()
+        if c.startswith("SELECT BILL_DATE, AMOUNT"):
+            self.description = [("bill_date",), ("amount",)]
+        elif "REMAINING" in c:
+            self.description = [("id",), ("txn_date",), ("description",), ("debit",),
+                                ("amount",), ("remaining",), ("allocated",),
+                                ("linked_bill_count",)]
+        else:
+            self.description = [("id",), ("txn_date",), ("description",),
+                                ("debit",), ("amount",)]
+
+
+def test_combined_candidates_expose_remaining_and_exclude_this_bill(monkeypatch):
+    """Real production shape: the 2025-11-04 transfer of 27,039.97 already holds
+    the 5,309.98 invoice, so 21,729.99 is still free for the second one."""
+    cursor = CandCursor([
+        (date(2025, 10, 24), 21729.99),
+        [],
+        [(UUID(BANK_ID), date(2025, 11, 4), "transfer to SINGHA", 27039.97,
+          27039.97, 21729.99, 5309.98, 1)],
+    ])
     conn = FakeConn(cursor)
     monkeypatch.setattr(routes, "get_db_conn", lambda: conn)
 
-    # Called directly, so FastAPI Query defaults must be supplied explicitly.
-    result = routes.list_bills_payment(
-        month="2026-05", status=None, vendor=None, branch=routes.DEFAULT_BRANCH
-    )
+    result = routes.bank_candidates_for_bill(BILL_ID, ADMIN)
 
-    assert [b["bank_statement_entry_id"] for b in result["bills"]] == [BANK_ID, None]
-    sql = " ".join(cursor.queries[0][0].split())
-    assert "AS bank_statement_entry_id" in sql
-    assert "b.matched_invoice_id = vb.id" in sql
+    assert result["candidates"] == []
+    assert len(result["combined_candidates"]) == 1
+    combined = result["combined_candidates"][0]
+    assert combined["remaining"] == 21729.99
+    assert combined["allocated"] == 5309.98
+    assert combined["linked_bill_count"] == 1
+
+    sql = _sqls(cursor)[-1]
+    assert "l.vendor_bill_id <> %s" in sql
+    assert "COALESCE(alloc.bill_count, 0) > 0" in sql
+    assert "b.direction = 'expense'" in sql
+
+
+def test_combined_candidates_are_additive_and_leave_the_exact_list_alone(monkeypatch):
+    cursor = CandCursor([
+        (date(2026, 7, 1), 1234.0),
+        [(UUID(BANK_ID), date(2026, 7, 5), "transfer to Supplier", 1234.0, 1234.0)],
+        [],
+    ])
+    conn = FakeConn(cursor)
+    monkeypatch.setattr(routes, "get_db_conn", lambda: conn)
+
+    result = routes.bank_candidates_for_bill(BILL_ID, ADMIN)
+
+    assert [c["id"] for c in result["candidates"]] == [BANK_ID]
+    assert result["combined_candidates"] == []
+    exact_sql = _sqls(cursor)[1]
+    assert "matched_invoice_id IS NULL" in exact_sql
+    assert "amount = %s" in exact_sql

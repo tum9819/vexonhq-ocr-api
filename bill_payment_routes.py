@@ -306,6 +306,28 @@ def update_bill_payment(bill_id: str, body: BillPaymentPatch, _admin: dict = Dep
 LINKABLE_STATUSES = ("paid", "credit_card")
 
 
+def _refresh_bank_entry_mirror(cur, bank_entry_id: str) -> None:
+    """Point the legacy `matched_invoice_id` at this transfer's first link.
+
+    `bank_entry_bill_links` is authoritative. The old single column stays in
+    sync with the earliest link so the export audit package, export readiness
+    and slip matching keep reading a valid bill, and it becomes NULL again once
+    the last link is removed.
+    """
+    cur.execute(
+        """UPDATE public.bank_statement_entries
+           SET matched_invoice_id = (
+               SELECT l.vendor_bill_id
+               FROM public.bank_entry_bill_links l
+               WHERE l.bank_entry_id = %s
+               ORDER BY l.created_at, l.id
+               LIMIT 1
+           )
+           WHERE id = %s""",
+        (bank_entry_id, bank_entry_id),
+    )
+
+
 @router.put("/bills/payment/{bill_id}/bank-link")
 def link_bill_bank_entry(
     bill_id: str,
@@ -317,8 +339,15 @@ def link_bill_bank_entry(
     PATCH /bills/payment/{id} can only link while the status is being CHANGED to
     paid/credit_card, so a bill that is already paid could never be linked
     afterwards. Re-running that PATCH would also rewrite paid_date to today.
-    This route therefore writes `bank_statement_entries.matched_invoice_id` only
-    and never touches `public.vendor_bills`.
+    This route therefore writes link rows only and never touches
+    `public.vendor_bills`.
+
+    One transfer may settle SEVERAL bills (verified in production: the
+    2025-11-04 transfer of 27,039.97 is exactly two SINGHA BEER invoices), so
+    the authoritative store is `public.bank_entry_bill_links`. A bill still has
+    at most one transfer. `bank_statement_entries.matched_invoice_id` is kept as
+    a mirror of the transfer's FIRST linked bill so every existing reader keeps
+    working unchanged.
     """
     try:
         uid = UUID(bill_id)
@@ -357,16 +386,20 @@ def link_bill_bank_entry(
                     f"this bill is {payment_status!r}",
                 )
 
-            if bank_entry_id is None:
+            # Remember the transfer this bill was on, so its mirror is refreshed
+            # too when the bill moves to a different transfer.
+            cur.execute(
+                """SELECT bank_entry_id::text
+                   FROM public.bank_entry_bill_links
+                   WHERE vendor_bill_id = %s""",
+                (str(uid),),
+            )
+            previous = cur.fetchone()
+            previous_entry_id = previous[0] if previous else None
+
+            if bank_entry_id is not None:
                 cur.execute(
-                    """UPDATE public.bank_statement_entries
-                       SET matched_invoice_id = NULL
-                       WHERE matched_invoice_id = %s""",
-                    (str(uid),),
-                )
-            else:
-                cur.execute(
-                    """SELECT id, direction, matched_invoice_id
+                    """SELECT id, direction
                        FROM public.bank_statement_entries
                        WHERE id = %s
                        FOR UPDATE""",
@@ -375,27 +408,26 @@ def link_bill_bank_entry(
                 bank_row = cur.fetchone()
                 if not bank_row:
                     raise HTTPException(404, "Bank statement entry not found")
-
-                _bank_id, direction, matched_invoice_id = bank_row
-                if direction != "expense":
+                if bank_row[1] != "expense":
                     raise HTTPException(400, "bank_statement_entry_id must be an expense row")
-                if matched_invoice_id and str(matched_invoice_id) != str(uid):
-                    raise HTTPException(409, "Bank statement entry is already linked to another bill")
 
-                # Keep one bill to at most one bank row, matching the PATCH route.
+            # A bill has at most one transfer, so drop whatever it had first.
+            cur.execute(
+                """DELETE FROM public.bank_entry_bill_links
+                   WHERE vendor_bill_id = %s""",
+                (str(uid),),
+            )
+            if bank_entry_id is not None:
                 cur.execute(
-                    """UPDATE public.bank_statement_entries
-                       SET matched_invoice_id = NULL
-                       WHERE matched_invoice_id = %s
-                         AND id <> %s""",
-                    (str(uid), bank_entry_id),
+                    """INSERT INTO public.bank_entry_bill_links
+                           (bank_entry_id, vendor_bill_id, created_by)
+                       VALUES (%s, %s, %s)""",
+                    (bank_entry_id, str(uid), _admin.get("sub")),
                 )
-                cur.execute(
-                    """UPDATE public.bank_statement_entries
-                       SET matched_invoice_id = %s
-                       WHERE id = %s""",
-                    (str(uid), bank_entry_id),
-                )
+
+            for entry_id in {e for e in (previous_entry_id, bank_entry_id) if e}:
+                _refresh_bank_entry_mirror(cur, entry_id)
+
             conn.commit()
             return {
                 "bill_id": str(uid),
@@ -445,11 +477,41 @@ def bank_candidates_for_bill(bill_id: str, _admin: dict = Depends(_require_admin
                 (amount, bill_date, bill_date + timedelta(days=30)),
             )
             candidates = _rows_to_dicts(cur)
+
+            # Additive: transfers that already carry other bills but still have
+            # enough unallocated money left for this one. This is how a single
+            # supplier transfer that settles several invoices gets found.
+            cur.execute(
+                """SELECT b.id, b.txn_date, b.description, b.debit, b.amount,
+                          (b.amount - COALESCE(alloc.allocated, 0)) AS remaining,
+                          COALESCE(alloc.allocated, 0) AS allocated,
+                          COALESCE(alloc.bill_count, 0) AS linked_bill_count
+                   FROM public.bank_statement_entries b
+                   LEFT JOIN LATERAL (
+                       SELECT SUM(vb.amount) AS allocated, COUNT(*) AS bill_count
+                       FROM public.bank_entry_bill_links l
+                       JOIN public.vendor_bills vb ON vb.id = l.vendor_bill_id
+                       WHERE l.bank_entry_id = b.id
+                         AND l.vendor_bill_id <> %s
+                   ) alloc ON TRUE
+                   WHERE b.direction = 'expense'
+                     AND b.txn_date >= %s
+                     AND b.txn_date <= %s
+                     AND COALESCE(alloc.bill_count, 0) > 0
+                     AND (b.amount - COALESCE(alloc.allocated, 0)) >= %s - 1
+                   ORDER BY abs((b.amount - COALESCE(alloc.allocated, 0)) - %s), b.txn_date
+                   LIMIT 20""",
+                (str(uid), bill_date, bill_date + timedelta(days=30), amount, amount),
+            )
+            combined = _rows_to_dicts(cur)
+
             return {
                 "bill_id": str(uid),
                 "bill_date": bill_date.isoformat() if isinstance(bill_date, date) else bill_date,
                 "amount": float(amount),
                 "candidates": candidates,
+                # Schema-additive; older clients ignore this key.
+                "combined_candidates": combined,
             }
     except Exception:
         conn.rollback()
