@@ -552,3 +552,50 @@ def test_combined_candidates_are_additive_and_leave_the_exact_list_alone(monkeyp
     exact_sql = _sqls(cursor)[1]
     assert "matched_invoice_id IS NULL" in exact_sql
     assert "amount = %s" in exact_sql
+
+
+# ─────────────────────────────────────────────────────────
+# GET /bills/payment — the per-row "is it linked" flag
+# ─────────────────────────────────────────────────────────
+
+
+def test_list_bills_reads_link_table_not_the_legacy_mirror(monkeypatch):
+    """Regression: a transfer that settles several bills mirrors only its FIRST
+    bill into bank_statement_entries.matched_invoice_id. Reading that mirror here
+    made every later bill of a combined transfer render as still unlinked, which
+    is exactly what production showed for SS 681107140 after group C was linked.
+    """
+
+    class ListCursor(FakeCursor):
+        def execute(self, sql, params=None):
+            self.queries.append((sql, params))
+            self.description = [
+                ("id",), ("vendor_name",), ("invoice_no",), ("bill_date",),
+                ("due_date",), ("amount",), ("category_code",), ("category_name",),
+                ("payment_status",), ("paid_date",), ("review_status",), ("notes",),
+                ("bank_statement_entry_id",),
+            ]
+
+    cursor = ListCursor([[
+        (UUID(BILL_ID), "SINGHA BEER CO., LTD.", "SS 681107063", date(2025, 11, 21),
+         None, 13759.99, "beverage_raw", "เครื่องดื่ม", "paid", date(2025, 11, 27),
+         "confirmed", None, BANK_ID),
+        # Second bill on the SAME transfer — must also report as linked.
+        (UUID(OTHER_BILL_ID), "SINGHA BEER CO., LTD.", "SS 681107140",
+         date(2025, 11, 21), None, 4609.99, "beverage_raw", "เครื่องดื่ม", "paid",
+         date(2025, 11, 27), "confirmed", None, BANK_ID),
+    ]])
+    conn = FakeConn(cursor)
+    monkeypatch.setattr(routes, "get_db_conn", lambda: conn)
+
+    result = routes.list_bills_payment(
+        month="2025-11", status=None, vendor=None, branch=routes.DEFAULT_BRANCH)
+
+    assert [b["bank_statement_entry_id"] for b in result["bills"]] == [BANK_ID, BANK_ID]
+
+    sql = " ".join(cursor.queries[0][0].split())
+    assert "AS bank_statement_entry_id" in sql
+    assert "FROM public.bank_entry_bill_links l" in sql
+    assert "l.vendor_bill_id = vb.id" in sql
+    # The legacy mirror must not be the source of this flag any more.
+    assert "b.matched_invoice_id = vb.id" not in sql

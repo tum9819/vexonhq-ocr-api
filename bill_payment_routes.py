@@ -154,11 +154,15 @@ def list_bills_payment(
                     vb.notes,
                     -- Additive field: lets the UI show which bills still need a
                     -- bank link. Older clients ignore it.
+                    -- Reads bank_entry_bill_links, NOT the legacy
+                    -- matched_invoice_id mirror: a transfer that settles several
+                    -- bills mirrors only its first one, so reading the mirror
+                    -- here would show every later bill of a combined transfer as
+                    -- unlinked.
                     (
-                        SELECT b.id::text
-                        FROM public.bank_statement_entries b
-                        WHERE b.matched_invoice_id = vb.id
-                        ORDER BY b.txn_date, b.id
+                        SELECT l.bank_entry_id::text
+                        FROM public.bank_entry_bill_links l
+                        WHERE l.vendor_bill_id = vb.id
                         LIMIT 1
                     ) AS bank_statement_entry_id
                 FROM public.vendor_bills vb
