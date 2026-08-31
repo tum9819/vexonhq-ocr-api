@@ -565,7 +565,7 @@ Then the nightly job (or `POST /slip/reconcile`) re-matches slips + pushes memo 
   fixed-authority `COALESCE` binding) was confirmed by both the reviewer and the
   local self-review. No other blocking finding.
 
-## Bill payment linked-flag correction — 2026-08-31 (reviewed, awaiting push)
+## Bill payment linked-flag correction — 2026-08-31 (shipped)
 
 ### Completed locally
 
@@ -584,14 +584,23 @@ Then the nightly job (or `POST /slip/reconcile`) re-matches slips + pushes memo 
   `origin/main...HEAD` range and returned `APPROVE`, no confirmed findings and
   no push blocker. The reviewer made no repository change.
 - Rollback tag `backup-pre-bill-link-flag-2026-08-31` points to pre-change
-  `origin/main` (`b5af368`). It remains local until TUM approves the push.
+  `origin/main` (`b5af368`) and was pushed before `main`.
 
-### Pending
+### Deployed and verified
 
-- TUM must explicitly approve the backend tag and `main` push.
-- After Coolify deploys, verify the exact live commit, `/health`,
-  `/health/deep`, settled shared-VPS CPU, and an authenticated
-  `GET /bills/payment` smoke before marking the fix shipped.
+- TUM explicitly approved `Confirm backend Commit + Push`. Backend `main` and
+  `origin/main` now point to docs closure commit `46fa408`, immediately after
+  the reviewed code commit `08cd34d`.
+- Coolify deployment `l6ibtjlu0f8tptydm0eg5x6m` deployed exact commit
+  `46fa408` successfully from 15:54:01 to 16:00:26 UTC (6m25s).
+- Post-deploy verification passed 618 offline tests with 2 skipped and all 71
+  live smoke tests. `/health` and `/health/deep` stayed healthy; PostgreSQL,
+  Supabase and the 16-job scheduler were healthy, and shared-VPS CPU settled to
+  0.0% after the build.
+- Authenticated production UI smoke on November 2025 showed both combined-link
+  bills `SS 681107063` (13,759.99) and `SS 681107140` (4,609.99) as
+  `ผูกรายการโอนแล้ว`. The authenticated page produced no console warning or
+  error.
 
 ### Kept out of scope
 
