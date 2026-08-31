@@ -564,3 +564,38 @@ Then the nightly job (or `POST /slip/reconcile`) re-matches slips + pushes memo 
   invoice ordering, print gating, schema-v2 backward compatibility, admin gate,
   fixed-authority `COALESCE` binding) was confirmed by both the reviewer and the
   local self-review. No other blocking finding.
+
+## Bill payment linked-flag correction — 2026-08-31 (reviewed, awaiting push)
+
+### Completed locally
+
+- Commit `08cd34d` changes only the additive `bank_statement_entry_id` field in
+  `GET /bills/payment`: it now reads the authoritative
+  `public.bank_entry_bill_links` table instead of the one-bill-only legacy
+  `bank_statement_entries.matched_invoice_id` mirror. This prevents later bills
+  in one combined transfer from being displayed as unlinked.
+- Production schema was checked read-only through `information_schema`: both
+  link columns are UUIDs. Production `EXPLAIN` used
+  `uq_bank_entry_bill_links_bill` for the new correlated lookup.
+- Regression proof is red/green: the new test fails against `origin/main`
+  `b5af368` and passes against `08cd34d`. Focused tests passed 23/23; the full
+  backend gate passed 618 with 2 skipped and no failures.
+- Local `review.ps1` found no issue. TUM's external audit inspected the exact
+  `origin/main...HEAD` range and returned `APPROVE`, no confirmed findings and
+  no push blocker. The reviewer made no repository change.
+- Rollback tag `backup-pre-bill-link-flag-2026-08-31` points to pre-change
+  `origin/main` (`b5af368`). It remains local until TUM approves the push.
+
+### Pending
+
+- TUM must explicitly approve the backend tag and `main` push.
+- After Coolify deploys, verify the exact live commit, `/health`,
+  `/health/deep`, settled shared-VPS CPU, and an authenticated
+  `GET /bills/payment` smoke before marking the fix shipped.
+
+### Kept out of scope
+
+- The signed-out `/api/auth/session` 307-versus-intended-401 behaviour remains a
+  separate auth-sensitive task and needs its own backup/review cycle.
+- `scripts/overwrite_menu_watermarks.py` remains untouched and untracked. Its
+  disposition is a separate decision after the production fix closes.
