@@ -35,11 +35,6 @@ TAX_EVIDENCE_CODES = COMMON_CODES + (
     "CREDIT_CARD_INVOICE_EVIDENCE",
     "IMAGE_URLS_PRESENT",
 )
-PND3_CODES = TAX_EVIDENCE_CODES + (
-    "TAX_PROFILE_PHASE_B",
-    "PND_RECIPIENT_ASSIGNMENTS_PHASE_B",
-)
-PND53_CODES = PND3_CODES
 SHAREHOLDER_CODES = COMMON_CODES + (
     "INVOICE_ATTACHMENT_EVIDENCE",
     "CREDIT_CARD_INVOICE_EVIDENCE",
@@ -114,7 +109,6 @@ def build_readiness(month: str, branch_code: str, facts: dict[str, Any]) -> dict
     invoice_evidence = facts["invoice_evidence"]
     credit_cards = facts["credit_cards"]
     image_url_failures = facts["image_url_failures"]
-    wht_candidates = facts.get("wht_candidates", {"count": 0, "amount": 0})
 
     reconciliation_verified = reconciliation["verified"] is True
     if reconciliation_verified:
@@ -242,22 +236,6 @@ def build_readiness(month: str, branch_code: str, facts: dict[str, Any]) -> dict
             None,
             {},
         ),
-        "TAX_PROFILE_PHASE_B": _rule(
-            "TAX_PROFILE_PHASE_B",
-            "action_required",
-            "Tax profile เริ่มใน Phase B",
-            1,
-            None,
-            {"availability": "phase_b"},
-        ),
-        "PND_RECIPIENT_ASSIGNMENTS_PHASE_B": _rule(
-            "PND_RECIPIENT_ASSIGNMENTS_PHASE_B",
-            "action_required",
-            "การกำหนดผู้รับ ภ.ง.ด. เริ่มใน Phase B",
-            wht_candidates["count"],
-            wht_candidates["amount"],
-            {"availability": "phase_b"},
-        ),
         "SHAREHOLDER_PREVIEW_PHASE_C": _rule(
             "SHAREHOLDER_PREVIEW_PHASE_C",
             "action_required",
@@ -313,8 +291,18 @@ def build_readiness(month: str, branch_code: str, facts: dict[str, Any]) -> dict
         "packages": {
             "common_accounting": package(COMMON_CODES),
             "tax_evidence": package(TAX_EVIDENCE_CODES),
-            "pnd3": package(PND3_CODES, "phase_b"),
-            "pnd53": package(PND53_CODES, "phase_b"),
+            # Schema-v1 compatibility: retain the historic keys, but never expose
+            # P.N.D. as pending work or as a generated filing package.
+            "pnd3": {
+                "status": "preview_only",
+                "availability": "decommissioned",
+                "rules": [],
+            },
+            "pnd53": {
+                "status": "preview_only",
+                "availability": "decommissioned",
+                "rules": [],
+            },
             "shareholder": package(SHAREHOLDER_CODES, "phase_c"),
         },
     }

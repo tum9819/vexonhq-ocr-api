@@ -74,7 +74,7 @@ All routers are registered in `main.py`. 38 routers, 150+ endpoints (OpenAPI-doc
 | stock_router | stock_routes.py | /stock | POS stock snapshots + LINE alerts |
 | recipe_router / ingredient_router | recipe_routes.py | /recipes, /ingredients | Recipe + ingredient cost engine |
 | menu_public_router | menu_public_routes.py | /menu/public | Public menu API (no auth) |
-| tax_router | tax_routes.py | /tax | WHT tax calculation |
+| tax_router | tax_routes.py | /tax | Retired WHT compatibility routes (HTTP 410) |
 | alerts_router | alerts_webhook_routes.py | /alerts | Uptime Robot → Telegram/Discord webhooks |
 | discord_router | discord_routes.py | /discord | Discord interaction handlers |
 | do_snapshot_router | do_snapshot_routes.py | /snapshots | DigitalOcean snapshot rotation |
@@ -178,7 +178,7 @@ All routers are registered in `main.py`. 38 routers, 150+ endpoints (OpenAPI-doc
 - Every P&L query over `v_daybook` must exclude `source IN ('owner_capital','owner_advance','transfer_error')`.
 - Never set `source_type='bank_statement'` on an expense row (it's on the P&L exclusion list — silently drops the expense from profit calculations); if a bank entry is matched to a vendor bill via 3-way match, use the bill's category instead.
 - POS field mapping must use the canonical Thai-column-name lookup (`r.get("<name>")` via `_CANONICAL_COLS`), never positional `iloc` — FoodStory has reordered export columns before.
-- WHT tax gross-vs-net formula must be verified against real invoices/accountant input — never assumed.
+- WHT/P.N.D. was decommissioned on 2026-09-01 because the system has no actual-withheld/remitted state. Never infer withholding from an expense category; VAT remains unchanged.
 - `create_token()` and `verify_token()` (JWT) must stay in lockstep — `verify_token()` must accept both `JWT_SECRET` (self-issued) and `SUPABASE_JWT_SECRET` (SSO) since both token types are valid.
 
 ---
@@ -221,7 +221,7 @@ All routers are registered in `main.py`. 38 routers, 150+ endpoints (OpenAPI-doc
 | OPS-12: pin `requirements.txt` | 🟡 Ops | Needs TUM to paste the container's `pip freeze` output |
 | SEC-1b: `AI_EXEC_ALLOWED_IPS` | 🟡 Security | Needs to be set in Coolify to finish locking down `/ai/exec` |
 | Vendor name consolidation | 🟢 Low | 5 groups with spelling variants (SINGHA, BB Superstore, WEALIMEX, CP Extra, ขายส่ง) — blocked on a unique constraint on (vendor_name, invoice_no); needs manual per-invoice review |
-| WHT tax gross/net formula (PNL-3) | 🟡 Medium | Needs accountant/invoice verification before trusting the current formula |
+| WHT/P.N.D. workflow | 🟡 Pending deploy | Decommissioned locally; legacy endpoints return HTTP 410 after deployment |
 | DB latency (~590ms) | 🟢 Optional | Could improve with in-process connection pooling; low priority |
 
 ---

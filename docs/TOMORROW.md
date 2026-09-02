@@ -1,11 +1,37 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-07-29 (Export Center Phase A implemented locally; not pushed)
+**Last updated**: 2026-09-02 (WHT/P.N.D. external audit approved; not pushed)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
 
 ---
+
+## 🟡 WHT/P.N.D. decommission — push approval pending
+
+- TUM confirmed the restaurant pays musician fees and THB 8,000 rent in full,
+  has no actual-withheld/remitted state in VEXONHQ, and has not remitted WHT
+  through this workflow. VAT and invoice VAT remain unchanged.
+- Local rollback tag `backup-pre-wht-decommission-2026-09-01` points to backend
+  `b3c146a`; the matching frontend tag points to `f987381`. Neither is pushed.
+- Four legacy endpoints now return HTTP 410 before DB/file work. ZIP contains
+  Category Summary + Daybook only. Summary/readiness keep explicit
+  `decommissioned` compatibility objects, and Audit schema v2 keeps `wht:null`.
+- No migration, data rewrite, P&L/category/VAT/auth/dependency/env change.
+  Full local gate after external-review cleanup: compileall plus 620 passed /
+  2 skipped / 1 pre-existing
+  warning. Canonical design/plan and session evidence are in the frontend repo
+  under `docs/superpowers/` and `docs/04_LOGS/DAILY_LOG_2026_09.md` Session 2.
+- TUM-selected external AI returned `APPROVE WITH NON-BLOCKING NOTES`: all 10
+  targets passed with zero Critical/Important findings. Its valid M-1 cleanup
+  removed the dead `wht_rules` assembler argument. M-2 is an accepted frontend
+  source-test limitation; M-3 remains an intentional strict fingerprint type.
+  Full evidence is in the frontend audit-result document dated 2026-09-02.
+- Next: obtain TUM's separate commit/push approval, deploy backend first, test
+  410/ZIP/summary/readiness/Audit and `/health/deep`, wait for CPU to settle,
+  then deploy frontend and run authenticated UI/export smoke.
+- `scripts/overwrite_menu_watermarks.py` remains pre-existing, untracked, and
+  untouched.
 
 ## 🟡 Export Center Phase A backend — local verification complete, external audit pending
 
@@ -66,7 +92,9 @@ These were previously listed as local/awaiting review. They are now pushed and p
 ## 🟡 Current backend next priorities
 
 1. **AI Review/category queue operations** — now that FA-022 is deployed, pending vendor-bill and AI-review suggestions are safer to review, but still require human approval. Do not run broad backlog apply without a dry-run list and TUM confirmation.
-2. **Export category summary completeness (FA-016 follow-up)** — add an "ไม่ระบุหมวด" row to the category-summary export so it ties to the daybook total.
+2. **FA-016 is closed** — Category Summary already includes the
+   "ไม่ระบุหมวด" row (`export_routes.py`) so the sheet total ties to the Daybook.
+   Do not reopen this from the stale pre-fix handoff text.
 3. **Owner/data work** — inventory MAX values, unresolved payees/no-evidence rows, FA-010b recipe 158.5%, and FA-010f `ZZZ_TEST_QUICK` remain outside automatic code cleanup.
 
 ## 🟢 2026-07-11 — Expense category integrity migration applied

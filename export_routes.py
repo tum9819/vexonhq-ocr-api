@@ -4,8 +4,8 @@ VEXONHQ Phase 9 — Export Routes
 Endpoints:
     GET /export/category-summary?month=YYYY-MM   → Excel: รายรับ/รายจ่ายต่อ category
     GET /export/daybook?month=YYYY-MM            → Excel: รายการธุรกรรมทั้งหมด
-    GET /export/pnd3?month=YYYY-MM               → Excel: ภ.ง.ด. 3 (musician fees + freelancers)
-    GET /export/zip-bundle?month=YYYY-MM         → ZIP: รวม 3 ไฟล์ข้างต้น
+    GET /export/pnd3?month=YYYY-MM               → HTTP 410 compatibility tombstone
+    GET /export/zip-bundle?month=YYYY-MM         → ZIP: category summary + daybook
 """
 
 from __future__ import annotations
@@ -507,128 +507,10 @@ def _build_daybook(month: str) -> openpyxl.Workbook:
 
 
 def _build_pnd3(month: str) -> openpyxl.Workbook:
-    """ภ.ง.ด. 3 — รายชื่อผู้รับเงินที่ต้องหักภาษี ณ ที่จ่าย (บุคคลธรรมดา)
-    สำหรับค่าดนตรี / freelancer ที่ต้องหัก 3%"""
-    first, last = _month_range(month)
-    label = _month_label_th(month)
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "ภ.ง.ด.3"
-
-    # Title block
-    ws.merge_cells("A1:H1")
-    t = ws.cell(row=1, column=1, value="แบบแสดงรายการภาษีเงินได้หัก ณ ที่จ่าย (ภ.ง.ด. 3)")
-    t.font = Font(name="TH Sarabun New", bold=True, size=15)
-    t.alignment = CENTER
-    ws.row_dimensions[1].height = 30
-
-    ws.merge_cells("A2:H2")
-    ws.cell(row=2, column=1, value=f"เดือน: {label}   |   ผู้จ่ายเงิน: ร้านสถานีหม่าล่า  เลขที่ 255/4 ถ.พุทธมณฑลสาย 2 แขวงศาลาธรรมสพน์ เขตทวีวัฒนา กรุงเทพมหานคร 10170")
-    ws.cell(row=2, column=1).font = FONT_BODY
-    ws.cell(row=2, column=1).alignment = CENTER
-    ws.row_dimensions[2].height = 20
-
-    ws.merge_cells("A3:H3")
-    ws.cell(row=3, column=1, value=f"ช่วงวันที่: {first.strftime('%d/%m/%Y')} – {last.strftime('%d/%m/%Y')}")
-    ws.cell(row=3, column=1).font = FONT_SMALL
-    ws.cell(row=3, column=1).alignment = CENTER
-
-    _header_row(ws, [
-        "ลำดับ", "วันที่จ่าย", "ชื่อผู้รับ", "เลขประจำตัวผู้เสียภาษี",
-        "ประเภทเงินได้", "อัตราภาษี", "ยอดเงิน (฿)", "ภาษีที่หัก (฿)"
-    ], row=4)
-
-    # Single source of truth for which categories are ภ.ง.ด.3 + their per-category
-    # WHT rate (audit #1: this generator + yearly + /tax/wht-summary must agree).
-    from tax_routes import WHT_RULES  # noqa: PLC0415
-    wht_cats = list(WHT_RULES.keys())
-
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            # ดึงรายการที่ต้องหัก ณ ที่จ่าย (musician_fee/rent/service_fee) จาก v_daybook_pnl
-            cur.execute(
-                """SELECT entry_date,
-                          COALESCE(label, counterparty, 'ไม่ระบุชื่อ') AS name,
-                          amount,
-                          category_code,
-                          source
-                   FROM public.v_daybook_pnl
-                   WHERE direction = 'expense'
-                     AND entry_date BETWEEN %s AND %s
-                     AND category_code = ANY(%s)
-                   ORDER BY entry_date, amount""",
-                (first, last, wht_cats),
-            )
-            pnd_rows = _rows_to_dicts(cur)
-
-            # PNL-4: best-effort prefill of payee tax-id by EXACT (normalized) name
-            # match against counterparties. Exact-match ONLY — a wrong tax-id on a
-            # สรรพากร filing is worse than a blank, so never fuzzy-match.
-            cur.execute(
-                """SELECT lower(btrim(name)) AS k, tax_id
-                   FROM public.counterparties
-                   WHERE tax_id IS NOT NULL AND btrim(tax_id) <> '' AND is_active"""
-            )
-            cp_taxid = {k: t for k, t in cur.fetchall() if k}
-    finally:
-        conn.close()
-
-    row = 5
-    total_amount = 0.0
-    total_tax = 0.0
-
-    for i, r in enumerate(pnd_rows, 1):
-        fill = FILL_GRAY if i % 2 == 0 else None
-        d = r["entry_date"]
-        date_str = d.strftime("%d/%m/%Y") if hasattr(d, "strftime") else str(d)
-        amount = float(r["amount"])
-        rule = WHT_RULES.get(r["category_code"],
-                             {"label": "ค่าบริการ", "section": "มาตรา 40(8)", "wht_pct": 3.0})
-        pct = float(rule["wht_pct"])
-        tax = round(amount * pct / 100, 2)   # per-category rate (rent=5%, others=3%) — not a flat 3%
-        total_amount += amount
-        total_tax += tax
-
-        _data_cell(ws, row, 1, i, align=CENTER, fill=fill)
-        _data_cell(ws, row, 2, date_str, align=CENTER, fill=fill)
-        _data_cell(ws, row, 3, r["name"], fill=fill)
-        tid = cp_taxid.get((r["name"] or "").strip().lower(), "")  # PNL-4: exact name match, else blank
-        _data_cell(ws, row, 4, tid, align=CENTER, fill=fill)
-        _data_cell(ws, row, 5, f'{rule["label"]} - {rule["section"]}', fill=fill)
-        _data_cell(ws, row, 6, f"{pct:g}%", align=CENTER, fill=fill)
-        _data_cell(ws, row, 7, amount, align=RIGHT, num_format='#,##0.00', fill=fill)
-        _data_cell(ws, row, 8, tax, align=RIGHT, num_format='#,##0.00', fill=fill)
-        ws.row_dimensions[row].height = 18
-        row += 1
-
-    if len(pnd_rows) == 0:
-        ws.merge_cells(f"A{row}:H{row}")
-        empty = ws.cell(row=row, column=1, value="ไม่มีรายการภาษีหัก ณ ที่จ่ายในเดือนนี้")
-        empty.font = FONT_SMALL
-        empty.alignment = CENTER
-        row += 1
-
-    # Total
-    ws.merge_cells(f"A{row}:F{row}")
-    tl = ws.cell(row=row, column=1, value="รวม")
-    tl.font = FONT_BOLD
-    tl.fill = FILL_GREEN
-    tl.alignment = CENTER
-    _data_cell(ws, row, 7, total_amount, align=RIGHT, num_format='#,##0.00', bold=True, fill=FILL_GREEN)
-    _data_cell(ws, row, 8, total_tax, align=RIGHT, num_format='#,##0.00', bold=True, fill=FILL_GREEN)
-    ws.row_dimensions[row].height = 22
-
-    # Note
-    row += 2
-    note = ws.cell(row=row, column=1, value="หมายเหตุ: เลขประจำตัวผู้เสียภาษีที่เติมให้อัตโนมัติมาจากการจับคู่ชื่อแบบตรงตัวเท่านั้น — โปรดตรวจสอบทุกแถวและกรอกช่องที่ว่างก่อนยื่นสรรพากร")
-    note.font = Font(name="TH Sarabun New", size=10, italic=True, color="CC0000")
-    ws.merge_cells(f"A{row}:H{row}")
-
-    _set_col_widths(ws, [6, 12, 28, 18, 24, 10, 16, 14])
-
-    return wb
+    """Retired compatibility helper: never generate inferred WHT data."""
+    del month
+    from tax_routes import raise_wht_decommissioned
+    raise_wht_decommissioned()
 
 
 def _build_commission_breakdown(month: str) -> openpyxl.Workbook:
@@ -761,16 +643,11 @@ def export_daybook(month: str = Query(..., description="YYYY-MM")):
 
 
 @router.get("/pnd3")
-def export_pnd3(month: str = Query(..., description="YYYY-MM")):
-    """ดาวน์โหลด Excel ภ.ง.ด. 3 (ค่าดนตรี + freelancer หัก 3%)"""
-    wb = _build_pnd3(month)
-    data = _excel_bytes(wb)
-    fname = f"pnd3_{month}.xlsx"
-    return Response(
-        content=data,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
-    )
+def export_pnd3(month: Optional[str] = Query(None, description="retired")):
+    """Retired compatibility endpoint; no inferred P.N.D. workbook is emitted."""
+    del month
+    from tax_routes import raise_wht_decommissioned
+    raise_wht_decommissioned()
 
 
 @router.get("/commission-breakdown")
@@ -788,18 +665,14 @@ def export_commission_breakdown(month: str = Query(..., description="YYYY-MM")):
 
 @router.get("/zip-bundle")
 def export_zip_bundle(month: str = Query(..., description="YYYY-MM")):
-    """ดาวน์โหลด ZIP รวม 3 ไฟล์: category-summary, daybook, pnd3"""
-    label = _month_label_th(month)
-
+    """ดาวน์โหลด ZIP รวม 2 ไฟล์: category-summary และ daybook"""
     category_wb = _build_category_summary(month)
     daybook_wb  = _build_daybook(month)
-    pnd3_wb     = _build_pnd3(month)
 
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(f"category_summary_{month}.xlsx", _excel_bytes(category_wb))
         zf.writestr(f"daybook_{month}.xlsx",          _excel_bytes(daybook_wb))
-        zf.writestr(f"pnd3_{month}.xlsx",             _excel_bytes(pnd3_wb))
 
     zip_buf.seek(0)
     fname = f"VEXONHQ_export_{month}.zip"
@@ -829,28 +702,6 @@ def export_summary(month: str = Query(..., description="YYYY-MM")):
             )
             r = cur.fetchone()
             daybook_rows, total_income, total_expense = int(r[0]), float(r[1]), float(r[2])
-
-            # pnd3 stats — use the SAME per-category WHT_RULES as the other 4 generators.
-            # (audit AUD-TAX-01: this preview used flat 3% + a phantom-category/amount
-            # heuristic AGENTS #19 had removed, so it under-reported rent's 5% WHT and
-            # disagreed with the actual pnd3 export.)
-            from tax_routes import WHT_RULES  # local import avoids any router import-order issue
-            _wht_keys = list(WHT_RULES.keys())
-            _wht_case = " ".join("WHEN category_code = %s THEN amount * %s" for _ in _wht_keys)
-            _wht_params: list = []
-            for _k in _wht_keys:
-                _wht_params.extend([_k, WHT_RULES[_k]["wht_pct"] / 100.0])
-            cur.execute(
-                f"""SELECT COUNT(*) AS cnt,
-                          COALESCE(SUM(CASE {_wht_case} ELSE 0 END), 0) AS total_wht
-                   FROM public.v_daybook_pnl
-                   WHERE direction = 'expense'
-                     AND entry_date BETWEEN %s AND %s
-                     AND category_code = ANY(%s)""",
-                tuple(_wht_params) + (first, last, _wht_keys),
-            )
-            r2 = cur.fetchone()
-            pnd3_rows, total_wht = int(r2[0]), float(r2[1])
 
             # category summary stats
             cur.execute(
@@ -891,8 +742,8 @@ def export_summary(month: str = Query(..., description="YYYY-MM")):
     finally:
         conn.close()
 
-    # Rough ZIP size estimate: ~50KB per Excel file × 3
-    zip_est = 150 * 1024
+    # Rough ZIP size estimate: ~50KB per active Excel file × 2
+    zip_est = 100 * 1024
 
     return {
         "month": month,
@@ -902,8 +753,10 @@ def export_summary(month: str = Query(..., description="YYYY-MM")):
             "total_expense": round(total_expense, 2),
         },
         "pnd3": {
-            "rows": pnd3_rows,
-            "total_withholding": round(total_wht, 2),
+            "available": False,
+            "status": "decommissioned",
+            "rows": 0,
+            "total_withholding": 0,
         },
         "category_summary": {
             "categories": cat_count,
@@ -916,7 +769,7 @@ def export_summary(month: str = Query(..., description="YYYY-MM")):
             "total_commission": round(total_comm, 2),
         },
         "zip_bundle": {
-            "files": 3,
+            "files": 2,
             "size_bytes_est": zip_est,
         },
     }
@@ -1012,25 +865,6 @@ def _summarize_readiness_bill_evidence(bill_rows: list[dict]) -> dict:
         # stored attachment row whose file_url is empty is a real image failure.
         "image_url_failure_count": attachment_url_failures,
     }
-
-
-def _wht_candidate_facts(
-    daybook_rows: list[dict],
-    wht_rules: dict,
-) -> tuple[dict, list[dict], list[str]]:
-    category_codes = sorted(wht_rules)
-    candidate_codes = set(category_codes)
-    candidate_rows = [
-        row
-        for row in daybook_rows
-        if row["direction"] == "expense"
-        and row["category_code"] in candidate_codes
-    ]
-    facts = {
-        "count": len(candidate_rows),
-        "amount": sum((row["amount"] or 0 for row in candidate_rows), 0),
-    }
-    return facts, candidate_rows, category_codes
 
 
 def _query_readiness_facts(
@@ -1256,17 +1090,6 @@ def _query_readiness_facts(
     month_unattributed_slip_rows = [
         row for row in slip_rows if row["is_month_unattributed"]
     ]
-    from tax_routes import WHT_RULES
-
-    (
-        wht_candidates,
-        wht_candidate_rows,
-        wht_candidate_category_codes,
-    ) = _wht_candidate_facts(
-        daybook_rows,
-        WHT_RULES,
-    )
-
     drift = (
         (pnl_stats["expense_total"] or 0)
         - (pnl_stats["categorized_expense"] or 0)
@@ -1323,7 +1146,6 @@ def _query_readiness_facts(
             "missing_invoice_page_amount": bill_evidence["missing_card_amount"],
         },
         "image_url_failures": {"count": image_url_failure_count},
-        "wht_candidates": wht_candidates,
     }
     fingerprint_inputs = {
         "month": first.strftime("%Y-%m"),
@@ -1333,8 +1155,6 @@ def _query_readiness_facts(
         "branch_linked_slip_rows": branch_linked_slip_rows,
         "month_unattributed_slip_rows": month_unattributed_slip_rows,
         "bills_and_pages": bill_rows,
-        "wht_candidate_rows": wht_candidate_rows,
-        "wht_candidate_category_codes": wht_candidate_category_codes,
         "monthly_close": [
             {
                 "risk_key": risk["risk_key"],
@@ -1367,7 +1187,7 @@ def export_readiness(
     )
     payload["generated_at"] = bkk_now().isoformat()
     payload["source_fingerprint"] = {
-        "version": "phase-a-v1",
+        "version": "phase-a-v2-wht-decommissioned",
         "sha256": canonical_fingerprint(fingerprint_inputs),
     }
     return payload
@@ -1559,20 +1379,12 @@ def _assemble_audit_vouchers(
     slips_by_stmt: dict,
     inv_by_stmt: dict,
     card_invoices: dict,
-    wht_rules: dict,
 ) -> list[dict]:
     """Assemble cash-basis vouchers first, then supplementary card evidence."""
     vouchers: list[dict] = []
     for row in transfer_rows:
         category_code = row.get("category_code")
-        rule = wht_rules.get(category_code) if category_code else None
         amount = float(row.get("amount") or 0)
-        wht = None
-        if rule:
-            wht = {
-                "rate": rule["wht_pct"],
-                "amount": round(amount * rule["wht_pct"] / 100.0, 2),
-            }
         raw_source_id = row.get("ref_id")
         source_id = (
             str(raw_source_id)
@@ -1605,7 +1417,7 @@ def _assemble_audit_vouchers(
             "category_code": category_code,
             "category_name_th": row.get("category_name_th") or "ไม่ระบุ",
             "amount": round(amount, 2),
-            "wht": wht,
+            "wht": None,
             "slip": (
                 None
                 if payment_method == "Credit Card"
@@ -1758,7 +1570,6 @@ def export_audit_package(month: str = Query(..., description="YYYY-MM")):
     Read-only JSON bundle for the printable A4 audit-package page.
     Voucher numbering is stateless (PV-YYYYMM-### by entry_date,ref_id) — the
     printed/archived PDF is the immutable snapshot (design review 2026-07-13, 5b)."""
-    from tax_routes import WHT_RULES  # noqa: PLC0415 — single source of WHT rates
     # The `uploads` storage bucket is private (security hardening 2026-05-31, GAP 2)
     # — stored .../object/public/... paths 404 unless signed at read time. Reuse the
     # existing helper (see slip_routes.py for the same lazy-import pattern) instead
@@ -1862,7 +1673,6 @@ def export_audit_package(month: str = Query(..., description="YYYY-MM")):
                 slips_by_stmt=slips_by_stmt,
                 inv_by_stmt=inv_by_stmt,
                 card_invoices=card_invoices,
-                wht_rules=WHT_RULES,
             )
 
             # ── Petty cash book (pos_cashflow) ──
@@ -1941,7 +1751,11 @@ def export_health():
         "/export/summary?month=YYYY-MM",
         "/export/category-summary?month=YYYY-MM",
         "/export/daybook?month=YYYY-MM",
-        "/export/pnd3?month=YYYY-MM",
         "/export/commission-breakdown?month=YYYY-MM",
         "/export/zip-bundle?month=YYYY-MM",
+    ], "decommissioned": [
+        "/export/pnd3?month=YYYY-MM",
+        "/export/pnd3-annual?year=YYYY",
+        "/tax/wht-summary?month=YYYY-MM",
+        "/tax/wht-export?month=YYYY-MM",
     ]}

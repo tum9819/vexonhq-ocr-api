@@ -1,12 +1,12 @@
 """
-VEXONHQ Phase 18 — Yearly Report + ภ.ง.ด. Annual
-===================================================
-Annual P&L summary + full-year ภ.ง.ด.3 export.
+VEXONHQ Phase 18 — Yearly Report
+=================================
+Annual P&L summary with a compatibility tombstone for the retired P.N.D. export.
 
 Endpoints:
   GET /pnl/yearly            — monthly breakdown for a year (JSON)
   GET /export/yearly         — download Annual P&L Excel
-  GET /export/pnd3-annual    — download full-year ภ.ง.ด.3 Excel
+  GET /export/pnd3-annual    — HTTP 410 compatibility tombstone
 
 In main.py add:
     from yearly_routes import router as yearly_router
@@ -424,154 +424,15 @@ def export_yearly(
     )
 
 
-# ─────────────────────────────────────────────────────────
-# GET /export/pnd3-annual  — full-year ภ.ง.ด.3 Excel
-# ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────
+# GET /export/pnd3-annual — retired compatibility endpoint
+# ─────────────────────────────────────────────────
 
 @router.get("/export/pnd3-annual")
 def export_pnd3_annual(
-    year: int = Query(2026, ge=2020, le=2099),
+    year: Optional[str] = Query(None, description="retired"),
 ):
-    """
-    Download full-year ภ.ง.ด.3 Excel (ทุกเดือนในปีเดียว).
-    รวมค่าดนตรี / freelancer ทั้งปี แยกตามเดือน
-    """
-    try:
-        import openpyxl
-        from openpyxl.styles import Alignment, Font, PatternFill
-    except ImportError:
-        raise HTTPException(500, "openpyxl not installed")
-
-    # Single source of truth for ภ.ง.ด.3 categories + per-category WHT rate
-    # (audit #1: this annual generator must agree with /export/pnd3 + /tax/wht-summary).
-    from tax_routes import WHT_RULES  # noqa: PLC0415
-    wht_cats = list(WHT_RULES.keys())
-
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """SELECT
-                       EXTRACT(MONTH FROM entry_date)::int AS m,
-                       entry_date,
-                       COALESCE(label, counterparty, 'ไม่ระบุชื่อ') AS name,
-                       amount,
-                       category_code
-                   FROM public.v_daybook_pnl
-                   WHERE direction = 'expense'
-                     AND EXTRACT(YEAR FROM entry_date) = %s
-                     AND category_code = ANY(%s)
-                   ORDER BY entry_date, amount""",
-                (year, wht_cats),
-            )
-            rows = _rows_to_dicts(cur)
-
-            # PNL-4: best-effort prefill of payee tax-id by EXACT (normalized) name
-            # match against counterparties (exact-match ONLY — never fuzzy; a wrong
-            # tax-id on a สรรพากร filing is worse than a blank).
-            cur.execute(
-                """SELECT lower(btrim(name)) AS k, tax_id
-                   FROM public.counterparties
-                   WHERE tax_id IS NOT NULL AND btrim(tax_id) <> '' AND is_active"""
-            )
-            cp_taxid = {k: t for k, t in cur.fetchall() if k}
-    finally:
-        conn.close()
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = f"ภ.ง.ด.3 ปี {year}"
-
-    LEFT   = Alignment(horizontal="left",   vertical="center")
-    CENTER = Alignment(horizontal="center",  vertical="center")
-    RIGHT  = Alignment(horizontal="right",   vertical="center")
-
-    FONT_T = Font(name="TH Sarabun New", bold=True, size=15)
-    FONT_H = Font(name="TH Sarabun New", bold=True, size=12, color="FFFFFF")
-    FONT_B = Font(name="TH Sarabun New", size=12)
-    FONT_BOLD = Font(name="TH Sarabun New", bold=True, size=12)
-    FILL_H = PatternFill("solid", fgColor="4F46E5")
-    FILL_T = PatternFill("solid", fgColor="E0E7FF")
-    FILL_ALT = PatternFill("solid", fgColor="F8F8FF")
-
-    # Title
-    ws.merge_cells("A1:H1")
-    c = ws.cell(row=1, column=1, value=f"สรุปภาษีเงินได้หัก ณ ที่จ่าย (ภ.ง.ด.3) ประจำปี {year} — ร้านสถานีหม่าล่า")
-    c.font = FONT_T; c.alignment = CENTER
-    ws.row_dimensions[1].height = 30
-
-    headers = ["ลำดับ", "เดือน", "วันที่จ่าย", "ชื่อผู้รับ",
-               "เลขผู้เสียภาษี", "ประเภทเงินได้", "ยอดเงิน (฿)", "ภาษีที่หัก (฿)"]
-    for col_i, h in enumerate(headers, 1):
-        c = ws.cell(row=3, column=col_i, value=h)
-        c.font = FONT_H; c.alignment = CENTER; c.fill = FILL_H
-    ws.row_dimensions[3].height = 22
-
-    row_n = 4
-    grand_amt = grand_tax = 0.0
-    for seq, r in enumerate(rows, 1):
-        fill = FILL_ALT if seq % 2 == 0 else None
-        m = int(r["m"])
-        d = r["entry_date"]
-        date_str = d if isinstance(d, str) else str(d)
-        amount = float(r["amount"])
-        rule = WHT_RULES.get(r["category_code"],
-                             {"label": "ค่าบริการ", "section": "มาตรา 40(8)", "wht_pct": 3.0})
-        pct = float(rule["wht_pct"])
-        tax = round(amount * pct / 100, 2)   # per-category rate (rent=5%, others=3%)
-        grand_amt += amount
-        grand_tax += tax
-
-        def _c(col, val, align=LEFT, font=FONT_B, num_fmt=None):
-            cc = ws.cell(row=row_n, column=col, value=val)
-            cc.font = font; cc.alignment = align
-            if fill: cc.fill = fill
-            if num_fmt: cc.number_format = num_fmt
-            return cc
-
-        _c(1, seq, CENTER)
-        _c(2, TH_MONTHS[m], CENTER)
-        _c(3, date_str, CENTER)
-        _c(4, r["name"])
-        tid = cp_taxid.get((r["name"] or "").strip().lower(), "")  # PNL-4: exact name match, else blank
-        _c(5, tid, CENTER)
-        _c(6, f'{rule["label"]} - {rule["section"]}')
-        _c(7, amount, RIGHT, FONT_B, '#,##0.00')
-        _c(8, tax,    RIGHT, FONT_B, '#,##0.00')
-        ws.row_dimensions[row_n].height = 18
-        row_n += 1
-
-    if not rows:
-        ws.merge_cells(f"A{row_n}:H{row_n}")
-        e = ws.cell(row=row_n, column=1, value="ไม่มีรายการภาษีหัก ณ ที่จ่ายทั้งปี")
-        e.font = FONT_B; e.alignment = CENTER
-        row_n += 1
-
-    # Grand total
-    ws.merge_cells(f"A{row_n}:F{row_n}")
-    t = ws.cell(row=row_n, column=1, value="รวมทั้งปี")
-    t.font = FONT_BOLD; t.fill = FILL_T; t.alignment = CENTER
-    for col_i, (val, fmt) in enumerate([(grand_amt, '#,##0.00'), (grand_tax, '#,##0.00')], 7):
-        cc = ws.cell(row=row_n, column=col_i, value=val)
-        cc.font = FONT_BOLD; cc.fill = FILL_T
-        cc.alignment = RIGHT; cc.number_format = fmt
-    ws.row_dimensions[row_n].height = 22
-
-    note_row = row_n + 2
-    ws.merge_cells(f"A{note_row}:H{note_row}")
-    n = ws.cell(row=note_row, column=1,
-                value="หมายเหตุ: เลขประจำตัวผู้เสียภาษีที่เติมให้อัตโนมัติมาจากการจับคู่ชื่อแบบตรงตัวเท่านั้น — โปรดตรวจสอบทุกแถวและกรอกช่องที่ว่างก่อนยื่นสรรพากร")
-    n.font = Font(name="TH Sarabun New", size=10, italic=True, color="CC0000")
-
-    for col_i, w in enumerate([7, 8, 14, 28, 18, 24, 16, 14], 1):
-        ws.column_dimensions[openpyxl.utils.get_column_letter(col_i)].width = w
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    filename = f"pnd3_annual_{year}.xlsx"
-    return StreamingResponse(
-        buf,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+    """Retired: no annual P.N.D. workbook is generated from expense categories."""
+    del year
+    from tax_routes import raise_wht_decommissioned
+    raise_wht_decommissioned()

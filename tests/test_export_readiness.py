@@ -9,7 +9,12 @@ from fastapi.testclient import TestClient
 import auth_routes
 import export_routes
 import monthly_close_routes
-from export_readiness import build_readiness, canonical_fingerprint, package_status
+from export_readiness import (
+    TAX_EVIDENCE_CODES,
+    build_readiness,
+    canonical_fingerprint,
+    package_status,
+)
 
 
 def _facts(**overrides):
@@ -70,6 +75,9 @@ def test_readiness_accepts_admin_and_returns_versioned_contract(monkeypatch):
     )
     assert response.status_code == 200
     assert response.json()["schema_version"] == 1
+    assert response.json()["source_fingerprint"]["version"] == (
+        "phase-a-v2-wht-decommissioned"
+    )
     assert len(response.json()["source_fingerprint"]["sha256"]) == 64
 
 
@@ -219,36 +227,6 @@ def test_never_uploaded_bill_is_not_an_image_failure_but_empty_file_url_is():
     assert export_routes._summarize_readiness_bill_evidence(
         [never_uploaded, broken_page]
     )["missing_invoice_count"] == 2
-
-
-def test_wht_candidate_facts_use_supplied_rules_and_scoped_daybook_rows():
-    daybook_rows = [
-        {
-            "direction": "expense", "category_code": "musician_fee",
-            "amount": Decimal("600.00"), "ref_id": "m1",
-        },
-        {
-            "direction": "expense", "category_code": "rent",
-            "amount": Decimal("800.00"), "ref_id": "r1",
-        },
-        {
-            "direction": "income", "category_code": "rent",
-            "amount": Decimal("999.00"), "ref_id": "income-rent",
-        },
-        {
-            "direction": "expense", "category_code": "food_raw",
-            "amount": Decimal("100.00"), "ref_id": "food",
-        },
-    ]
-
-    facts, candidate_rows, category_codes = export_routes._wht_candidate_facts(
-        daybook_rows,
-        {"musician_fee": {"wht_pct": 3}, "rent": {"wht_pct": 5}},
-    )
-
-    assert facts == {"count": 2, "amount": Decimal("1400.00")}
-    assert [row["ref_id"] for row in candidate_rows] == ["m1", "r1"]
-    assert category_codes == ["musician_fee", "rent"]
 
 
 def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monkeypatch):
@@ -500,10 +478,7 @@ def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monke
     # failure. The two bills that were never uploaded belong to
     # invoice_evidence / credit_cards instead.
     assert facts["image_url_failures"] == {"count": 1}
-    assert facts["wht_candidates"] == {
-        "count": 1,
-        "amount": Decimal("600.00"),
-    }
+    assert "wht_candidates" not in facts
     assert fingerprint_inputs["month"] == "2026-07"
     assert fingerprint_inputs["branch_code"] == "future_branch"
     assert len(fingerprint_inputs["daybook_rows"]) == 5
@@ -513,9 +488,8 @@ def test_query_readiness_facts_batches_six_selects_and_normalizes_evidence(monke
     assert fingerprint_inputs["bills_and_pages"][-1]["id"] == "b4"
     assert fingerprint_inputs["bills_and_pages"][-1]["is_month_bill"] is False
     assert fingerprint_inputs["bills_and_pages"][-1]["is_linked_statement_card"] is True
-    assert [row["ref_id"] for row in fingerprint_inputs["wht_candidate_rows"]] == [
-        "p1"
-    ]
+    assert "wht_candidate_rows" not in fingerprint_inputs
+    assert "wht_candidate_category_codes" not in fingerprint_inputs
     assert [row["id"] for row in fingerprint_inputs["branch_linked_slip_rows"]] == [
         "sl1"
     ]
@@ -771,8 +745,6 @@ def test_fingerprint_is_order_independent_but_value_sensitive():
         ("INVOICE_ATTACHMENT_EVIDENCE", "pass", 0, 0, "/invoices"),
         ("CREDIT_CARD_INVOICE_EVIDENCE", "pass", 0, 0, "/bills/payment"),
         ("IMAGE_URLS_PRESENT", "pass", 0, None, None),
-        ("TAX_PROFILE_PHASE_B", "action_required", 1, None, None),
-        ("PND_RECIPIENT_ASSIGNMENTS_PHASE_B", "action_required", 0, 0, None),
         ("SHAREHOLDER_PREVIEW_PHASE_C", "action_required", 1, None, None),
     ],
 )
@@ -788,7 +760,7 @@ def test_each_stable_rule_exposes_its_pass_or_phase_blocker_details(
     }))
     all_rules = [
         *result["packages"]["common_accounting"]["rules"],
-        *result["packages"]["pnd3"]["rules"],
+        *result["packages"]["tax_evidence"]["rules"],
         *result["packages"]["shareholder"]["rules"],
     ]
     rule = next(rule for rule in all_rules if rule["code"] == code)
@@ -829,8 +801,6 @@ def test_each_stable_rule_exposes_its_pass_or_phase_blocker_details(
             "missing_invoice_page_amount": 900,
         }}, "CREDIT_CARD_INVOICE_EVIDENCE", "action_required", 7, 900, "/bills/payment"),
         ("image URL is missing", {"image_url_failures": {"count": 8}}, "IMAGE_URLS_PRESENT", "action_required", 8, None, None),
-        ("tax profile remains phase B", {}, "TAX_PROFILE_PHASE_B", "action_required", 1, None, None),
-        ("recipient assignments remain phase B", {"wht_candidates": {"count": 9, "amount": 1000}}, "PND_RECIPIENT_ASSIGNMENTS_PHASE_B", "action_required", 9, 1000, None),
         ("shareholder preview remains phase C", {}, "SHAREHOLDER_PREVIEW_PHASE_C", "action_required", 1, None, None),
     ],
 )
@@ -840,7 +810,7 @@ def test_each_blocking_rule_keeps_its_action_details(
     result = build_readiness("2026-07", "thawi_watthana", _facts(**overrides))
     all_rules = [
         *result["packages"]["common_accounting"]["rules"],
-        *result["packages"]["pnd3"]["rules"],
+        *result["packages"]["tax_evidence"]["rules"],
         *result["packages"]["shareholder"]["rules"],
     ]
     rule = next(rule for rule in all_rules if rule["code"] == code)
@@ -881,22 +851,8 @@ def test_packages_keep_the_approved_ordered_rule_composition_and_statuses():
         "INVOICE_ATTACHMENT_EVIDENCE", "CREDIT_CARD_INVOICE_EVIDENCE",
         "IMAGE_URLS_PRESENT",
     ]
-    assert [rule["code"] for rule in result["packages"]["pnd3"]["rules"]] == [
-        "MONTH_ENDED", "STATEMENT_MISSING", "STATEMENT_PERIOD_UNVERIFIED",
-        "STATEMENT_REVIEW_CLEAR", "UNCATEGORIZED_CLEAR", "DAYBOOK_RECONCILES",
-        "MONTHLY_CLOSE_DANGER_CLEAR", "TRANSFER_SLIP_EVIDENCE",
-        "INVOICE_ATTACHMENT_EVIDENCE", "CREDIT_CARD_INVOICE_EVIDENCE",
-        "IMAGE_URLS_PRESENT", "TAX_PROFILE_PHASE_B",
-        "PND_RECIPIENT_ASSIGNMENTS_PHASE_B",
-    ]
-    assert [rule["code"] for rule in result["packages"]["pnd53"]["rules"]] == [
-        "MONTH_ENDED", "STATEMENT_MISSING", "STATEMENT_PERIOD_UNVERIFIED",
-        "STATEMENT_REVIEW_CLEAR", "UNCATEGORIZED_CLEAR", "DAYBOOK_RECONCILES",
-        "MONTHLY_CLOSE_DANGER_CLEAR", "TRANSFER_SLIP_EVIDENCE",
-        "INVOICE_ATTACHMENT_EVIDENCE", "CREDIT_CARD_INVOICE_EVIDENCE",
-        "IMAGE_URLS_PRESENT", "TAX_PROFILE_PHASE_B",
-        "PND_RECIPIENT_ASSIGNMENTS_PHASE_B",
-    ]
+    assert result["packages"]["pnd3"]["rules"] == []
+    assert result["packages"]["pnd53"]["rules"] == []
     assert [rule["code"] for rule in result["packages"]["shareholder"]["rules"]] == [
         "MONTH_ENDED", "STATEMENT_MISSING", "STATEMENT_PERIOD_UNVERIFIED",
         "STATEMENT_REVIEW_CLEAR", "UNCATEGORIZED_CLEAR", "DAYBOOK_RECONCILES",
@@ -906,8 +862,8 @@ def test_packages_keep_the_approved_ordered_rule_composition_and_statuses():
     ]
     assert result["packages"]["common_accounting"]["status"] == "ready"
     assert result["packages"]["tax_evidence"]["status"] == "ready"
-    assert result["packages"]["pnd3"]["status"] == "action_required"
-    assert result["packages"]["pnd53"]["status"] == "action_required"
+    assert result["packages"]["pnd3"]["status"] == "preview_only"
+    assert result["packages"]["pnd53"]["status"] == "preview_only"
     assert result["packages"]["shareholder"]["status"] == "action_required"
 
 
@@ -916,3 +872,21 @@ def test_fingerprint_normalizes_date_and_decimal_values_before_hashing():
     serialized = canonical_fingerprint({"month_end": "2026-07-31", "amount": "123.40"})
 
     assert typed == serialized
+
+
+def test_pnd_packages_are_decommissioned_while_document_evidence_remains():
+    result = build_readiness("2026-07", "thawi_watthana", _facts())
+
+    assert result["packages"]["pnd3"] == {
+        "status": "preview_only",
+        "availability": "decommissioned",
+        "rules": [],
+    }
+    assert result["packages"]["pnd53"] == {
+        "status": "preview_only",
+        "availability": "decommissioned",
+        "rules": [],
+    }
+    assert [
+        rule["code"] for rule in result["packages"]["tax_evidence"]["rules"]
+    ] == list(TAX_EVIDENCE_CODES)

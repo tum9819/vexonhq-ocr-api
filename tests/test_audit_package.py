@@ -7,7 +7,6 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import export_routes as routes  # noqa: E402
-from tax_routes import WHT_RULES  # noqa: E402
 
 
 _DEFAULT_STATEMENT_ID = object()
@@ -40,7 +39,6 @@ def _assemble(transfer_rows, *, slips=None, invoices=None, card_rows=None, card_
         slips_by_stmt=slips or {},
         inv_by_stmt=invoices or {},
         card_invoices=card_invoices or {},
-        wht_rules=WHT_RULES,
     )
 
 
@@ -51,15 +49,16 @@ def test_seq_follows_input_order_and_amounts_round():
     assert v[0]["amount"] == 100.0 or v[0]["amount"] == 100.01  # round to 2dp
 
 
-def test_wht_musician_3pct_and_rent_5pct_others_none():
+def test_wht_is_never_inferred_from_expense_category():
     rows = [
         _row("2026-06-05", 2100, "musician_fee", "m1"),
         _row("2026-06-06", 8000, "rent", "r1"),
         _row("2026-06-07", 500, "food_raw", "f1"),
     ]
     v = _assemble(rows)
-    assert v[0]["wht"] == {"rate": 3.0, "amount": 63.0}
-    assert v[1]["wht"] == {"rate": 5.0, "amount": 400.0}
+    assert [row["amount"] for row in v] == [2100.0, 8000.0, 500.0]
+    assert v[0]["wht"] is None
+    assert v[1]["wht"] is None
     assert v[2]["wht"] is None
 
 
