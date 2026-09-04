@@ -1,19 +1,19 @@
 # TOMORROW.md — vexonhq-ocr-api backend
 
-**Last updated**: 2026-09-02 (WHT/P.N.D. external audit approved; not pushed)
+**Last updated**: 2026-09-04 (WHT/P.N.D. decommission shipped and production-verified)
 
 > Frontend / cross-repo context → `C:\Users\rapee\VEXONHQ\docs\01_PROJECT\TOMORROW.md`
 > Full re-audit detail → `docs/superpowers/audits/2026-05-29-reaudit-batch13-RUNBOOK.md`
 
 ---
 
-## 🟡 WHT/P.N.D. decommission — push approval pending
+## ✅ WHT/P.N.D. decommission — SHIPPED 2026-09-02
 
 - TUM confirmed the restaurant pays musician fees and THB 8,000 rent in full,
   has no actual-withheld/remitted state in VEXONHQ, and has not remitted WHT
   through this workflow. VAT and invoice VAT remain unchanged.
 - Local rollback tag `backup-pre-wht-decommission-2026-09-01` points to backend
-  `b3c146a`; the matching frontend tag points to `f987381`. Neither is pushed.
+  `b3c146a`; the matching frontend tag points to `f987381`. Both are pushed.
 - Four legacy endpoints now return HTTP 410 before DB/file work. ZIP contains
   Category Summary + Daybook only. Summary/readiness keep explicit
   `decommissioned` compatibility objects, and Audit schema v2 keeps `wht:null`.
@@ -27,9 +27,17 @@
   removed the dead `wht_rules` assembler argument. M-2 is an accepted frontend
   source-test limitation; M-3 remains an intentional strict fingerprint type.
   Full evidence is in the frontend audit-result document dated 2026-09-02.
-- Next: obtain TUM's separate commit/push approval, deploy backend first, test
-  410/ZIP/summary/readiness/Audit and `/health/deep`, wait for CPU to settle,
-  then deploy frontend and run authenticated UI/export smoke.
+- Backend `76160f2` is on `origin/main`. Its first webhook rollout later entered
+  `exited`/503; TUM manually redeployed the same commit. Coolify then reported
+  Success/Running from 07:25:12 to 07:25:29 UTC (17s). Live smoke passed 71/71;
+  410/ZIP/summary/readiness/Audit contracts and `/health/deep` passed.
+- Frontend `2298742` is also deployed and Running. Authenticated Export,
+  Yearly, `/tax` redirect, and Audit Package smoke passed. The downloaded
+  August ZIP contained exactly Category Summary + Daybook; both files and the
+  annual P&L workbook were valid XLSX structures with no WHT text.
+- No WHT code/deploy work remains. Closure-only docs are prepared from local
+  tag `backup-pre-wht-closure-docs-2026-09-02` at backend `76160f2` and
+  frontend `2298742`; they need a separate TUM Confirm before commit/push.
 - `scripts/overwrite_menu_watermarks.py` remains pre-existing, untracked, and
   untouched.
 

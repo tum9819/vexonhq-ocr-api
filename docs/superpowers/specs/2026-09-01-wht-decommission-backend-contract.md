@@ -1,7 +1,7 @@
 # WHT/P.N.D. decommission — backend contract
 
 Date: 2026-09-01
-Status: implemented and verified locally; not committed, pushed, or deployed
+Status: shipped and production-verified on 2026-09-02
 
 ## Confirmed operational fact
 
@@ -34,3 +34,20 @@ accounting labels, not tax-event evidence. VAT is outside this decommission.
   1 pre-existing warning.
 - Deployment order after explicit TUM approval: backend first, verify contracts
   and health/settled CPU, then frontend.
+
+## Production closure
+
+- Backend commit `76160f2` and frontend commit `2298742` are on `origin/main`.
+- The initial backend webhook rollout later entered `exited`/503. After TUM
+  manually redeployed the same commit, Coolify reported Success/Running and
+  live smoke passed 71/71; all retired-route and compatibility contracts above
+  matched production.
+- Frontend Coolify deployment `an2tkinii0kfxdpezp8bcois` succeeded from
+  07:50:47 to 07:58:51 UTC (8m04s) and remained Running on exact commit
+  `2298742`.
+- Authenticated production checks showed no WHT/P.N.D. controls or printed WHT
+  row, `/tax` redirected to `/export`, and the real August ZIP contained only
+  Category Summary + Daybook. Those two XLSX files and the annual P&L XLSX had
+  valid structures and no WHT/withholding/P.N.D. XML text.
+- `/health/deep` remained healthy with PostgreSQL, Supabase, scheduler, RAM,
+  and disk checks healthy; CPU reached 0% after the shared-VPS build.
