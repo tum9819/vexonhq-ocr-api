@@ -112,9 +112,21 @@ def test_ocr_concurrency_capped_at_three(monkeypatch):
     }
 
 
+def test_single_page_pdf_keeps_corrective_retry(monkeypatch):
+    # The suppression keys on page COUNT, not on the PDF mime type: a 1-page
+    # PDF is a standalone page and keeps the retry exactly like a single image.
+    monkeypatch.delenv("OCR_PAGE_RETRY_MULTIPAGE", raising=False)
+    state = _install_mocks(monkeypatch, ocr_sleep=0.0)
+    monkeypatch.setattr(main, "_pdf_to_images", lambda c: [b"p1"])
+
+    main._process_upload(b"%PDF-fake", "OnePage.pdf", "application/pdf")
+
+    assert state["retry_flags"] == [("p1", True)]
+
+
 def test_multipage_retry_can_be_restored_by_env(monkeypatch):
     state = _install_mocks(monkeypatch, ocr_sleep=0.0)
-    monkeypatch.setenv("OCR_PAGE_RETRY_MULTIPAGE", "1")
+    monkeypatch.setenv("OCR_PAGE_RETRY_MULTIPAGE", "true")   # any of 1/true/yes/on
     monkeypatch.setattr(main, "_pdf_to_images", lambda c: [b"p1", b"p2"])
 
     main._process_upload(b"%PDF-fake", "Rollback.pdf", "application/pdf")

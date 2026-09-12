@@ -64,6 +64,7 @@ def _configure(monkeypatch, secret: str) -> None:
 
 def test_enabled_flag_derivation():
     assert auth_routes._legacy_auth_enabled("") is False
+    assert auth_routes._legacy_auth_enabled("   ") is False
     assert auth_routes._legacy_auth_enabled(OLD_DEFAULT_SECRET) is False
     assert auth_routes._legacy_auth_enabled(REAL_SECRET) is True
 
@@ -97,9 +98,11 @@ def test_real_secret_keeps_legacy_path_working(monkeypatch):
 
 
 def test_no_builtin_default_account(monkeypatch):
-    # The test environment never sets these, so the module-level values prove
-    # there is no in-code default account any more.
-    assert "VEXON_USER" not in os.environ and "VEXON_HASH" not in os.environ
+    # With the env vars absent, the module-level values prove there is no
+    # in-code default account any more. A shell that exported them (sourced
+    # .env) cannot make that observation, so skip rather than fail there.
+    if "VEXON_USER" in os.environ or "VEXON_HASH" in os.environ:
+        pytest.skip("VEXON_USER/VEXON_HASH exported in this shell; module default not observable")
     assert auth_routes.VEXON_USER == ""
     assert auth_routes.VEXON_HASH == ""
     assert auth_routes._load_users() == {}

@@ -304,8 +304,10 @@ def _classify_image_type(image_bytes: bytes) -> str:
             )
             image_detail = "low"
         # Low detail is enough for the coarse slip/invoice distinction and avoids
-        # mini's high-detail image-token multiplier. Set LINE_IMAGE_CLASSIFY_DETAIL=high
-        # to restore the previous auto/high-equivalent payload after a bad classification.
+        # mini's high-detail image-token multiplier. Rollback after a bad
+        # classification: LINE_IMAGE_CLASSIFY_DETAIL=auto is the exact previous
+        # payload (the request used to omit `detail`, which OpenAI treats as auto);
+        # `high` forces max quality regardless of image size.
         # Routed through llm.openai_chat for ai_call_log telemetry. Model unchanged.
         resp = openai_chat(
             "line_image_classify",

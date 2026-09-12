@@ -14,6 +14,11 @@ Setup (ทำใน PowerShell ก่อน run):
 
 Optional overrides:
     $env:VEXONHQ_TEST_USER = "vexonhq"              # default "vexonhq"
+
+NOTE (2026-09-12): this suite logs in through the LEGACY POST /auth/login,
+which is fail-closed on the backend — it answers 503 unless the target has a
+real JWT_SECRET plus VEXON_USER/VEXON_HASH (and VEXON_ADMINS covering the test
+user) configured in Coolify. Supabase SSO is the app's real login.
     $env:BACKEND_URL = "https://api.marastation.com" # default ↑
 
 Run:

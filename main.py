@@ -880,7 +880,10 @@ def _process_upload(contents: bytes, filename: str, content_type: str) -> dict[s
         # summary page can carry the whole-bill amount but only that page's rows.
         # Restore the legacy behavior temporarily with OCR_PAGE_RETRY_MULTIPAGE=1.
         max_workers = min(3, len(page_args))
-        allow_multipage_retry = os.environ.get("OCR_PAGE_RETRY_MULTIPAGE", "0") == "1"
+        allow_multipage_retry = (
+            os.environ.get("OCR_PAGE_RETRY_MULTIPAGE", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             ocr_pages = list(pool.map(
                 lambda a: _ocr_page(

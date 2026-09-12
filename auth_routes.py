@@ -66,8 +66,8 @@ _INSECURE_DEFAULT_JWT_SECRET = "vexonhq-change-this-secret-key-in-production-ple
 
 
 def _legacy_auth_enabled(secret: str) -> bool:
-    """True only for an operator-supplied secret (non-empty, not the old default)."""
-    return bool(secret) and secret != _INSECURE_DEFAULT_JWT_SECRET
+    """True only for an operator-supplied secret (non-blank, not the old default)."""
+    return bool(secret.strip()) and secret != _INSECURE_DEFAULT_JWT_SECRET
 
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
@@ -77,6 +77,10 @@ if not LEGACY_AUTH_ENABLED:
         "legacy /auth/login + self-issued JWT path DISABLED: JWT_SECRET missing or default "
         "(Supabase SSO tokens are unaffected)"
     )
+elif len(JWT_SECRET) < 32:
+    # Not fatal (unit tests use short secrets) but an HS256 key this short is
+    # brute-forceable; production should use secrets.token_hex(32).
+    log.warning("JWT_SECRET is only %d chars — use at least 32 random chars", len(JWT_SECRET))
 # Supabase project URL — used to build the JWKS endpoint for ES256 token verification.
 # Set in Coolify: SUPABASE_URL=https://<project-id>.supabase.co
 # (Never use NEXT_PUBLIC_ prefix — this is server-side only.)
