@@ -34,13 +34,15 @@ def _install_mocks(monkeypatch, *, ocr_sleep):
         "_persist_active": False,
         "ocr_peak": 0,
         "_ocr_active": 0,
+        "retry_flags": [],
     }
     lock = threading.Lock()
 
-    def fake_ocr_page(image_bytes, file_name, mime_type):
+    def fake_ocr_page(image_bytes, file_name, mime_type, *, allow_corrective_retry=True):
         tag = image_bytes.decode()           # b"p1" -> "p1"
         idx = int(tag[1:])
         with lock:
+            state["retry_flags"].append((tag, allow_corrective_retry))
             state["_ocr_active"] += 1
             state["ocr_peak"] = max(state["ocr_peak"], state["_ocr_active"])
         # Earlier pages sleep LONGER → if order were by completion it would
@@ -93,6 +95,7 @@ def test_multipage_preserves_page_order_and_serial_persist(monkeypatch):
 
 
 def test_ocr_concurrency_capped_at_three(monkeypatch):
+    monkeypatch.delenv("OCR_PAGE_RETRY_MULTIPAGE", raising=False)
     state = _install_mocks(monkeypatch, ocr_sleep=0.03)
     monkeypatch.setattr(
         main, "_pdf_to_images", lambda c: [f"p{i}".encode() for i in range(1, 6)]
@@ -104,6 +107,19 @@ def test_ocr_concurrency_capped_at_three(monkeypatch):
     assert state["ocr_peak"] <= 3
     assert state["persist_order"] == ["p1", "p2", "p3", "p4", "p5"]
     assert state["persist_overlap"] is False
+    assert dict(state["retry_flags"]) == {
+        "p1": False, "p2": False, "p3": False, "p4": False, "p5": False,
+    }
+
+
+def test_multipage_retry_can_be_restored_by_env(monkeypatch):
+    state = _install_mocks(monkeypatch, ocr_sleep=0.0)
+    monkeypatch.setenv("OCR_PAGE_RETRY_MULTIPAGE", "1")
+    monkeypatch.setattr(main, "_pdf_to_images", lambda c: [b"p1", b"p2"])
+
+    main._process_upload(b"%PDF-fake", "Rollback.pdf", "application/pdf")
+
+    assert dict(state["retry_flags"]) == {"p1": True, "p2": True}
 
 
 def test_single_image_uses_one_page_path(monkeypatch):
@@ -113,3 +129,22 @@ def test_single_image_uses_one_page_path(monkeypatch):
 
     assert out["total_pages_processed"] == 1
     assert state["persist_order"] == ["p1"]
+    assert state["retry_flags"] == [("p1", True)]
+
+
+def test_ocr_page_can_suppress_corrective_retry_without_changing_first_parse(monkeypatch):
+    calls = []
+    first = {"amount": 100.0, "items": [{"amount": 10.0}], "discount": None}
+    monkeypatch.setattr(main, "_run_tesseract", lambda _image: "hint")
+    monkeypatch.setattr(
+        main,
+        "_run_gpt_vision",
+        lambda *args, **kwargs: calls.append(kwargs.get("corrective_note")) or first,
+    )
+
+    result = main._ocr_page(
+        b"image", "bill-p2.png", "image/png", allow_corrective_retry=False
+    )
+
+    assert calls == [None]
+    assert result["parsed"] is first

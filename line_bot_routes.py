@@ -266,7 +266,7 @@ def _save_invoice_from_line(parsed: dict, image_bytes: bytes) -> str:
 #   (a) a supplier invoice — existing flow, vendor_bills
 #   (b) a K+ transfer slip — Session 27 flow, slips table
 #
-# We run a tiny GPT-4o-mini Vision classification call (~$0.001) BEFORE
+# We run a tiny GPT-4o-mini Vision classification call BEFORE
 # the full-blown OCR so we can route the image into the right pipeline.
 # Slips have a very distinctive layout ("โอนเงินสำเร็จ" header, single-
 # amount summary, memo field) so this is high-confidence cheap to do.
@@ -296,6 +296,16 @@ def _classify_image_type(image_bytes: bytes) -> str:
 
         b64 = _b64.b64encode(image_bytes).decode("utf-8")
         data_url = f"data:image/jpeg;base64,{b64}"
+        image_detail = os.environ.get("LINE_IMAGE_CLASSIFY_DETAIL", "low").strip().lower()
+        if image_detail not in {"low", "high", "auto"}:
+            log.warning(
+                "invalid LINE_IMAGE_CLASSIFY_DETAIL=%r; using low",
+                image_detail,
+            )
+            image_detail = "low"
+        # Low detail is enough for the coarse slip/invoice distinction and avoids
+        # mini's high-detail image-token multiplier. Set LINE_IMAGE_CLASSIFY_DETAIL=high
+        # to restore the previous auto/high-equivalent payload after a bad classification.
         # Routed through llm.openai_chat for ai_call_log telemetry. Model unchanged.
         resp = openai_chat(
             "line_image_classify",
@@ -305,7 +315,10 @@ def _classify_image_type(image_bytes: bytes) -> str:
                     "role": "user",
                     "content": [
                         {"type": "text", "text": _IMAGE_TYPE_CLASSIFIER_PROMPT},
-                        {"type": "image_url", "image_url": {"url": data_url}},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_url, "detail": image_detail},
+                        },
                     ],
                 }
             ],

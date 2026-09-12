@@ -138,8 +138,8 @@ def test_new_multipage_writes_same_hash_to_every_page(monkeypatch):
     monkeypatch.setattr(main, "_find_uploaded_file", lambda h, expected_pages=1: None)
     monkeypatch.setattr(main, "_pdf_to_images", lambda c: [b"p1", b"p2", b"p3"])
     monkeypatch.setattr(main, "_ocr_page",
-                        lambda img, fn, mt: {"image_bytes": img, "file_name": fn,
-                                             "mime_type": mt, "ocr_text": "", "parsed": {}})
+                        lambda img, fn, mt, **_kwargs: {"image_bytes": img, "file_name": fn,
+                                                       "mime_type": mt, "ocr_text": "", "parsed": {}})
     hashes = []
 
     def fake_persist(image_bytes, file_name, mime_type, ocr_text, parsed, file_sha256=None):

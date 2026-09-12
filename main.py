@@ -876,9 +876,19 @@ def _process_upload(contents: bytes, filename: str, content_type: str) -> dict[s
 
         # Phase 1: parallel OCR, capped at 3 in-flight vision calls so we don't
         # overload the OpenAI API or the shared 4GB box. map() preserves order.
+        # Page-level completeness retries are unsafe for multi-page PDFs: a
+        # summary page can carry the whole-bill amount but only that page's rows.
+        # Restore the legacy behavior temporarily with OCR_PAGE_RETRY_MULTIPAGE=1.
         max_workers = min(3, len(page_args))
+        allow_multipage_retry = os.environ.get("OCR_PAGE_RETRY_MULTIPAGE", "0") == "1"
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            ocr_pages = list(pool.map(lambda a: _ocr_page(*a), page_args))
+            ocr_pages = list(pool.map(
+                lambda a: _ocr_page(
+                    *a,
+                    allow_corrective_retry=(len(page_args) == 1 or allow_multipage_retry),
+                ),
+                page_args,
+            ))
 
         # Phase 2: sequential persist + multi-page merge, strictly in page order.
         last_result = None
@@ -906,6 +916,8 @@ def _ocr_page(
     image_bytes: bytes,
     file_name: str,
     mime_type: str,
+    *,
+    allow_corrective_retry: bool = True,
 ) -> dict[str, Any]:
     """OCR-only stage for ONE image: Tesseract hint → GPT Vision extraction.
 
@@ -933,14 +945,13 @@ def _ocr_page(
         raise HTTPException(500, f"vision extraction failed: {e}")
 
     # 3) Completeness self-check + ONE corrective retry (2026-07-15).
-    # When THIS page carries the bill total and the extracted lines don't tie
-    # to it (±10% band), re-run vision once telling the model what it missed —
-    # the model is far more accurate when it knows the target sum. Pages
-    # without a total (page 2+ of multi-page bills) never trigger this, and a
-    # retry failure falls back to the first parse, so this can only improve
-    # the result. Cost: one extra vision call only on out-of-band pages.
+    # When THIS standalone page carries the bill total and the extracted lines
+    # don't tie to it (±10% band), re-run vision once telling the model what it
+    # missed. Multi-page callers disable this check because the page carrying a
+    # whole-bill total may legitimately contain only a fraction of the rows.
+    # A retry failure falls back to the first parse.
     tie = _items_tie_state(parsed.get("amount"), parsed.get("items"), parsed.get("discount"))
-    if not tie["ok"]:
+    if allow_corrective_retry and not tie["ok"]:
         note = (
             "CORRECTIVE RETRY: a previous extraction of this SAME image captured "
             f"{tie['n_items']} line item(s) summing to {tie['items_sum']:,.2f}, but the "
