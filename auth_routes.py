@@ -10,9 +10,12 @@ Endpoints:
   POST /auth/logout  — client-side logout instruction
 
 Environment variables:
-  JWT_SECRET   — secret key for signing JWTs (CHANGE IN PRODUCTION)
-  VEXON_USER   — username (default: vexonhq)
-  VEXON_HASH   — PBKDF2 password hash (see below for format)
+  JWT_SECRET   — secret for the legacy self-issued JWTs. REQUIRED for that
+                 path: unset (or left at the old in-repo default) disables
+                 POST /auth/login (503) and rejects every self-issued token.
+                 Supabase SSO tokens (Path 1 in verify_token) are unaffected.
+  VEXON_USER   — legacy username (no default)
+  VEXON_HASH   — PBKDF2 password hash (no default; see below for format)
 
 Hash format:  pbkdf2:sha256:<iterations>:<salt_hex>:<hash_b64>
 Generate new hash:
@@ -54,10 +57,26 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 # Config
 # ─────────────────────────────────────────────────────────
 
-JWT_SECRET = os.environ.get(
-    "JWT_SECRET",
-    "vexonhq-change-this-secret-key-in-production-please"
-)
+# Fail-closed (2026-09-12): the legacy self-issued token path (Path 2 below and
+# POST /auth/login) only runs when an operator-supplied JWT_SECRET exists. The
+# previous in-repo default let anyone holding the source mint an admin token
+# that production accepted. The old literal is kept ONLY so an env var still
+# set to it is treated as "not configured" — never sign or verify with it.
+_INSECURE_DEFAULT_JWT_SECRET = "vexonhq-change-this-secret-key-in-production-please"
+
+
+def _legacy_auth_enabled(secret: str) -> bool:
+    """True only for an operator-supplied secret (non-empty, not the old default)."""
+    return bool(secret) and secret != _INSECURE_DEFAULT_JWT_SECRET
+
+
+JWT_SECRET = os.environ.get("JWT_SECRET", "")
+LEGACY_AUTH_ENABLED = _legacy_auth_enabled(JWT_SECRET)
+if not LEGACY_AUTH_ENABLED:
+    log.warning(
+        "legacy /auth/login + self-issued JWT path DISABLED: JWT_SECRET missing or default "
+        "(Supabase SSO tokens are unaffected)"
+    )
 # Supabase project URL — used to build the JWKS endpoint for ES256 token verification.
 # Set in Coolify: SUPABASE_URL=https://<project-id>.supabase.co
 # (Never use NEXT_PUBLIC_ prefix — this is server-side only.)
@@ -67,13 +86,11 @@ SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = 8
 
-# Default credentials (override via env vars)
-VEXON_USER = os.environ.get("VEXON_USER", "vexonhq")
-VEXON_HASH = os.environ.get(
-    "VEXON_HASH",
-    "pbkdf2:sha256:260000:3aca8935884bee634378925756665515:Z5xUmbAylUBocnq4FchR1f2nfYGeK1WfIPfe62qSvPs="
-)
-# Default password: mara2026  (override via VEXON_HASH env var in Coolify)
+# Legacy login accounts come ONLY from env vars (2026-09-12: the built-in
+# vexonhq / mara2026 admin default was removed — no accounts configured means
+# /auth/login always rejects).
+VEXON_USER = os.environ.get("VEXON_USER", "")
+VEXON_HASH = os.environ.get("VEXON_HASH", "")
 
 # ── Role config ───────────────────────────────────────────────────────────────
 # Comma-separated usernames that get role="admin" in their JWT.
@@ -97,9 +114,9 @@ def _load_users() -> dict[str, str]:
 
     Two patterns are accepted, additively:
 
-    1. **Legacy single-user** — `VEXON_USER` + `VEXON_HASH`. The
-       admin account that has existed since day one. Always present
-       so the system never locks itself out.
+    1. **Legacy single-user** — `VEXON_USER` + `VEXON_HASH`. Only
+       present when BOTH env vars are set (no built-in default since
+       2026-09-12); the app's real login is Supabase SSO.
     2. **Multi-user** — `VEXON_USER_<KEY>` + `VEXON_HASH_<KEY>` pairs.
        The `<KEY>` suffix is just a label that ties username to hash;
        it has no role in auth. Example env pair:
@@ -225,7 +242,8 @@ def verify_token(token: str) -> Optional[dict]:
     Path 2 — Self-issued tokens from /auth/login (legacy VEXONHQ login):
         Decodes with JWT_SECRET, no audience check.
         Role comes directly from payload["role"] (our convention).
-        Always tried as fallback when Path 1 fails.
+        Tried as fallback when Path 1 fails — ONLY when LEGACY_AUTH_ENABLED
+        (operator-set JWT_SECRET); otherwise skipped, fail-closed.
 
     Returns None on any definitive failure (expired, malformed). Never raises.
     """
@@ -275,6 +293,8 @@ def verify_token(token: str) -> Optional[dict]:
             )
 
     # Path 2: Self-issued tokens from /auth/login
+    if not LEGACY_AUTH_ENABLED:
+        return None
     try:
         payload = jwt.decode(
             token,
@@ -334,6 +354,12 @@ def login(body: LoginRequest, request: Request):
     Validate credentials and return a JWT access token.
     Rate limited to 10 attempts per minute per IP.
     """
+    if not LEGACY_AUTH_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="legacy login disabled: JWT_SECRET not configured (use Supabase SSO)",
+        )
+
     # Use X-Forwarded-For when behind Coolify/nginx reverse proxy
     forwarded_for = request.headers.get("X-Forwarded-For")
     client_ip = forwarded_for.split(",")[0].strip() if forwarded_for else (

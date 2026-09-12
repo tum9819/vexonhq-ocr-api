@@ -78,9 +78,16 @@ ORDER BY vb.amount DESC NULLS LAST;
 
 
 def mint_admin_token() -> str:
-    # EXACTLY mirrors auth_routes.JWT_SECRET: env var if set, otherwise the
-    # module's default. Whatever secret the app verifies with, we sign with.
-    secret = getenv("JWT_SECRET") or "vexonhq-change-this-secret-key-in-production-please"
+    # Mirrors auth_routes fail-closed rule (2026-09-12): the app only accepts
+    # self-issued tokens when JWT_SECRET is set to a real value, so this script
+    # can only sign with that same env var — there is no fallback secret.
+    secret = getenv("JWT_SECRET") or ""
+    if not secret or secret == "vexonhq-change-this-secret-key-in-production-please":
+        sys.exit(
+            "JWT_SECRET is missing or still the old default in this container — "
+            "the app rejects self-issued tokens (fail-closed). Set a real JWT_SECRET "
+            "in Coolify env, restart, then rerun."
+        )
     return jwt.encode(
         {"sub": "repair-script", "role": "admin", "exp": int(time.time()) + 2 * 3600},
         secret,
