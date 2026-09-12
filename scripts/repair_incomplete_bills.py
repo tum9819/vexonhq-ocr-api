@@ -81,8 +81,10 @@ def mint_admin_token() -> str:
     # Mirrors auth_routes fail-closed rule (2026-09-12): the app only accepts
     # self-issued tokens when JWT_SECRET is set to a real value, so this script
     # can only sign with that same env var — there is no fallback secret.
+    # Same test as auth_routes._legacy_auth_enabled: blank (after strip) or the
+    # old literal = disabled. Sign with the RAW value, exactly as the app does.
     secret = getenv("JWT_SECRET") or ""
-    if not secret or secret == "vexonhq-change-this-secret-key-in-production-please":
+    if not secret.strip() or secret == "vexonhq-change-this-secret-key-in-production-please":
         sys.exit(
             "JWT_SECRET is missing or still the old default in this container — "
             "the app rejects self-issued tokens (fail-closed). Set a real JWT_SECRET "
