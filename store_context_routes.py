@@ -131,11 +131,10 @@ def build_context_prompt() -> str:
 # Auth helpers
 # ────────────────────────────────────────────────────────────────────────────
 
-# Allowlist of usernames that may mutate store_context. The legacy admin
-# account ("vexonhq") is always allowed; named family accounts are added
-# explicitly so a future "read-only" account can be added without breaking
-# this gate.
-_ADMIN_USERS = {"vexonhq", "Tum", "tum", "May", "Toon", "Oil"}
+# Mutations are admin-only by JWT role (set by the auth middleware), the same
+# rule as the other admin-gated endpoints. A username allowlist cannot work
+# here: since the Supabase SSO cutover the middleware stores the token `sub`,
+# which is a UUID, so a name list rejected every real user.
 
 
 def _current_username(request: Request) -> Optional[str]:
@@ -146,8 +145,8 @@ def _require_admin(request: Request) -> str:
     user = _current_username(request)
     if not user:
         raise HTTPException(401, "auth required")
-    if user not in _ADMIN_USERS:
-        raise HTTPException(403, f"user {user!r} cannot edit store_context")
+    if getattr(request.state, "role", None) != "admin":
+        raise HTTPException(403, "Admin access required")
     return user
 
 
