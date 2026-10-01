@@ -98,11 +98,12 @@ VEXON_HASH = os.environ.get("VEXON_HASH", "")
 
 # ── Role config ───────────────────────────────────────────────────────────────
 # Comma-separated usernames that get role="admin" in their JWT.
-# Default includes the legacy single-user "vexonhq" and "tum".
-# Override in Coolify: VEXON_ADMINS=tum,vexonhq,manager
+# Default is "tum" only — the old default account "vexonhq" was removed
+# (2026-09-12) and must not regain admin if a same-named user is configured.
+# Override in Coolify: VEXON_ADMINS=tum,manager
 _ADMIN_USERNAMES: frozenset[str] = frozenset(
     x.strip().lower()
-    for x in os.environ.get("VEXON_ADMINS", "tum,vexonhq").split(",")
+    for x in os.environ.get("VEXON_ADMINS", "tum").split(",")
     if x.strip()
 )
 

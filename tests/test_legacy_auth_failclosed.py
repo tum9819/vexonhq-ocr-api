@@ -110,3 +110,13 @@ def test_no_builtin_default_account(monkeypatch):
     monkeypatch.setattr(auth_routes, "VEXON_USER", "Ops")
     monkeypatch.setattr(auth_routes, "VEXON_HASH", "pbkdf2:sha256:1:00:AA==")
     assert auth_routes._load_users() == {"ops": "pbkdf2:sha256:1:00:AA=="}
+
+
+def test_removed_default_account_is_not_a_default_admin():
+    # The default account "vexonhq" was removed; if anyone later configures a
+    # user with that name it must not inherit admin from the in-code default.
+    if "VEXON_ADMINS" in os.environ:
+        pytest.skip("VEXON_ADMINS exported in this shell; module default not observable")
+    assert auth_routes._get_role("vexonhq") == "user"
+    assert auth_routes._get_role("tum") == "admin"
+    assert auth_routes._get_role("TUM ") == "admin"
