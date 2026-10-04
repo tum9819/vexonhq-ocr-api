@@ -1,6 +1,6 @@
 # Makro hybrid OCR — Phase 0 (study + proposal, no code changed)
 
-Date: 2026-10-04. Status: **awaiting TUM's answers (§6) before Phase 1.**
+Date: 2026-10-04. Status: **TUM answered (§7). Next: duplicate guard task, then Phase 1.**
 Builds on: `docs/superpowers/audits/2026-09-10-invoice-ocr-cost-audit.md`,
 `docs/superpowers/audits/2026-09-10-makro-local-ocr-benchmark.md`,
 `tools/ocr_local_bench/makro_extract.py`. TUM decisions already on record
@@ -89,3 +89,21 @@ hybrid gate is designed to catch.
 5. The two 2026-10-03 bills — same purchase? (keep the one with the valid
    tax ID, reject the other in the review queue — your call, not changed by
    Claude).
+
+## 7. TUM's decisions (2026-10-04)
+
+1. Hybrid = **web PDF uploads only**; LINE photos stay on GPT-4o.
+2. **Resume uploading bills now, backlog included** (feeds shadow).
+3. Go/no-go into Phase 3: **≥ 50 Makro bills in shadow, acceptance ≥ 70%,
+   0 accepted bills with a money total different from the confirmed value.**
+4. Duplicate guard before Phase 1 — **both**: (a) widen the existing
+   suspected-duplicates banner (`GET /invoice/duplicates`, `main.py:1096`) to
+   match same amount + same bill_date even when vendor names differ, and (b)
+   file-hash LINE invoice images.
+   Why (a): checked in storage — the two 2026-10-03 images are different
+   files (1,230,056 vs 360,398 bytes, different eTags), so a file hash alone
+   could not have caught that pair; and the vendor names differ
+   (`CP AXTRA PUBLIC COMPANY LIMITED (HEAD)` vs `CP AXTRA ศาลายามาร์เก็ต
+   (3203)` — likely the full tax invoice + the store receipt of one
+   purchase), so today's banner (exact vendor name + amount + date) stays
+   silent. (b) still blocks an exact re-send of the same photo.
