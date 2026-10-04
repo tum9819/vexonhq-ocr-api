@@ -112,6 +112,37 @@ def test_missing_or_non_positive_amount_is_ignored(monkeypatch):
     assert _run(monkeypatch, rows)["total_groups"] == 0
 
 
+def test_negative_invalid_and_non_finite_amounts_are_ignored(monkeypatch):
+    # "Infinity"/"1e309" parse to inf and would make the JSON response 500.
+    rows = []
+    for i, bad in enumerate(["-5", "abc", "Infinity", "1e309", "NaN", "-Infinity"]):
+        rows.append(_bill(2 * i, "A", bad, "2026-10-03", f"2026-10-03T0{i}:00:00Z"))
+        rows.append(_bill(2 * i + 1, "B", bad, "2026-10-03", f"2026-10-03T0{i}:30:00Z"))
+    out = _run(monkeypatch, rows)
+    assert out["total_groups"] == 0
+    import json
+    json.dumps(out, allow_nan=False)  # the real response class serialises like this
+
+
+def test_empty_string_date_falls_back_to_vendor_rule(monkeypatch):
+    rows = [
+        _bill(1, "Shop A", 120, "", "2026-10-01T01:00:00Z"),
+        _bill(2, "Shop B", 120, "", "2026-10-01T02:00:00Z"),
+        _bill(3, "shop a", 120, "", "2026-10-01T03:00:00Z"),
+    ]
+    out = _run(monkeypatch, rows)
+    assert out["total_groups"] == 1
+    assert [b["id"] for b in out["groups"][0]["bills"]] == ["b1", "b3"]
+
+
+def test_whitespace_only_vendor_is_treated_as_missing(monkeypatch):
+    rows = [
+        _bill(1, "   ", 80, None, "2026-10-01T01:00:00Z"),
+        _bill(2, "   ", 80, None, "2026-10-01T02:00:00Z"),
+    ]
+    assert _run(monkeypatch, rows)["total_groups"] == 0
+
+
 def test_dated_bill_without_vendor_name_can_still_be_grouped(monkeypatch):
     rows = [
         _bill(1, None, 350, "2026-10-02", "2026-10-02T01:00:00Z"),

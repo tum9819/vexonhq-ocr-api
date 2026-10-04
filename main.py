@@ -1129,6 +1129,7 @@ def invoice_suspected_duplicates():
     )
     rows = resp.data or []
 
+    import math
     from collections import defaultdict
     groups: dict[tuple, list[dict]] = defaultdict(list)
     for r in rows:
@@ -1140,7 +1141,8 @@ def invoice_suspected_duplicates():
             amount_num = float(amount_raw)
         except (TypeError, ValueError):
             continue
-        if amount_num <= 0:
+        # numeric columns can hold Infinity/NaN; inf would 500 the JSON response.
+        if not math.isfinite(amount_num) or amount_num <= 0:
             continue
         bill_date = r.get("bill_date")
         if bill_date:
