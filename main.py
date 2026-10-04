@@ -1097,13 +1097,19 @@ def invoice_queue(limit: int = 50, offset: int = 0):
 def invoice_suspected_duplicates():
     """Find groups of pending bills suspected to be duplicates of each other.
 
-    Strict-match heuristic (high precision, low recall):
-      same vendor_name (lowercase trim) + same amount + same bill_date.
+    Match key: same amount + same bill_date, whatever the vendor name says
+    (undated bills fall back to same vendor_name + same amount). Vendor names
+    are display-only — "A / B" when the group's bills disagree.
 
     Catches OCR misread cases where the same paper invoice was uploaded twice
     and the model extracted slightly different `invoice_no` strings (e.g.
     "SS 68093823" vs "SS 680903823" — an extra "0"). Strict dedup by invoice_no
     in _save_invoice() can't catch this; this endpoint surfaces it for the user.
+    The vendor name is not part of the key since 2026-10-04: one Makro purchase
+    arrived as the full tax invoice ("CP AXTRA PUBLIC COMPANY LIMITED (HEAD)")
+    and the store receipt ("CP AXTRA ศาลายามาร์เก็ต (3203)"), and the old
+    exact-name key never warned. It is a warning only — two genuine bills with
+    the same amount on the same day can exist, so nothing is blocked here.
 
     Only considers bills with `review_status IN ('pending', 'needs_attention')`.
     Once a bill is confirmed/rejected, it's intentionally excluded so the
@@ -1126,27 +1132,40 @@ def invoice_suspected_duplicates():
     from collections import defaultdict
     groups: dict[tuple, list[dict]] = defaultdict(list)
     for r in rows:
-        vendor_raw = r.get("vendor_name")
+        vendor_norm = (r.get("vendor_name") or "").strip().lower()
         amount_raw = r.get("amount")
-        if not vendor_raw or amount_raw is None:
+        if amount_raw is None:
             continue
-        vendor_norm = vendor_raw.strip().lower()
         try:
             amount_num = float(amount_raw)
         except (TypeError, ValueError):
             continue
         if amount_num <= 0:
             continue
-        key = (vendor_norm, amount_num, r.get("bill_date"))
+        bill_date = r.get("bill_date")
+        if bill_date:
+            key = ("date", amount_num, bill_date)
+        elif vendor_norm:
+            key = ("vendor", amount_num, vendor_norm)
+        else:
+            continue
         groups[key].append(r)
 
     out_groups: list[dict] = []
-    for (_vendor_norm, amount_num, _bill_date), bills in groups.items():
+    for (_kind, amount_num, _match), bills in groups.items():
         if len(bills) < 2:
             continue
         bills.sort(key=lambda b: b.get("created_at") or "")
+        # Distinct names in upload order; case/whitespace variants count once.
+        names: list[str] = []
+        seen_norm: set[str] = set()
+        for b in bills:
+            name = (b.get("vendor_name") or "").strip()
+            if name and name.lower() not in seen_norm:
+                seen_norm.add(name.lower())
+                names.append(name)
         out_groups.append({
-            "vendor_name": bills[0].get("vendor_name"),
+            "vendor_name": " / ".join(names) or None,
             "amount": amount_num,
             "bill_date": bills[0].get("bill_date"),
             "count": len(bills),
