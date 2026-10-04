@@ -231,10 +231,14 @@ def _ocr_invoice_image(image_bytes: bytes) -> dict:
         raise RuntimeError(f"OCR failed: {e}")
 
 
-def _save_invoice_from_line(parsed: dict, image_bytes: bytes) -> str:
+def _save_invoice_from_line(
+    parsed: dict, image_bytes: bytes, file_sha256: Optional[str] = None
+) -> str:
     """
     Save OCR result to vendor_bills + invoice_items.
     Upload image to Supabase Storage (best-effort).
+    file_sha256 is stored on the attachment row (only written when the storage
+    upload succeeded) so a re-send of the same file is recognised later.
     Returns invoice_id (UUID).
     """
     try:
@@ -255,8 +259,36 @@ def _save_invoice_from_line(parsed: dict, image_bytes: bytes) -> str:
         file_url=file_url,
         file_name=file_name,
         mime_type="image/jpeg",
+        file_sha256=file_sha256,
     )
     return invoice_id
+
+
+def _process_invoice_from_line(image_bytes: bytes) -> str:
+    """
+    OCR + save one LINE invoice image; returns the reply text.
+
+    Same file-level idempotency as the web upload (main._find_uploaded_file):
+    if this exact file is already on a bill, skip OCR and saving and say so.
+    Only a byte-identical re-send is caught — a new photo of the same paper
+    has different bytes and is left to the duplicates banner in the review
+    queue (GET /invoice/duplicates).
+    """
+    from main import _find_uploaded_file
+
+    file_sha256 = hashlib.sha256(image_bytes).hexdigest()
+    already = _find_uploaded_file(file_sha256, expected_pages=1)
+    if already:
+        existing_id = str(already.get("invoice_id") or "")
+        log.info("LINE invoice duplicate file — existing bill id=%s", existing_id)
+        return (
+            "📎 รูปนี้เคยส่งเข้าระบบแล้ว — ไม่บันทึกซ้ำ\n"
+            f"🔑 บิลเดิม ID: {existing_id[:8]}..."
+        )
+
+    parsed = _ocr_invoice_image(image_bytes)
+    invoice_id = _save_invoice_from_line(parsed, image_bytes, file_sha256=file_sha256)
+    return _format_ocr_reply(parsed, invoice_id)
 
 
 # ─────────────────────────────────────────────
@@ -2118,9 +2150,7 @@ def _process_one_event(event: dict) -> None:
                 # Invoice path (also covers "other" — fallback OCR is
                 # cheap enough; vendor_bills can be flagged + rejected
                 # from the review queue if it really isn't an invoice).
-                parsed = _ocr_invoice_image(image_bytes)
-                invoice_id = _save_invoice_from_line(parsed, image_bytes)
-                _push_text(_format_ocr_reply(parsed, invoice_id))
+                _push_text(_process_invoice_from_line(image_bytes))
 
         except Exception as e:
             log.error("LINE image flow failed: %s", e)
