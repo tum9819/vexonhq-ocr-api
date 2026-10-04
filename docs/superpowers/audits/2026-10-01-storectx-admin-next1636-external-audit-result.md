@@ -42,3 +42,11 @@ Author spot-check of round 2 (per the "demand evidence" rule): two factual slips
 - Item 8 says `sharp` "is not installed in node_modules"; it is (`node_modules/sharp` exists; lockfile `node_modules/sharp` 0.35.4 at L6400 both before and after `8451f26`). Round 1 had this right. The verdict — no transitive version drift — holds.
 
 **Overall: 2 independent rounds, 21 item checks, 1 Low defect found and fixed (`6bf0667`), 0 open.**
+
+## Deployed (2026-10-04, TUM confirmed push; both shops closed)
+
+- Pre-push re-check after 3 days: `origin/main` unchanged on both repos; backend `verify.ps1` READY; frontend clean worktree `npm ci` → Next 16.3.6 → `tsc` 0 → build 70/70 + `ƒ Proxy (Middleware)`; baseline `/health/deep` healthy, live chunks embedded 16.3.3.
+- Pre-push hook blocked the first backend push: `tests/test_workflow.py::TestWF1Auth::test_wrong_password_is_rejected` expected 401 from the live `/auth/login`, which answers 503 "legacy login disabled" by design since 2026-09-12. TUM approved the fix: skip only on that exact 503 (`4d6d86d`, +2 lines); hook command then 659 passed / 26 skipped / 0 failed.
+- Backend: tag `backup-pre-storectx-admin-2026-10-01` pushed; `main` `4525252..4d6d86d`. Coolify started two deployments of the same commit that removed each other's containers → `503 no available server` ~03:15–03:22Z (~7 min). TUM approved one manual Deploy → image reused, healthy 03:22:09Z. Verified: `/health/deep` healthy, `/cron/health` 16 jobs / 0 missing, live smoke 71/71, Coolify Running on `4d6d86d`. Incident + rules: AGENTS #77.
+- Frontend: tag `backup-pre-next-1636-2026-10-01` pushed; `main` `ffe940e..19f7bb8`; single Coolify deployment, Success; live chunks switched to embedded **16.3.6** at 03:36:27Z with `/login` 200 throughout; `/invoices` and `/admin/store-context` signed-out → 307 to `/login`.
+- Still to confirm by TUM (needs an SSO session): save or reload once in `/admin/store-context`.
