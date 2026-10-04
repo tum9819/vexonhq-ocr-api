@@ -177,6 +177,8 @@ class TestWF1Auth:
             json={"username": TEST_USER, "password": "WRONG_XYZ_999"},
             timeout=DEFAULT_TIMEOUT,
         )
+        if r.status_code == 503 and "legacy login disabled" in r.text:
+            pytest.skip("legacy /auth/login disabled on this server (fail-closed, AGENTS #75)")
         assert r.status_code == 401, (
             f"Expected 401 for wrong password, got {r.status_code}. "
             f"Auth may be misconfigured."
