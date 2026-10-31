@@ -242,25 +242,32 @@ def _save_invoice_from_line(
     Returns invoice_id (UUID).
     """
     try:
-        from main import _save_invoice, _upload_to_storage
+        from main import HTTPException, _remove_storage_quietly, _save_invoice, _upload_to_storage
     except ImportError as e:
         raise RuntimeError(f"Cannot import from main: {e}")
 
     file_name = f"line-ocr-{uuid.uuid4().hex[:8]}.jpg"
     file_url = None
+    storage_path = None
     try:
-        file_url, _ = _upload_to_storage(image_bytes, file_name, "image/jpeg")
+        file_url, storage_path = _upload_to_storage(image_bytes, file_name, "image/jpeg")
     except Exception as e:
         log.warning("storage upload failed (continuing without file_url): %s", e)
 
-    invoice_id, batch_id, page_no, merged = _save_invoice(
-        parsed=parsed,
-        ocr_text="",
-        file_url=file_url,
-        file_name=file_name,
-        mime_type="image/jpeg",
-        file_sha256=file_sha256,
-    )
+    try:
+        invoice_id, batch_id, page_no, merged = _save_invoice(
+            parsed=parsed,
+            ocr_text="",
+            file_url=file_url,
+            file_name=file_name,
+            mime_type="image/jpeg",
+            file_sha256=file_sha256,
+        )
+    except HTTPException:
+        # 409 duplicate / 503 guard failure: nothing was written, so the image
+        # just uploaded is unreferenced.
+        _remove_storage_quietly(storage_path)
+        raise
     return invoice_id
 
 
@@ -270,11 +277,13 @@ def _process_invoice_from_line(image_bytes: bytes) -> str:
 
     Same file-level idempotency as the web upload (main._find_uploaded_file):
     if this exact file is already on a bill, skip OCR and saving and say so.
-    Only a byte-identical re-send is caught — a new photo of the same paper
-    has different bytes and is left to the duplicates banner in the review
-    queue (GET /invoice/duplicates).
+    A new photo of the same paper has different bytes; when its OCR'd invoice
+    matches a bill already in the system, _save_invoice refuses it
+    (BillAlreadyExists) and the reply says so. Only photos whose OCR misreads
+    the number slip past that and are left to the duplicates banner in the
+    review queue (GET /invoice/duplicates).
     """
-    from main import _find_uploaded_file
+    from main import BillAlreadyExists, _find_uploaded_file
 
     file_sha256 = hashlib.sha256(image_bytes).hexdigest()
     already = _find_uploaded_file(file_sha256, expected_pages=1)
@@ -287,7 +296,17 @@ def _process_invoice_from_line(image_bytes: bytes) -> str:
         )
 
     parsed = _ocr_invoice_image(image_bytes)
-    invoice_id = _save_invoice_from_line(parsed, image_bytes, file_sha256=file_sha256)
+    try:
+        invoice_id = _save_invoice_from_line(parsed, image_bytes, file_sha256=file_sha256)
+    except BillAlreadyExists as e:
+        # A different photo of a bill already in the system: never appended
+        # (that duplicated line items). Say so plainly instead of the generic
+        # "try again" reply, which invites another re-send.
+        log.info("LINE invoice matches existing bill id=%s — not saved", e.bill.get("id"))
+        return (
+            f"📎 {e.detail}\n"
+            "ถ้าเป็นหน้าต่อของบิลหลายแผ่น หน้านี้จะไม่ถูกเพิ่มเข้าบิล — แจ้ง admin ตรวจในเว็บ"
+        )
     return _format_ocr_reply(parsed, invoice_id)
 
 

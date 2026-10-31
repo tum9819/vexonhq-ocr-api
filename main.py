@@ -712,13 +712,15 @@ async def invoice_upload(file: UploadFile = File(...)):
       - PDF: each page rendered to PNG, processed individually
              multi-page merge happens automatically when invoice_no matches
 
-    Multi-page merge: if same (vendor_name, invoice_no) exists with
-    review_status in ('pending','needs_attention'), this upload is treated
-    as page N+1 of that bill (appends items, attaches as new page).
+    Multi-page merge: pages of the SAME file (one PDF) merge into one bill.
+    A different file matching a bill already in the system is not merged —
+    409 with a plain-string detail (see _same_file_on_bill).
 
     Returns:
       success, invoice_id, batch_id, page_no, merged, parsed, warnings,
       preview_url, total_pages_processed
+      409 when the bill already exists from another file; 503 when that
+      check itself could not run (nothing saved either way)
     """
     if not file.filename:
         raise HTTPException(400, "filename required")
@@ -999,6 +1001,15 @@ def _ocr_page(
     }
 
 
+def _remove_storage_quietly(storage_path: Optional[str]) -> None:
+    if not storage_path:
+        return
+    try:
+        get_supabase().storage.from_(SUPABASE_STORAGE_BUCKET).remove([storage_path])
+    except Exception as e:
+        log.warning("Failed to clean up unreferenced invoice storage file %s: %s", storage_path, e)
+
+
 def _persist_invoice_page(
     image_bytes: bytes,
     file_name: str,
@@ -1031,15 +1042,15 @@ def _persist_invoice_page(
             mime_type=mime_type,
             file_sha256=file_sha256,
         )
+    except HTTPException:
+        # 409 duplicate / 503 guard failure — raised before any DB write of
+        # this request, so this page's file is unreferenced. Pass the status
+        # through instead of turning it into a 500.
+        _remove_storage_quietly(storage_path)
+        raise
     except Exception as e:
         log.exception("db save failed")
-        if storage_path:
-            try:
-                sb = get_supabase()
-                sb.storage.from_(SUPABASE_STORAGE_BUCKET).remove([storage_path])
-                log.info("Cleaned up orphaned invoice storage file: bucket=%s, path=%s", SUPABASE_STORAGE_BUCKET, storage_path)
-            except Exception as cleanup_err:
-                log.warning("Failed to clean up orphaned invoice storage file %s: %s", storage_path, cleanup_err)
+        _remove_storage_quietly(storage_path)
         raise HTTPException(500, f"db save failed: {e}")
 
     # 6) Revalidate against the merged state so warnings stay accurate
@@ -3620,6 +3631,53 @@ def _merge_ocr_json(existing_ocr: Any, parsed: dict[str, Any]) -> dict[str, Any]
     return out
 
 
+class BillAlreadyExists(HTTPException):
+    """409: the upload matches a bill that is already in the system but came
+    from a different file, so it is NOT merged (that duplicated line items).
+    `detail` stays a plain string — the web upload shows `body.detail` as-is."""
+
+    def __init__(self, bill: dict[str, Any]):
+        self.bill = bill
+        amount = bill.get("amount")
+        try:
+            amount_txt = f"{float(amount):,.2f}"
+        except (TypeError, ValueError):
+            amount_txt = "-"
+        detail = (
+            "บิลนี้มีในระบบแล้ว — ไม่บันทึกซ้ำ: "
+            f"{bill.get('vendor_name') or '-'} เลขที่ {bill.get('invoice_no') or '-'} "
+            f"วันที่ {bill.get('bill_date') or '-'} ยอด {amount_txt} "
+            f"(ID {str(bill.get('id') or '')[:8]}, สถานะ {bill.get('review_status') or '-'})"
+        )
+        super().__init__(status_code=409, detail=detail)
+
+
+def _same_file_on_bill(sb, bill_id: str, file_sha256: Optional[str]) -> bool:
+    """May this upload add a page to `bill_id`? True when the bill already has a
+    page from the same source file (next page of one PDF / retry of that file),
+    or when the bill is an empty shell (no attachment, no items — a previous
+    attempt wrote the header and failed before the rest), since merging into it
+    cannot duplicate anything. No sha (legacy caller) keeps the old behaviour.
+    Fails closed: a lookup error raises 503 and nothing is written."""
+    if not file_sha256:
+        return True
+    try:
+        def _has(table: str, **eqs: str) -> bool:
+            q = sb.table(table).select("id")
+            for col, val in eqs.items():
+                q = q.eq(col, val)
+            return bool(q.limit(1).execute().data)
+
+        if _has("attachments", parent_type="vendor_bill", parent_id=bill_id, file_sha256=file_sha256):
+            return True
+        if _has("attachments", parent_type="vendor_bill", parent_id=bill_id):
+            return False
+        return not _has("invoice_items", vendor_bill_id=bill_id)
+    except Exception as e:
+        log.error("cross-file merge guard lookup failed for bill %s: %s", bill_id, e)
+        raise HTTPException(503, "ตรวจบิลซ้ำไม่สำเร็จ — ยังไม่ได้บันทึก กรุณาลองใหม่")
+
+
 def _save_invoice(
     parsed: dict[str, Any],
     ocr_text: str,
@@ -3693,6 +3751,14 @@ def _save_invoice(
                     )
         except Exception as e:
             log.warning("dedup lookup (invoice_no fallback) failed: %s", e)
+
+    # Cross-file guard (2026-10-31): a bill found above may only gain pages from
+    # the SAME source file (next page of one PDF, or a retry of that file). A
+    # re-scan / new photo of a bill already in the system used to be appended
+    # here, duplicating its line items. Outside the lookup try-blocks on purpose
+    # so the 409/503 is never swallowed.
+    if existing and not _same_file_on_bill(sb, existing["id"], file_sha256):
+        raise BillAlreadyExists(existing)
 
     # Page idempotency check
     is_duplicate_page = False
@@ -3841,8 +3907,9 @@ def _save_invoice(
                 "notes": parsed.get("notes"),
                 "batch_id": batch_id,
             }).execute()
-            _insert_items(invoice_id, parsed.get("items") or [], page_no)
         except Exception as e:
+            # Only the header INSERT is inside this try: an items error must not
+            # be mistaken for a dedup conflict and turned into a merge.
             err = str(e).lower()
             if dedup_key and ("uq_vendor_bills_dedup" in err or "duplicate key" in err or "23505" in err):
                 log.warning("create-conflict on dedup_key=%s → falling back to merge", dedup_key)
@@ -3857,6 +3924,8 @@ def _save_invoice(
                 if not res.data:
                     raise RuntimeError(f"unique conflict but no existing row for {dedup_key}")
                 existing = res.data[0]
+                if not _same_file_on_bill(sb, existing["id"], file_sha256):
+                    raise BillAlreadyExists(existing)
                 invoice_id = existing["id"]
                 batch_id = existing.get("batch_id") or str(uuid.uuid4())
                 if not existing.get("batch_id"):
@@ -3870,9 +3939,9 @@ def _save_invoice(
                 )
                 page_no = (page_count_resp.count or 0) + 1
                 merged = True
-                _insert_items(invoice_id, parsed.get("items") or [], page_no)
             else:
                 raise
+        _insert_items(invoice_id, parsed.get("items") or [], page_no)
 
     # Save attachment row for this page
     if file_url:

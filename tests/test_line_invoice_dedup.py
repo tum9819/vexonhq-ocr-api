@@ -84,6 +84,60 @@ def test_save_invoice_from_line_passes_the_hash_to_save_invoice(monkeypatch):
     assert seen["mime_type"] == "image/jpeg"
 
 
+EXISTING = {"id": "bbbbbbbb-1111-2222-3333-444444444444", "vendor_name": "Makro",
+            "invoice_no": "016276201221", "bill_date": "2026-10-30", "amount": 2082,
+            "review_status": "confirmed"}
+
+
+def test_new_photo_of_existing_bill_replies_already_in_system(monkeypatch):
+    # Real _process_invoice_from_line → _save_invoice_from_line chain; only the
+    # DB save, storage and OCR are faked.
+    live = sys.modules["main"]
+    removed = []
+    monkeypatch.setattr(live, "_find_uploaded_file", lambda sha, expected_pages=1: None)
+    monkeypatch.setattr(lbr, "_ocr_invoice_image", lambda b: {"invoice_no": "016276201221"})
+    monkeypatch.setattr(live, "_upload_to_storage", lambda b, name, mime: ("https://x/uploads/d.jpg", "invoices/d.jpg"))
+    monkeypatch.setattr(live, "_remove_storage_quietly", lambda path: removed.append(path))
+
+    def conflict(**kw):
+        raise live.BillAlreadyExists(EXISTING)
+
+    monkeypatch.setattr(live, "_save_invoice", conflict)
+
+    reply = lbr._process_invoice_from_line(IMAGE)
+
+    assert removed == ["invoices/d.jpg"]
+    assert "มีในระบบแล้ว" in reply
+    assert "016276201221" in reply
+    assert "bbbbbbbb" in reply
+    assert "ลองใหม่" not in reply
+
+
+import pytest
+
+
+@pytest.mark.parametrize("status", [409, 503])
+def test_save_invoice_from_line_removes_its_upload_when_guard_blocks(monkeypatch, status):
+    # Other tests reload `main`; _save_invoice_from_line imports from whatever
+    # sys.modules["main"] is at call time, so patch and raise from that module.
+    live = sys.modules["main"]
+    removed = []
+    monkeypatch.setattr(live, "_upload_to_storage", lambda b, name, mime: ("https://x/uploads/c.jpg", "invoices/c.jpg"))
+    monkeypatch.setattr(live, "_remove_storage_quietly", lambda path: removed.append(path))
+
+    def blocked(**kw):
+        if status == 409:
+            raise live.BillAlreadyExists(EXISTING)
+        raise live.HTTPException(503, "guard down")
+
+    monkeypatch.setattr(live, "_save_invoice", blocked)
+
+    with pytest.raises(live.HTTPException) as exc:
+        lbr._save_invoice_from_line({"amount": 1}, IMAGE, file_sha256=SHA)
+    assert exc.value.status_code == status
+    assert removed == ["invoices/c.jpg"]
+
+
 def test_save_invoice_from_line_without_hash_keeps_old_behaviour(monkeypatch):
     seen = {}
     monkeypatch.setattr(main, "_upload_to_storage", lambda b, name, mime: ("https://x/uploads/b.jpg", "b.jpg"))
