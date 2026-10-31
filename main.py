@@ -1122,20 +1122,23 @@ def invoice_suspected_duplicates():
     exact-name key never warned. It is a warning only — two genuine bills with
     the same amount on the same day can exist, so nothing is blocked here.
 
-    Only considers bills with `review_status IN ('pending', 'needs_attention')`.
-    Once a bill is confirmed/rejected, it's intentionally excluded so the
-    operator can re-upload a confirmed bill if needed.
+    Confirmed bills are matched too (since 2026-10-31): a re-scan of a
+    confirmed Singha bill was OCR'd with a different invoice_no and vendor
+    name, became a new pending bill, and pending-only grouping never saw it.
+    A group is shown only if it holds at least one pending/needs_attention
+    bill — groups of decided bills alone stay quiet. Rejected bills are never
+    considered. Still a warning only, so re-uploading a confirmed bill works.
 
-    Returns groups of >= 2 bills. Each group lists the bills sorted by
-    `created_at` ascending (oldest first) so the user can keep the original
-    and reject the later upload.
+    Returns groups of >= 2 bills. Confirmed bills come first, then by
+    `created_at` ascending, because the banner marks bills[0] as the one to
+    keep and must never suggest rejecting a bill the operator confirmed.
     """
     sb = get_supabase()
     resp = (
         sb.table("vendor_bills")
         .select("id, vendor_name, invoice_no, bill_date, amount, "
                 "created_at, review_status, payment_status")
-        .in_("review_status", ["pending", "needs_attention"])
+        .in_("review_status", ["pending", "needs_attention", "confirmed"])
         .execute()
     )
     rows = resp.data or []
@@ -1166,9 +1169,9 @@ def invoice_suspected_duplicates():
 
     out_groups: list[dict] = []
     for (_kind, amount_num, _match), bills in groups.items():
-        if len(bills) < 2:
+        if len(bills) < 2 or all(b.get("review_status") == "confirmed" for b in bills):
             continue
-        bills.sort(key=lambda b: b.get("created_at") or "")
+        bills.sort(key=lambda b: (b.get("review_status") != "confirmed", b.get("created_at") or ""))
         # Distinct names in upload order; case/whitespace variants count once.
         names: list[str] = []
         seen_norm: set[str] = set()
