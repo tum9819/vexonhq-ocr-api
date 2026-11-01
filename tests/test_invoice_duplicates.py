@@ -194,6 +194,19 @@ def test_confirmed_bill_is_listed_first_even_if_uploaded_later(monkeypatch):
     assert [b["id"] for b in out["groups"][0]["bills"]] == ["b2", "b1"]
 
 
+def test_only_one_confirmed_bill_is_listed_per_group(monkeypatch):
+    # Antigravity review 2026-11-01: two confirmed + one pending put the second
+    # confirmed at idx 1, where the banner says "probably reject".
+    rows = [
+        _with_status(_bill(1, "A", 1000, "2026-10-01", "2026-10-01T01:00:00Z"), "confirmed"),
+        _with_status(_bill(2, "A", 1000, "2026-10-01", "2026-10-01T02:00:00Z"), "confirmed"),
+        _bill(3, "A", 1000, "2026-10-01", "2026-10-31T10:00:00Z"),
+    ]
+    g = _run(monkeypatch, rows)["groups"][0]
+    assert [b["id"] for b in g["bills"]] == ["b1", "b3"]
+    assert g["count"] == 2
+
+
 def test_undated_pending_matches_undated_confirmed_by_vendor(monkeypatch):
     rows = [
         _with_status(_bill(1, "Wealimex", 900, None, "2026-10-01T01:00:00Z"), "confirmed"),

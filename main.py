@@ -1172,6 +1172,9 @@ def invoice_suspected_duplicates():
         if len(bills) < 2 or all(b.get("review_status") == "confirmed" for b in bills):
             continue
         bills.sort(key=lambda b: (b.get("review_status") != "confirmed", b.get("created_at") or ""))
+        # Keep only the earliest confirmed bill: the banner labels every bill
+        # after bills[0] "probably reject", so a second confirmed must not appear.
+        bills = bills[:1] + [b for b in bills[1:] if b.get("review_status") != "confirmed"]
         # Distinct names in upload order; case/whitespace variants count once.
         names: list[str] = []
         seen_norm: set[str] = set()
