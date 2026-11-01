@@ -2218,6 +2218,14 @@ def invoice_reject(invoice_id: str, request: Request, body: dict[str, Any] | Non
         raise HTTPException(422, "reject_reason is required")
     reviewer = _current_username(request) or (body or {}).get("reviewed_by")
     sb = get_supabase()
+    # A confirmed bill already counts in AP, P&L and exports; rejecting it drops
+    # it from all of them. Require an explicit opt-in so it can't happen by a
+    # stray click (e.g. following a duplicate-banner link to the kept bill).
+    current = sb.table("vendor_bills").select("review_status").eq("id", invoice_id).execute()
+    if not current.data:
+        raise HTTPException(404, "invoice not found")
+    if current.data[0].get("review_status") == "confirmed" and (body or {}).get("allow_confirmed") is not True:
+        raise HTTPException(409, "บิลนี้ยืนยันแล้ว — ต้องยืนยันซ้ำก่อนปฏิเสธ (allow_confirmed)")
     now_iso = datetime.utcnow().isoformat()
     resp = (
         sb.table("vendor_bills")
