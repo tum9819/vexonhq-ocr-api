@@ -84,6 +84,14 @@ def test_lineman_normal_day_unchanged():
     assert str(out["period_start"]) == "2026-11-02"
 
 
+def test_grab_header_missing_parsed_columns_still_400():
+    # Review 2026-11-02: passes CSV detection (Transaction ID + commission) but
+    # lacks ยอด / ทั้งหมด / หมวดหมู่ — a broken export, not a 0-order day.
+    with pytest.raises(HTTPException) as e:
+        _grab("วันที่สร้าง,Transaction ID,ค่าคอมมิชชันแพลตฟอร์ม\n")
+    assert e.value.status_code == 400
+
+
 def test_empty_frame_without_the_date_column_is_not_accepted():
     # Guard only accepts a real header; a frame missing the date column falls
     # through to the old 400.

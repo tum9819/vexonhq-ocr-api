@@ -889,13 +889,20 @@ def _no_orders() -> dict:
     return {"period_start": None, "period_end": None, "tables": {"rider_deliveries": []}}
 
 
-def _is_header_only(df: pd.DataFrame, date_col: str) -> bool:
-    return len(df) == 0 and date_col in df.columns
+# Every column the parser reads must be in the header — a truncated or
+# malformed header is a broken file, not a 0-order day (review 2026-11-02).
+_GRAB_REQUIRED_COLS = ("วันที่สร้าง", "หมวดหมู่", "ยอด", "ค่าคอมมิชชันแพลตฟอร์ม",
+                       "ส่วนลด (ออกโดยร้าน)", "ทั้งหมด")
+_LINEMAN_REQUIRED_COLS = ("time", "sales", "orders")
+
+
+def _is_header_only(df: pd.DataFrame, required_cols: tuple[str, ...]) -> bool:
+    return len(df) == 0 and all(c in df.columns for c in required_cols)
 
 
 def parse_grab_transaction(df: pd.DataFrame, **_) -> dict:
     """Aggregate Grab CSV to daily rider_deliveries rows."""
-    if _is_header_only(df, "วันที่สร้าง"):
+    if _is_header_only(df, _GRAB_REQUIRED_COLS):
         return _no_orders()
     # Filter to payment rows only (safety — Grab only exports ชำระเงิน)
     if "หมวดหมู่" in df.columns:
@@ -962,7 +969,7 @@ _LINEMAN_GP_RATE = 0.321
 
 def parse_lineman_daily(df: pd.DataFrame, **_) -> dict:
     """Parse Lineman daily XLSX to rider_deliveries rows."""
-    if _is_header_only(df, "time"):
+    if _is_header_only(df, _LINEMAN_REQUIRED_COLS):
         return _no_orders()
     rows = []
     for _, r in df.iterrows():
