@@ -880,8 +880,23 @@ def _parse_grab_date(v: Any) -> Optional[date]:
         return None
 
 
+# A day with no delivery orders exports the header row only (seen 2026-11-01
+# for both Grab and LINE MAN). That is a valid "0 orders" report, not a broken
+# file — import it as success with 0 rows (period stays NULL, like an empty
+# cashflow_detail) so the 10-file POS daily upload is not blocked. Files that
+# HAVE rows but none usable still raise 400.
+def _no_orders() -> dict:
+    return {"period_start": None, "period_end": None, "tables": {"rider_deliveries": []}}
+
+
+def _is_header_only(df: pd.DataFrame, date_col: str) -> bool:
+    return len(df) == 0 and date_col in df.columns
+
+
 def parse_grab_transaction(df: pd.DataFrame, **_) -> dict:
     """Aggregate Grab CSV to daily rider_deliveries rows."""
+    if _is_header_only(df, "วันที่สร้าง"):
+        return _no_orders()
     # Filter to payment rows only (safety — Grab only exports ชำระเงิน)
     if "หมวดหมู่" in df.columns:
         df = df[df["หมวดหมู่"].astype(str).str.strip() == "ชำระเงิน"].copy()
@@ -947,6 +962,8 @@ _LINEMAN_GP_RATE = 0.321
 
 def parse_lineman_daily(df: pd.DataFrame, **_) -> dict:
     """Parse Lineman daily XLSX to rider_deliveries rows."""
+    if _is_header_only(df, "time"):
+        return _no_orders()
     rows = []
     for _, r in df.iterrows():
         d = to_date(r.get("time"))
