@@ -441,3 +441,40 @@ def test_alerts_summary_includes_monthly_close(monkeypatch):
     assert mc_alerts[0]["severity"] == "danger"
     assert mc_alerts[0]["link"] == "/alerts"
     assert data["counts"]["danger"] >= 1
+
+
+# ── R3b: per-day platform gap (2026-11-03) ───────────────────────────────────
+
+def test_r3b_grab_flags_only_whole_missing_days():
+    rows = [
+        (date(2026, 10, 26), 1, 104, 1),   # match
+        (date(2026, 10, 27), 1, 438, 0),   # POS bill, no Grab order -> gap
+        (date(2026, 10, 29), 2, 474, 1),   # Grab short by 1: normal noise, not a gap
+        (date(2026, 10, 30), 0, 0, 2),     # Grab without POS: ignored for Grab
+    ]
+    r = mc.build_platform_daily_gap_risk("grab", "Grab", mc.RISK_DAILY_GAP_GRAB, rows, False)
+    assert r["severity"] == "warning" and r["risk_key"] == "platform_daily_gap_grab"
+    assert [g["date"] for g in r["evidence"]["days"]] == ["2026-10-27"]
+    assert r["amount"] == 438.0
+
+
+def test_r3b_lineman_flags_any_count_difference():
+    rows = [
+        (date(2026, 11, 1), 0, 0, 0),
+        (date(2026, 11, 2), 2, 450, 1),    # truncated / partial export
+        (date(2026, 11, 3), 0, 0, 1),      # platform order POS never saw
+    ]
+    r = mc.build_platform_daily_gap_risk("lineman", "LINE MAN", mc.RISK_DAILY_GAP_LINEMAN, rows, True)
+    assert [g["date"] for g in r["evidence"]["days"]] == ["2026-11-02", "2026-11-03"]
+
+
+def test_r3b_no_gaps_returns_none():
+    rows = [(date(2026, 11, 2), 2, 450, 2), (date(2026, 11, 1), 0, 0, 0)]
+    assert mc.build_platform_daily_gap_risk("lineman", "LINE MAN", "k", rows, True) is None
+    assert mc.build_platform_daily_gap_risk("grab", "Grab", "k", [], False) is None
+
+
+def test_r3b_evidence_list_is_capped():
+    rows = [(date(2026, 10, d), 1, 100, 0) for d in range(1, 21)]
+    r = mc.build_platform_daily_gap_risk("grab", "Grab", "k", rows, False)
+    assert r["evidence"]["day_count"] == 20 and len(r["evidence"]["days"]) == mc.EVIDENCE_LIST_CAP

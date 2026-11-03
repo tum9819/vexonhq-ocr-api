@@ -73,6 +73,14 @@ R3_PLATFORMS = (
     ("lineman", "Line Man - Rabbit Linepay", "lineman_daily", RISK_MISSING_LINEMAN, "LINE MAN"),
 )
 
+# R3b daily platform gap: platform -> (risk_key, exact daily count match expected)
+RISK_DAILY_GAP_GRAB = "platform_daily_gap_grab"
+RISK_DAILY_GAP_LINEMAN = "platform_daily_gap_lineman"
+R3B_DAILY = {
+    "grab": (RISK_DAILY_GAP_GRAB, False),
+    "lineman": (RISK_DAILY_GAP_LINEMAN, True),
+}
+
 # R4 ambiguous-settlement description keywords (matched case-insensitively).
 R4_KEYWORDS = ("LINE PAY", "Thai Line Pay", "บจก. แกร็บแท็กซี่")
 
@@ -195,6 +203,46 @@ def build_missing_platform_export_risk(
             "pos_sum": _f(pos_sum),
             "matching_import_count": int(import_count),
         },
+        "link": V1_LINK,
+    }
+
+
+def build_platform_daily_gap_risk(
+    platform: str,
+    label: str,
+    risk_key: str,
+    rows: list,
+    exact_count: bool,
+) -> Optional[dict]:
+    """R3b (warning): per day, POS delivery bills vs imported platform orders.
+
+    Catches what the import cannot: an export truncated to its header imports as
+    0 orders (by design since 2026-11-03), and a partial export imports short.
+    rows: (day, pos_count, pos_sum, platform_orders) for days already covered by
+    a platform upload. A gap is a day with POS bills but no platform orders; with
+    exact_count (LINE MAN — matched POS every day Sep–Oct 2026) any count
+    difference is a gap. Grab differs by ~1 bill on many days ("K Plus shop" is
+    not Grab-only), so only whole missing days count there.
+    """
+    gaps = []
+    for day, pos_count, pos_sum, plat_orders in rows:
+        pos_count, plat_orders = int(pos_count or 0), int(plat_orders or 0)
+        if pos_count <= 0 and not exact_count:
+            continue
+        if (plat_orders == 0 and pos_count > 0) or (exact_count and plat_orders != pos_count):
+            gaps.append({"date": str(day), "pos_count": pos_count,
+                         "pos_sum": _f(pos_sum), "platform_orders": plat_orders})
+    if not gaps:
+        return None
+    total = sum(g["pos_sum"] for g in gaps)
+    days = ", ".join(g["date"][5:] for g in gaps[:EVIDENCE_LIST_CAP])
+    return {
+        "risk_key": risk_key,
+        "severity": "warning",
+        "title": f"ยอด {label} รายวันไม่ตรงกับ POS",
+        "message": f"{len(gaps)} วันที่ {label} export ไม่ตรงกับบิล POS ({days}) — ดึง export วันนั้นใหม่",
+        "amount": total,
+        "evidence": {"platform": platform, "day_count": len(gaps), "days": _cap(gaps)},
         "link": V1_LINK,
     }
 
@@ -418,6 +466,45 @@ def run_all_checks(conn, mstart: date, mend: date, branch_code: str) -> list[dic
                 platform, label, risk_key,
                 int(pos_count), _f(pos_sum), int(import_count),
             )
+            if r:
+                detected.append(r)
+
+            # R3b: per-day comparison, only for days a platform upload already
+            # covers — days before the (Bangkok) date of the latest successful
+            # upload. Upload time, not period: a 0-order import has period NULL.
+            gap_key, exact = R3B_DAILY[platform]
+            cur.execute(
+                """
+                WITH covered AS (
+                    SELECT (MAX(uploaded_at) AT TIME ZONE 'Asia/Bangkok')::date AS upto
+                    FROM public.pos_imports
+                    WHERE report_type = %s AND status = 'success' AND branch_code = %s
+                ),
+                pos AS (
+                    SELECT sales_date AS d, COUNT(*) AS n, SUM(bill_net) AS s
+                    FROM public.pos_bills
+                    WHERE payment_type_raw = %s AND bill_net > 0
+                      AND sales_date BETWEEN %s AND %s AND branch_code = %s
+                    GROUP BY sales_date
+                ),
+                plat AS (
+                    SELECT delivery_date AS d, SUM(order_count) AS n
+                    FROM public.rider_deliveries
+                    WHERE platform = %s AND delivery_date BETWEEN %s AND %s
+                      AND branch_code = %s
+                    GROUP BY delivery_date
+                )
+                SELECT COALESCE(pos.d, plat.d), COALESCE(pos.n, 0), COALESCE(pos.s, 0),
+                       COALESCE(plat.n, 0)
+                FROM pos FULL JOIN plat ON pos.d = plat.d, covered
+                WHERE COALESCE(pos.d, plat.d) < covered.upto
+                ORDER BY 1
+                """,
+                (report_type, branch_code,
+                 pt_value, mstart, mend, branch_code,
+                 platform, mstart, mend, branch_code),
+            )
+            r = build_platform_daily_gap_risk(platform, label, gap_key, cur.fetchall(), exact)
             if r:
                 detected.append(r)
 
