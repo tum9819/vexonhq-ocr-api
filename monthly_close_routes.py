@@ -218,8 +218,8 @@ def build_platform_daily_gap_risk(
 
     Catches what the import cannot: an export truncated to its header imports as
     0 orders (by design since 2026-11-03), and a partial export imports short.
-    rows: (day, pos_count, pos_sum, platform_orders) for days already covered by
-    a platform upload. A gap is a day with POS bills but no platform orders; with
+    rows: (day, pos_count, pos_sum, platform_orders) for every past day of the
+    month (a day not uploaded yet also shows up). A gap is a day with POS bills but no platform orders; with
     exact_count (LINE MAN — matched POS every day Sep–Oct 2026) any count
     difference is a gap. Grab differs by ~1 bill on many days ("K Plus shop" is
     not Grab-only), so only whole missing days count there.
