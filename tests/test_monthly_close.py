@@ -478,3 +478,10 @@ def test_r3b_evidence_list_is_capped():
     rows = [(date(2026, 10, d), 1, 100, 0) for d in range(1, 21)]
     r = mc.build_platform_daily_gap_risk("grab", "Grab", "k", rows, False)
     assert r["evidence"]["day_count"] == 20 and len(r["evidence"]["days"]) == mc.EVIDENCE_LIST_CAP
+
+def test_r3b_message_shows_both_sides_and_does_not_blame_the_platform():
+    # Review 2026-11-03: /alerts shows no evidence; POS may be the missing side.
+    rows = [(date(2026, 11, 3), 0, 0, 1)]
+    r = mc.build_platform_daily_gap_risk("lineman", "LINE MAN", "k", rows, True)
+    assert "11-03 POS 0/LINE MAN 1" in r["message"]
+    assert "ไฟล์บิล POS" in r["message"]

@@ -235,12 +235,17 @@ def build_platform_daily_gap_risk(
     if not gaps:
         return None
     total = sum(g["pos_sum"] for g in gaps)
-    days = ", ".join(g["date"][5:] for g in gaps[:EVIDENCE_LIST_CAP])
+    # Both counts go in the message: /alerts does not show evidence, and either
+    # side can be the one missing (review 2026-11-03).
+    days = ", ".join(f"{g['date'][5:]} POS {g['pos_count']}/{label} {g['platform_orders']}"
+                     for g in gaps[:EVIDENCE_LIST_CAP])
+    more = f" และอีก {len(gaps) - EVIDENCE_LIST_CAP} วัน" if len(gaps) > EVIDENCE_LIST_CAP else ""
     return {
         "risk_key": risk_key,
         "severity": "warning",
         "title": f"ยอด {label} รายวันไม่ตรงกับ POS",
-        "message": f"{len(gaps)} วันที่ {label} export ไม่ตรงกับบิล POS ({days}) — ดึง export วันนั้นใหม่",
+        "message": (f"{len(gaps)} วันจำนวนบิลไม่ตรงกัน ({days}{more}) — "
+                    f"ตรวจทั้งไฟล์บิล POS และ {label} export ของวันนั้น"),
         "amount": total,
         "evidence": {"platform": platform, "day_count": len(gaps), "days": _cap(gaps)},
         "link": V1_LINK,
@@ -469,16 +474,19 @@ def run_all_checks(conn, mstart: date, mend: date, branch_code: str) -> list[dic
             if r:
                 detected.append(r)
 
-            # R3b: per-day comparison, only for days a platform upload already
-            # covers — days before the (Bangkok) date of the latest successful
-            # upload. Upload time, not period: a 0-order import has period NULL.
+            # R3b: per-day comparison, only for days before the (Bangkok) date of
+            # the latest successful POS upload of ANY report type. Not the
+            # platform's own uploads: a re-uploaded header-only file is deduped
+            # by hash and leaves no new row (review 2026-11-03), while the daily
+            # run's FoodStory files change every day. Upload time, not period: a
+            # 0-order import has period NULL.
             gap_key, exact = R3B_DAILY[platform]
             cur.execute(
                 """
                 WITH covered AS (
                     SELECT (MAX(uploaded_at) AT TIME ZONE 'Asia/Bangkok')::date AS upto
                     FROM public.pos_imports
-                    WHERE report_type = %s AND status = 'success' AND branch_code = %s
+                    WHERE status = 'success' AND branch_code = %s
                 ),
                 pos AS (
                     SELECT sales_date AS d, COUNT(*) AS n, SUM(bill_net) AS s
@@ -500,7 +508,7 @@ def run_all_checks(conn, mstart: date, mend: date, branch_code: str) -> list[dic
                 WHERE COALESCE(pos.d, plat.d) < covered.upto
                 ORDER BY 1
                 """,
-                (report_type, branch_code,
+                (branch_code,
                  pt_value, mstart, mend, branch_code,
                  platform, mstart, mend, branch_code),
             )
