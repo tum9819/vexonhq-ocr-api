@@ -485,3 +485,40 @@ def test_r3b_message_shows_both_sides_and_does_not_blame_the_platform():
     r = mc.build_platform_daily_gap_risk("lineman", "LINE MAN", "k", rows, True)
     assert "11-03 POS 0/LINE MAN 1" in r["message"]
     assert "ไฟล์บิล POS" in r["message"]
+
+class _R3bCursor:
+    """Fake cursor for run_all_checks: answers the R3b query, neutral elsewhere."""
+    def __init__(self, gap_rows):
+        self.gap_rows, self.sql, self.last = gap_rows, [], ""
+
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+    def execute(self, sql, params=None):
+        self.last = sql
+        self.sql.append(sql)
+
+    def fetchone(self):
+        return (1, 0) if "pos_bills" in self.last else (1,)
+
+    def fetchall(self):
+        return self.gap_rows if "rider_deliveries" in self.last else []
+
+
+class _R3bConn:
+    def __init__(self, cur): self.cur = cur
+    def cursor(self): return self.cur
+
+
+def test_r3b_sql_checks_every_past_day_not_an_upload_cutoff():
+    # Review round 3: an upload-derived cutoff skipped the month's last day when
+    # its upload was fully deduped. The R3b query must not depend on pos_imports.
+    cur = _R3bCursor([(date(2026, 11, 30), 1, 438, 0)])
+    risks = mc.run_all_checks(_R3bConn(cur), date(2026, 11, 1), date(2026, 11, 30), "thawi_watthana")
+    r3b_sql = [s for s in cur.sql if "rider_deliveries" in s]
+    assert len(r3b_sql) == 2  # grab + lineman
+    for s in r3b_sql:
+        assert "pos_imports" not in s
+        assert "now() AT TIME ZONE 'Asia/Bangkok'" in s
+    keys = {r["risk_key"] for r in risks}
+    assert {"platform_daily_gap_grab", "platform_daily_gap_lineman"} <= keys

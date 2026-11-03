@@ -245,7 +245,8 @@ def build_platform_daily_gap_risk(
         "severity": "warning",
         "title": f"ยอด {label} รายวันไม่ตรงกับ POS",
         "message": (f"{len(gaps)} วันจำนวนบิลไม่ตรงกัน ({days}{more}) — "
-                    f"ตรวจทั้งไฟล์บิล POS และ {label} export ของวันนั้น"),
+                    f"ตรวจทั้งไฟล์บิล POS และ {label} export ของวันนั้น "
+                    f"(ถ้าเป็นเมื่อวานและยังไม่ได้รันอัปโหลดเช้านี้ รอรันก่อน)"),
         "amount": total,
         "evidence": {"platform": platform, "day_count": len(gaps), "days": _cap(gaps)},
         "link": V1_LINK,
@@ -474,21 +475,15 @@ def run_all_checks(conn, mstart: date, mend: date, branch_code: str) -> list[dic
             if r:
                 detected.append(r)
 
-            # R3b: per-day comparison, only for days before the (Bangkok) date of
-            # the latest successful POS upload of ANY report type. Not the
-            # platform's own uploads: a re-uploaded header-only file is deduped
-            # by hash and leaves no new row (review 2026-11-03), while the daily
-            # run's FoodStory files change every day. Upload time, not period: a
-            # 0-order import has period NULL.
+            # R3b: per-day comparison for every day before today (Bangkok). Any
+            # cutoff derived from pos_imports rows misses the last day when the
+            # final upload was fully deduped by hash — dedup writes no row
+            # (review 2026-11-03, two rounds). So check all past days; a day not
+            # uploaded yet shows as a gap, which the message says.
             gap_key, exact = R3B_DAILY[platform]
             cur.execute(
                 """
-                WITH covered AS (
-                    SELECT (MAX(uploaded_at) AT TIME ZONE 'Asia/Bangkok')::date AS upto
-                    FROM public.pos_imports
-                    WHERE status = 'success' AND branch_code = %s
-                ),
-                pos AS (
+                WITH pos AS (
                     SELECT sales_date AS d, COUNT(*) AS n, SUM(bill_net) AS s
                     FROM public.pos_bills
                     WHERE payment_type_raw = %s AND bill_net > 0
@@ -504,12 +499,11 @@ def run_all_checks(conn, mstart: date, mend: date, branch_code: str) -> list[dic
                 )
                 SELECT COALESCE(pos.d, plat.d), COALESCE(pos.n, 0), COALESCE(pos.s, 0),
                        COALESCE(plat.n, 0)
-                FROM pos FULL JOIN plat ON pos.d = plat.d, covered
-                WHERE COALESCE(pos.d, plat.d) < covered.upto
+                FROM pos FULL JOIN plat ON pos.d = plat.d
+                WHERE COALESCE(pos.d, plat.d) < (now() AT TIME ZONE 'Asia/Bangkok')::date
                 ORDER BY 1
                 """,
-                (branch_code,
-                 pt_value, mstart, mend, branch_code,
+                (pt_value, mstart, mend, branch_code,
                  platform, mstart, mend, branch_code),
             )
             r = build_platform_daily_gap_risk(platform, label, gap_key, cur.fetchall(), exact)
